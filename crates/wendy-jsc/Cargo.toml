@@ -1,0 +1,21 @@
+[package]
+name = "wendy-jsc"
+description = "wendy's JS outlet: embedded JavaScriptCore with node-aligned APIs over wendy-libc"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+libc.workspace = true
+oxc = { version = "0.155", features = ["transformer", "codegen", "semantic", "ast_visit"] }
+oxc_ecmascript = "0.155"
+serde_json.workspace = true
+tokio.workspace = true
+wendy-io.workspace = true
+wendy-libc.workspace = true
+wendy-trace.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wendy-storage.workspace = true

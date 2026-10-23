@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# wendy's own bash-aligned sh is parked: tools run the system bash for now.
+# The source stays in the tree but is not built or kept in sync.
+exclude = ["crates/wendy-sh"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+wendy-core = { path = "crates/wendy-core" }
+wendy-trace = { path = "crates/wendy-trace" }
+wendy-storage = { path = "crates/wendy-storage" }
+wendy-io = { path = "crates/wendy-io" }
+wendy-jsc = { path = "crates/wendy-jsc" }
+wendy-kernel = { path = "crates/wendy-kernel" }
+wendy-libc = { path = "crates/wendy-libc" }
+
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+regex = "1"
+rusqlite = { version = "0.33", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+
+[profile.release]
+lto = "thin"

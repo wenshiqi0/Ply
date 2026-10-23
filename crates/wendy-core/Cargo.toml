@@ -1,0 +1,10 @@
+[package]
+name = "wendy-core"
+description = "Descriptive core of the wendy agent harness: IPO operations, plugins, tools"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
