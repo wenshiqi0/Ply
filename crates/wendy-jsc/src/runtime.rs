@@ -92,7 +92,8 @@ pub struct Caller {
     pub fiber: Option<String>,
 }
 
-/// The host side of `kernel.*` ops: awaiting another plugin.
+/// The host side of `kernel.*` ops: awaiting another plugin, calling a
+/// function on `ctx`, waiting for a plugin to load.
 #[async_trait::async_trait]
 pub trait HostBridge: Send + Sync {
     async fn call(&self, caller: Caller, op: &str, args: Value) -> Result<Value, String>;
@@ -159,7 +160,7 @@ enum Msg {
     Api { method: &'static str, args: Vec<String>, fiber: Option<String>, reply: Reply<Result<Value, JsError>> },
     TakeOutput(Reply<Output>),
     Idle(Reply<()>),
-    Catalog(Value),
+    Directory(Value),
     RawHostCall(String, Value, Reply<Value>),
     Completion(u64, OpResult),
     Timer(u64),
@@ -234,9 +235,29 @@ impl JsRuntime {
         self.api(realm, "call", vec![module.into(), export.into(), Value::Array(args).to_string()], None).await
     }
 
-    /// Run `handle(input)` of a module as fiber `fiber`.
+    /// Run `onHandle(input)` of a module as fiber `fiber`.
     pub async fn run_fiber(&self, realm: RealmId, module: &str, input: &Value, fiber: &str) -> Result<Value, JsError> {
         self.api(realm, "run", vec![module.into(), input.to_string()], Some(fiber.to_string())).await
+    }
+
+    /// Run the module's `onLoad` (if it has one) and keep what it returns.
+    /// Returns `{ data, methods }`: its plain members, and the names of its
+    /// function members.
+    pub async fn run_load(&self, realm: RealmId, module: &str) -> Result<Value, JsError> {
+        self.api(realm, "load", vec![module.into()], None).await
+    }
+
+    /// Call a function member of what the module's `onLoad` returned, on
+    /// behalf of fiber `fiber` (whose `tools.x` awaits it makes children).
+    pub async fn call_method(
+        &self,
+        realm: RealmId,
+        module: &str,
+        method: &str,
+        args: &[Value],
+        fiber: Option<String>,
+    ) -> Result<Value, JsError> {
+        self.api(realm, "method", vec![module.into(), method.into(), Value::Array(args.to_vec()).to_string()], fiber).await
     }
 
     /// Evaluate a plain-JS script in the realm (awaiting a promise result).
@@ -253,10 +274,11 @@ impl JsRuntime {
         rx.await.unwrap_or_default()
     }
 
-    /// What `tools` lists in this realm: the loaded plugins as tools
-    /// (`[{ name, description, parameters, wraps_input }]`).
-    pub fn set_catalog(&self, realm: RealmId, catalog: Value) {
-        self.send(realm, Msg::Catalog(catalog));
+    /// What `tools` and `ctx` hold in this realm: every plugin, as the
+    /// kernel describes it (name, description, tool schema, what its
+    /// `onLoad` mounted, load state).
+    pub fn set_directory(&self, realm: RealmId, directory: Value) {
+        self.send(realm, Msg::Directory(directory));
     }
 
     /// Send one host call exactly as given, the way a prelude that plugin
@@ -305,8 +327,9 @@ struct Engine {
     code: Fs,
     root: String,
     bridge: Option<Arc<dyn HostBridge>>,
-    /// The plugins `tools` lists, as the kernel last described them.
-    catalog: Value,
+    /// The plugins `tools` and `ctx` reflect, as the kernel last described
+    /// them.
+    directory: Value,
     stdout: String,
     stderr: String,
     exit_code: Option<i32>,
@@ -417,7 +440,7 @@ fn engine_main(
                 let _ = reply.send(out);
             }
             Msg::Idle(reply) => with(|e| e.idle_waiters.push(reply)),
-            Msg::Catalog(catalog) => with(|e| e.catalog = catalog),
+            Msg::Directory(directory) => with(|e| e.directory = directory),
             Msg::RawHostCall(op, args, reply) => {
                 let value = match sync_op(&op, args, None) {
                     OpResult::Json(v) => v,
@@ -457,7 +480,7 @@ fn init(config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtime::Handle) ->
                 code: Fs::new(config.modules.io, root.clone()),
                 root,
                 bridge: config.bridge,
-                catalog: json!([]),
+                directory: json!([]),
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: None,
@@ -652,7 +675,7 @@ unsafe extern "C" fn host_async(
                 }
                 Err(invalid) => finish(invalid),
             }
-        } else if op == "kernel.spawn" {
+        } else if op.starts_with("kernel.") {
             match bridge {
                 Some(bridge) => {
                     handle.spawn(async move {
@@ -663,7 +686,7 @@ unsafe extern "C" fn host_async(
                         finish(result)
                     });
                 }
-                None => finish(OpResult::error("ERR_WENDY_NO_KERNEL", "tools are only available under the wendy kernel")),
+                None => finish(OpResult::error("ERR_WENDY_NO_KERNEL", "other plugins are only reachable under the wendy kernel")),
             }
         } else {
             finish(OpResult::error("ERR_WENDY", format!("{op} has no async form")));
@@ -713,7 +736,7 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
             }
             OpResult::Json(Value::Null)
         }
-        "kernel.catalog" => OpResult::Json(with(|e| e.catalog.clone())),
+        "kernel.directory" => OpResult::Json(with(|e| e.directory.clone())),
         "clock.now" => OpResult::Json(json!(with(|e| e.started.elapsed().as_secs_f64() * 1000.0))),
         "process.cwd" => OpResult::Json(json!(with(|e| e.fs.cwd().to_string()))),
         "process.chdir" => {

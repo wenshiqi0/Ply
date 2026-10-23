@@ -5,7 +5,7 @@ import { execFile } from "node:child_process";
  * the exit code and what it printed; processes it leaves behind are stopped
  * when it exits.
  */
-export async function handle(input: {
+export async function onHandle(input: {
   /** The bash command or script to run. */
   command: string;
   /** Working directory (default: the workspace). */
@@ -28,4 +28,10 @@ export async function handle(input: {
       resolve({ exit_code: err ? err.code : 0, signal: err?.signal ?? null, timed_out: Boolean(err?.killed), stdout, stderr });
     });
   });
+}
+
+/** Offer this plugin to the model as a tool. */
+export async function onLoad() {
+  await tools.context.loaded;
+  await ctx.registerTool("bash");
 }

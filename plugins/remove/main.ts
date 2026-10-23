@@ -2,7 +2,7 @@ import { rm, stat } from "node:fs/promises";
 import path from "node:path";
 
 /** Remove a file, or a directory and everything in it when recursive is set. */
-export async function handle(input: {
+export async function onHandle(input: {
   path: string;
   /** Required to remove a directory. */
   recursive?: boolean;
@@ -13,4 +13,10 @@ export async function handle(input: {
   if (kind === "dir" && !input.recursive) throw new Error(`${input.path} is a directory (set recursive to remove it)`);
   await rm(input.path, { recursive: Boolean(input.recursive) });
   return { path: path.resolve(input.path), kind };
+}
+
+/** Offer this plugin to the model as a tool. */
+export async function onLoad() {
+  await tools.context.loaded;
+  await ctx.registerTool("remove");
 }

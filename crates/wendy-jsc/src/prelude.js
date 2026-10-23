@@ -13,7 +13,7 @@
   const jsonParse = JSON.parse;
   const jsonStringify = JSON.stringify;
   const indirectEval = eval;
-  const { create: objectCreate, assign: objectAssign, entries: objectEntries, freeze: objectFreeze } = Object;
+  const { create: objectCreate, assign: objectAssign, entries: objectEntries, freeze: objectFreeze, hasOwn: objectHasOwn } = Object;
   const config = jsonParse(configJson);
   const G = globalThis;
   const EXIT = Symbol("wendy.exit");
@@ -656,16 +656,23 @@
       );
   }
 
+  // ------------------------------------------------------------------ fiber
+  // The kernel attaches identity from the caller, never from plugin input.
+  const fiber = objectFreeze({
+    info: () => opAsync("kernel.fiber_info", {}),
+    record: (data) => opAsync("kernel.record", { data }),
+  });
+
   // ------------------------------------------------------------------ tools
-  // `await tools.read({ path })`: every plugin, as a lazy fiber. Nothing runs
-  // until it is awaited: `then` is the call, and the kernel runs it as a
-  // child of the fiber doing the awaiting. Awaiting a handle twice runs it
-  // once, like a promise.
+  // `tools.<name>` is every plugin, kept current by the kernel.
   //
-  // `tools` can be listed (`Object.keys(tools)`), and each entry says what
-  // it is as a tool: `description`, `parameters` (JSON Schema of the tool
-  // arguments) and `wrapsInput` (the arguments carry the input as
-  // `{ input }`). The kernel keeps that list current.
+  // - `await tools.bash(input)` runs its `onHandle` as a lazy fiber: nothing
+  //   runs until it is awaited, `then` is the call, and the kernel runs it
+  //   as a child of the fiber doing the awaiting. Awaiting a handle twice
+  //   runs it once, like a promise.
+  // - `await tools.context.loaded` waits until its `onLoad` has returned.
+  // - `description`, and for plugins with `onHandle` `parameters` (JSON
+  //   Schema of its tool arguments) and `wrapsInput`.
   function fiberHandle(plugin, input) {
     let started = null;
     const start = () => (started ??= opAsync("kernel.spawn", { plugin, input: input === undefined ? null : input }));
@@ -675,27 +682,60 @@
       finally: (onSettled) => start().finally(onSettled),
     });
   }
-  const catalog = () => op("kernel.catalog") ?? [];
+  const directory = () => op("kernel.directory") ?? [];
+  const findPlugin = (name) => directory().find((p) => p.name === name);
   function toolEntry(name) {
-    const call = (input) => fiberHandle(name, input);
-    const known = catalog().find((t) => t.name === name);
+    const entry = (input) => fiberHandle(name, input);
+    const props = {
+      loaded: { get: () => opAsync("kernel.loaded", { plugin: name }), enumerable: true },
+    };
+    const known = findPlugin(name);
     if (known) {
-      Object.defineProperties(call, {
-        description: { value: known.description, enumerable: true },
-        parameters: { value: known.parameters, enumerable: true },
-        wrapsInput: { value: known.wraps_input, enumerable: true },
-      });
+      props.description = { value: known.description, enumerable: true };
+      if (known.tool) {
+        props.parameters = { value: known.tool.parameters, enumerable: true };
+        props.wrapsInput = { value: known.tool.wraps_input, enumerable: true };
+      }
     }
-    return objectFreeze(call);
+    Object.defineProperties(entry, props);
+    return objectFreeze(entry);
   }
   const tools = new Proxy(objectCreate(null), {
     // `then` is excluded so `await tools` is not mistaken for a fiber.
     get: (_, name) => (typeof name === "string" && name !== "then" ? toolEntry(name) : undefined),
-    has: (_, name) => typeof name === "string" && catalog().some((t) => t.name === name),
-    ownKeys: () => catalog().map((t) => t.name),
+    has: (_, name) => typeof name === "string" && findPlugin(name) !== undefined,
+    ownKeys: () => directory().map((p) => p.name),
     getOwnPropertyDescriptor: (_, name) =>
-      typeof name === "string" && catalog().some((t) => t.name === name)
+      typeof name === "string" && findPlugin(name) !== undefined
         ? { value: toolEntry(name), enumerable: true, configurable: true, writable: false }
+        : undefined,
+    set: () => false,
+    defineProperty: () => false,
+    deleteProperty: () => false,
+  });
+
+  // -------------------------------------------------------------------- ctx
+  // What every plugin's `onLoad` returned, side by side: plain members as a
+  // copy, functions as async calls into the realm of the plugin that
+  // mounted them (`await ctx.registerTool("bash")`). When two plugins mount
+  // the same name, the later mount wins.
+  function ctxMember(name) {
+    for (const plugin of directory().slice().sort((a, b) => b.mounted - a.mounted)) {
+      if (objectHasOwn(plugin.mounts.data, name)) return plugin.mounts.data[name];
+      if (plugin.mounts.methods.includes(name)) {
+        return (...args) => opAsync("kernel.method", { plugin: plugin.name, method: name, args });
+      }
+    }
+    return undefined;
+  }
+  const ctxNames = () => [...new Set(directory().flatMap((p) => [...Object.keys(p.mounts.data), ...p.mounts.methods]))];
+  const ctx = new Proxy(objectCreate(null), {
+    get: (_, name) => (typeof name === "string" && name !== "then" ? ctxMember(name) : undefined),
+    has: (_, name) => typeof name === "string" && ctxNames().includes(name),
+    ownKeys: () => ctxNames(),
+    getOwnPropertyDescriptor: (_, name) =>
+      typeof name === "string" && ctxNames().includes(name)
+        ? { value: ctxMember(name), enumerable: true, configurable: true, writable: false }
         : undefined,
     set: () => false,
     defineProperty: () => false,
@@ -704,7 +744,7 @@
 
   // --------------------------------------------------------------- globals
   Object.assign(G, {
-    console, process, Buffer, TextEncoder, TextDecoder, tools,
+    console, process, Buffer, TextEncoder, TextDecoder, tools, ctx, fiber,
     setTimeout, setInterval, setImmediate, clearTimeout, clearInterval: clearTimeout, clearImmediate: clearTimeout,
     queueMicrotask,
   });
@@ -789,8 +829,10 @@
       })),
     );
   }
-  // A plugin's entry module, loaded once per realm.
+  // A plugin's entry module, loaded once per realm, and what its onLoad
+  // returned.
   const entries = new Map();
+  const loadedMounts = new Map();
   async function entry(file) {
     if (!entries.has(file)) entries.set(file, load(file, null));
     const rec = entries.get(file);
@@ -819,8 +861,32 @@
     // One fiber: the host has tagged this entry with its id.
     run: (id, file, inputJson) => settle(id, async () => {
       const exports = await entry(file);
-      if (typeof exports.handle !== "function") throw new TypeError(`${file} does not export a handle function`);
-      return await exports.handle(jsonParse(inputJson));
+      if (typeof exports.onHandle !== "function") throw new TypeError(`${file} does not export an onHandle function`);
+      return await exports.onHandle(jsonParse(inputJson));
+    }),
+    // onLoad, once: keep what it returns; tell the host what is in it.
+    load: (id, file) => settle(id, async () => {
+      const exports = await entry(file);
+      const mounted = typeof exports.onLoad === "function" ? await exports.onLoad() : undefined;
+      if (mounted !== undefined && mounted !== null && (typeof mounted !== "object" || Array.isArray(mounted))) {
+        throw new TypeError(`${file}: onLoad must return an object (or nothing)`);
+      }
+      const data = {};
+      const methods = [];
+      for (const [key, value] of objectEntries(mounted ?? {})) {
+        if (typeof value === "function") methods.push(key);
+        else data[key] = value;
+      }
+      loadedMounts.set(file, mounted ?? {});
+      return { data, methods };
+    }),
+    // A function onLoad returned (on ctx), called from another realm.
+    method: (id, file, name, argsJson) => settle(id, async () => {
+      const mounted = loadedMounts.get(file);
+      if (!mounted || !objectHasOwn(mounted, name) || typeof mounted[name] !== "function") {
+        throw new TypeError(`no function ${name} was mounted by ${file}`);
+      }
+      return await mounted[name](...jsonParse(argsJson));
     }),
     onUnhandledRejection(promise, reason) {
       const text = describe(reason) + (reason instanceof Error && reason.stack ? "\n" + reason.stack : "");

@@ -1,5 +1,6 @@
-//! Reading what a plugin is from its source: the JSDoc on `handle` is its
-//! description, `handle`'s parameter and return types are its input and
+//! Reading what a plugin is from its source: which hooks it exports
+//! (`onHandle`, `onLoad`), the JSDoc on `onHandle` (or `onLoad`) as its
+//! description, `onHandle`'s parameter and return types as its input and
 //! output.
 //!
 //! Only the structural part of TypeScript a signature usually uses is
@@ -25,9 +26,17 @@ use wendy_core::{Field, Type};
 #[derive(Debug)]
 pub struct Signature {
     pub description: String,
+    /// It exports `onHandle`.
+    pub callable: bool,
+    /// It exports `onLoad`.
+    pub loads: bool,
     pub input: Type,
     pub output: Type,
 }
+
+/// An exported function: where its statement starts (for its JSDoc), its
+/// parameters and return type.
+type Hook<'p, 'a> = (u32, &'p FormalParameters<'a>, Option<&'p TSTypeAnnotation<'a>>);
 
 pub fn read(source: &str, path: &Path) -> Result<Signature, String> {
     let allocator = Allocator::default();
@@ -40,13 +49,13 @@ pub fn read(source: &str, path: &Path) -> Result<Signature, String> {
 
     // Types declared in the module, by name, so references can be expanded.
     let mut declared: HashMap<&str, Declared> = HashMap::new();
-    let mut handle = None;
+    let mut hooks: HashMap<&str, Hook> = HashMap::new();
     for statement in &program.body {
-        let (declaration, start) = match statement {
-            Statement::ExportDeclaration(export) => (&export.declaration, export.span.start),
+        let (declaration, start, exported) = match statement {
+            Statement::ExportDeclaration(export) => (&export.declaration, export.span.start, true),
             Statement::TSInterfaceDeclaration(_) | Statement::TSTypeAliasDeclaration(_) => {
                 match statement.as_declaration() {
-                    Some(d) => (d, statement.span().start),
+                    Some(d) => (d, statement.span().start, false),
                     None => continue,
                 }
             }
@@ -59,42 +68,52 @@ pub fn read(source: &str, path: &Path) -> Result<Signature, String> {
             Declaration::TSTypeAliasDeclaration(t) => {
                 declared.insert(t.id.name.as_str(), Declared::Alias(&t.type_annotation));
             }
-            Declaration::FunctionDeclaration(f) if f.id.as_ref().is_some_and(|id| id.name == "handle") => {
-                handle = Some((start, &*f.params, f.return_type.as_deref()));
+            Declaration::FunctionDeclaration(f) if exported => {
+                if let Some(id) = &f.id {
+                    hooks.insert(id.name.as_str(), (start, &*f.params, f.return_type.as_deref()));
+                }
             }
-            Declaration::VariableDeclaration(v) => {
+            Declaration::VariableDeclaration(v) if exported => {
                 for d in &v.declarations {
-                    if d.id.get_identifier_name().is_some_and(|n| n == "handle") {
-                        match &d.init {
-                            Some(Expression::ArrowFunctionExpression(a)) => {
-                                handle = Some((start, &*a.params, a.return_type.as_deref()));
-                            }
-                            Some(Expression::FunctionExpression(f)) => {
-                                handle = Some((start, &*f.params, f.return_type.as_deref()));
-                            }
-                            _ => {}
+                    let Some(name) = d.id.get_identifier_name() else { continue };
+                    match &d.init {
+                        Some(Expression::ArrowFunctionExpression(a)) => {
+                            hooks.insert(name.as_str(), (start, &*a.params, a.return_type.as_deref()));
                         }
+                        Some(Expression::FunctionExpression(f)) => {
+                            hooks.insert(name.as_str(), (start, &*f.params, f.return_type.as_deref()));
+                        }
+                        _ => {}
                     }
                 }
             }
             _ => {}
         }
     }
-    let Some((start, params, returns)) = handle else {
-        return Err(format!("{}: does not export a `handle` function", path.display()));
-    };
+    let handle = hooks.get("onHandle").copied();
+    let load = hooks.get("onLoad").copied();
+    if handle.is_none() && load.is_none() {
+        return Err(format!("{}: exports neither an `onHandle` nor an `onLoad` function", path.display()));
+    }
 
     let reader = Reader { source, comments: &program.comments, declared };
-    let input = match parameter(params) {
-        Some(Some(annotation)) => reader.ty(&annotation.type_annotation, &mut Vec::new()),
-        Some(None) => Type::Unknown,
-        None => Type::Undefined,
+    let (input, output) = match handle {
+        Some((_, params, returns)) => (
+            match parameter(params) {
+                Some(Some(annotation)) => reader.ty(&annotation.type_annotation, &mut Vec::new()),
+                Some(None) => Type::Unknown,
+                None => Type::Undefined,
+            },
+            match returns {
+                Some(annotation) => reader.ty(promised(&annotation.type_annotation), &mut Vec::new()),
+                None => Type::Unknown,
+            },
+        ),
+        None => (Type::Undefined, Type::Undefined),
     };
-    let output = match returns {
-        Some(annotation) => reader.ty(promised(&annotation.type_annotation), &mut Vec::new()),
-        None => Type::Unknown,
-    };
-    Ok(Signature { description: reader.doc(start).unwrap_or_default(), input, output })
+    let doc = |hook: Option<Hook>| hook.and_then(|(start, _, _)| reader.doc(start));
+    let description = doc(handle).or_else(|| doc(load));
+    Ok(Signature { description: description.unwrap_or_default(), callable: handle.is_some(), loads: load.is_some(), input, output })
 }
 
 /// `None`: no parameter; `Some(None)`: one without a type.
@@ -102,7 +121,7 @@ fn parameter<'p, 'a>(params: &'p FormalParameters<'a>) -> Option<Option<&'p TSTy
     params.items.first().map(|p| p.type_annotation.as_deref())
 }
 
-/// `Promise<T>` → `T`: a handle's output is what it resolves to.
+/// `Promise<T>` → `T`: what `onHandle` outputs is what it resolves to.
 fn promised<'p, 'a>(ty: &'p TSType<'a>) -> &'p TSType<'a> {
     if let TSType::TSTypeReference(r) = ty
         && matches!(&r.type_name, TSTypeName::IdentifierReference(id) if id.name == "Promise")
@@ -201,20 +220,19 @@ impl<'p, 'a> Reader<'p, 'a> {
         }
     }
 
-    /// The text of the JSDoc comment attached to the node starting at
-    /// `start`, without its `*` gutters and `@tag` lines.
-    fn doc(&self, start: u32) -> Option<String> {
-        let comment = self.comments.iter().rev().find(|c| c.is_jsdoc() && c.attached_to == start)?;
+    /// The JSDoc comment attached to the node starting at `start`, one
+    /// entry per line without the `*` gutter.
+    fn jsdoc(&self, start: u32) -> Vec<&'p str> {
+        let Some(comment) = self.comments.iter().rev().find(|c| c.is_jsdoc() && c.attached_to == start) else {
+            return Vec::new();
+        };
         let span = comment.content_span();
-        let raw = &self.source[span.start as usize..span.end as usize];
-        let mut lines = Vec::new();
-        for line in raw.lines() {
-            let line = line.trim().trim_start_matches('*').trim();
-            if line.starts_with('@') {
-                break;
-            }
-            lines.push(line);
-        }
+        self.source[span.start as usize..span.end as usize].lines().map(|l| l.trim().trim_start_matches('*').trim()).collect()
+    }
+
+    /// The text of that comment, up to its first `@tag` line.
+    fn doc(&self, start: u32) -> Option<String> {
+        let lines: Vec<&str> = self.jsdoc(start).into_iter().take_while(|l| !l.starts_with('@')).collect();
         let text = lines.join("\n").trim().to_string();
         (!text.is_empty()).then_some(text)
     }
@@ -250,12 +268,16 @@ type Out = { count: number; extra: Record<string, boolean> | null };
  * Second paragraph.
  * @param input what to replace
  */
-export async function handle(input: Edit): Promise<Out> {
+export async function onHandle(input: Edit): Promise<Out> {
   return { count: 1, extra: null };
 }
 "#,
         );
         assert_eq!(sig.description, "Replace text in a file.\n\nSecond paragraph.");
+        assert!(sig.callable && !sig.loads);
+        let loader = read_ts("/** Keeps conversations. */\nexport async function onLoad() { return {}; }\n");
+        assert!(!loader.callable && loader.loads);
+        assert_eq!((loader.description.as_str(), loader.input, loader.output), ("Keeps conversations.", Type::Undefined, Type::Undefined));
         assert_eq!(
             sig.input,
             Type::Object {
@@ -288,19 +310,19 @@ export async function handle(input: Edit): Promise<Out> {
     }
 
     #[test]
-    fn reads_arrow_handles_untyped_and_unknown_parts() {
-        let sig = read_ts("type Tree = { children: Tree[] };\nexport const handle = (input: Tree, extra: number) => input;\n");
+    fn reads_arrow_hooks_untyped_and_unknown_parts() {
+        let sig = read_ts("type Tree = { children: Tree[] };\nexport const onHandle = (input: Tree, extra: number) => input;\n");
         assert_eq!(sig.description, "");
         let Type::Object { fields } = &sig.input else { panic!("{:?}", sig.input) };
         assert_eq!(fields[0].ty, Type::Array { items: Box::new(Type::Unknown) });
         assert_eq!(sig.output, Type::Unknown);
 
-        let sig = read("export function handle() { return 1; }\n", Path::new("main.js")).unwrap();
+        let sig = read("export function onHandle() { return 1; }\n", Path::new("main.js")).unwrap();
         assert_eq!((sig.input, sig.output), (Type::Undefined, Type::Unknown));
-        let sig = read_ts("import type { X } from './x';\nexport function handle(input: X): Map<string, X> { return new Map(); }\n");
+        let sig = read_ts("import type { X } from './x';\nexport function onHandle(input: X): Map<string, X> { return new Map(); }\n");
         assert_eq!((sig.input, sig.output), (Type::Unknown, Type::Unknown));
 
-        assert!(read("export const x = 1;\n", Path::new("main.ts")).unwrap_err().contains("does not export a `handle`"));
+        assert!(read("export const x = 1;\nfunction onHandle() {}\n", Path::new("main.ts")).unwrap_err().contains("exports neither"));
         assert!(read("export const = ;\n", Path::new("main.ts")).is_err());
     }
 }

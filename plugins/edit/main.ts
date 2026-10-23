@@ -6,7 +6,7 @@ import path from "node:path";
  * unless replace_all is set; include enough surrounding text to make it
  * unique.
  */
-export async function handle(input: {
+export async function onHandle(input: {
   path: string;
   /** Exact text to replace. */
   old_string: string;
@@ -29,4 +29,10 @@ export async function handle(input: {
   if (found > 1 && !input.replace_all) throw new Error(`old_string occurs ${found} times in ${file}; add context or set replace_all`);
   await writeFile(file, input.replace_all ? text.split(before).join(after) : text.replace(before, () => after));
   return { path: path.resolve(file), replacements: input.replace_all ? found : 1 };
+}
+
+/** Offer this plugin to the model as a tool. */
+export async function onLoad() {
+  await tools.context.loaded;
+  await ctx.registerTool("edit");
 }

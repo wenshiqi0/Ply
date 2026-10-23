@@ -208,7 +208,7 @@ async fn fibers_share_the_realm_and_each_await_names_its_fiber() {
         r#"
 let calls = 0; // shared by every fiber of this plugin
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-export async function handle(input: { n: number; wait: number }) {
+export async function onHandle(input: { n: number; wait: number }) {
   calls++;
   await sleep(input.wait);                  // the fibers interleave here
   const lazy = tools.other({ n: input.n }); // nothing runs yet
@@ -239,10 +239,10 @@ export async function handle(input: { n: number; wait: number }) {
             ("fiber-b".to_string(), r#""other"{"n":2}"#.to_string()),
         ]
     );
-    // A module without `handle` is not a plugin.
+    // A module without `onHandle` cannot run a fiber.
     let plain = w.plugin("plain.ts", "export const x = 1;\n");
     let err = w.rt.run_fiber(realm, &plain, &json!({}), "fiber-c").await.unwrap_err();
-    assert!(err.message.contains("does not export a handle function"), "{}", err.message);
+    assert!(err.message.contains("does not export an onHandle function"), "{}", err.message);
 }
 
 #[tokio::test(flavor = "multi_thread")]

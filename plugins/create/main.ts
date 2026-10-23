@@ -5,7 +5,7 @@ import path from "node:path";
  * Create a file with the given content, and its parent directories. Refuses
  * to replace an existing file unless overwrite is set.
  */
-export async function handle(input: {
+export async function onHandle(input: {
   path: string;
   content: string;
   /** Replace the file if it exists. */
@@ -21,4 +21,10 @@ export async function handle(input: {
   if (!(await stat(parent).then(() => true, () => false))) await mkdir(parent, { recursive: true });
   await writeFile(input.path, input.content);
   return { path: path.resolve(input.path), bytes: Buffer.byteLength(input.content), overwritten: existing === "file" };
+}
+
+/** Offer this plugin to the model as a tool. */
+export async function onLoad() {
+  await tools.context.loaded;
+  await ctx.registerTool("create");
 }

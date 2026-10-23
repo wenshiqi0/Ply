@@ -10,8 +10,8 @@
 //! Everything runs over explicitly mounted storage (default: the current
 //! directory, read-write, at its own path, so the file plugins and the
 //! system bash see the same paths). The default plugins (agent, bash,
-//! create, edit, remove) are loaded unless `--no-default-plugins`;
-//! `--plugin DIR` adds more. `--record FILE` appends every fiber event as a JSON line.
+//! context, create, deepseek, edit, read, remove) are loaded unless
+//! `--no-default-plugins`; `--plugin DIR` adds more. `--record FILE` appends every fiber event as a JSON line.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -55,10 +55,11 @@ struct Setup {
     /// Load a plugin directory (its name is the directory's). Repeatable.
     #[arg(long = "plugin", value_name = "DIR")]
     plugins: Vec<PathBuf>,
-    /// Do not load agent, bash, create, edit and remove.
+    /// Do not load the default plugins (agent, bash, context, create,
+    /// deepseek, edit, read, remove).
     #[arg(long)]
     no_default_plugins: bool,
-    /// Append every fiber event (JSON lines) to this file.
+    /// Append every fiber event (spawn / record / exit, JSON lines) to this file.
     #[arg(long, value_name = "FILE")]
     record: Option<PathBuf>,
 }
@@ -128,6 +129,9 @@ async fn kernel(setup: &Setup) -> Result<Kernel> {
     for dir in &setup.plugins {
         kernel.load(PluginSource::Dir(dir.clone())).await.with_context(|| format!("loading plugin {}", dir.display()))?;
     }
+    // Every onLoad (tools registering into the context, the model choice)
+    // has run before anything is called.
+    kernel.ready().await.context("loading plugins")?;
     Ok(kernel)
 }
 

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 oxc.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 wendy-core.workspace = true
