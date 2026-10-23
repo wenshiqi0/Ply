@@ -13,7 +13,7 @@
   const jsonParse = JSON.parse;
   const jsonStringify = JSON.stringify;
   const indirectEval = eval;
-  const { create: objectCreate, assign: objectAssign, entries: objectEntries, freeze: objectFreeze, defineProperty, hasOwn } = Object;
+  const { create: objectCreate, assign: objectAssign, entries: objectEntries, freeze: objectFreeze } = Object;
   const config = jsonParse(configJson);
   const G = globalThis;
   const EXIT = Symbol("wendy.exit");
@@ -423,27 +423,26 @@
     const enc = opts(o).encoding;
     return enc ? decode(r, enc) : toBuffer(r);
   };
-  // `label(name)` is the API name the IO is traced under (fs.readFileSync, fs.promises.readFile).
-  function makeFs(call, label) {
+  function makeFs(call) {
     return {
-      readFile: (p, o) => call("fs.readFile", { path: String(p), encoding: opts(o).encoding ?? null, api: label("readFile") }),
-      writeFile: (p, d, o) => call("fs.writeFile", { path: String(p), append: opts(o).flag === "a", api: label("writeFile") }, toBytes(d, o)),
-      appendFile: (p, d, o) => call("fs.writeFile", { path: String(p), append: true, api: label("appendFile") }, toBytes(d, o)),
-      stat: (p) => call("fs.stat", { path: String(p), api: label("stat") }),
-      readdir: (p) => call("fs.readdir", { path: String(p), api: label("readdir") }),
-      mkdir: (p, o) => call("fs.mkdir", { path: String(p), recursive: !!opts(o).recursive, api: label("mkdir") }),
-      rm: (p, o) => call("fs.rm", { path: String(p), recursive: !!opts(o).recursive, force: !!opts(o).force, api: label("rm") }),
-      unlink: (p) => call("fs.unlink", { path: String(p), api: label("unlink") }),
-      rmdir: (p, o) => call("fs.rm", { path: String(p), recursive: !!opts(o).recursive, dirOnly: true, api: label("rmdir") }),
-      rename: (a, b) => call("fs.rename", { path: String(a), dest: String(b), api: label("rename") }),
-      copyFile: (a, b) => call("fs.copyFile", { path: String(a), dest: String(b), api: label("copyFile") }),
-      access: (p) => call("fs.access", { path: String(p), api: label("access") }),
-      realpath: (p) => call("fs.realpath", { path: String(p), api: label("realpath") }),
-      exists: (p) => call("fs.exists", { path: String(p), api: label("exists") }),
+      readFile: (p, o) => call("fs.readFile", { path: String(p), encoding: opts(o).encoding ?? null }),
+      writeFile: (p, d, o) => call("fs.writeFile", { path: String(p), append: opts(o).flag === "a" }, toBytes(d, o)),
+      appendFile: (p, d, o) => call("fs.writeFile", { path: String(p), append: true }, toBytes(d, o)),
+      stat: (p) => call("fs.stat", { path: String(p) }),
+      readdir: (p) => call("fs.readdir", { path: String(p) }),
+      mkdir: (p, o) => call("fs.mkdir", { path: String(p), recursive: !!opts(o).recursive }),
+      rm: (p, o) => call("fs.rm", { path: String(p), recursive: !!opts(o).recursive, force: !!opts(o).force }),
+      unlink: (p) => call("fs.unlink", { path: String(p) }),
+      rmdir: (p, o) => call("fs.rm", { path: String(p), recursive: !!opts(o).recursive, dirOnly: true }),
+      rename: (a, b) => call("fs.rename", { path: String(a), dest: String(b) }),
+      copyFile: (a, b) => call("fs.copyFile", { path: String(a), dest: String(b) }),
+      access: (p) => call("fs.access", { path: String(p) }),
+      realpath: (p) => call("fs.realpath", { path: String(p) }),
+      exists: (p) => call("fs.exists", { path: String(p) }),
     };
   }
-  const sfs = makeFs(op, (n) => `fs.${n}Sync`);
-  const fsp = makeFs(opAsync, (n) => `fs.promises.${n}`);
+  const sfs = makeFs(op);
+  const fsp = makeFs(opAsync);
   const dirents = (list, p, o) => (opts(o).withFileTypes ? list.map((e) => new Dirent(e, p)) : list.map((e) => e.name));
   const fsSync = {
     readFileSync: (p, o) => asResult(sfs.readFile(p, o), o),
@@ -551,12 +550,12 @@
   };
 
   // --------------------------------------------------------- child_process
-  // Every process goes through wendy-io's exec: gated, confined to the
-  // read-write disk mounts, its file changes observed and traced.
+  // Every process goes through the IO layer's exec: it runs in a directory
+  // on a disk mount and its process group ends with the call.
   const SIGNALS = { 1: "SIGHUP", 2: "SIGINT", 3: "SIGQUIT", 6: "SIGABRT", 9: "SIGKILL", 13: "SIGPIPE", 14: "SIGALRM", 15: "SIGTERM" };
-  function processCall(call, api, argv, o, explicitOp) {
+  function processCall(call, argv, o) {
     o = o ?? {};
-    const args = { argv: argv.map(String), api };
+    const args = { argv: argv.map(String) };
     if (o.cwd !== undefined) args.cwd = String(o.cwd);
     if (o.env) {
       const env = {};
@@ -565,7 +564,6 @@
     }
     if (o.timeout) args.timeout = Number(o.timeout);
     if (o.maxBuffer) args.maxOutput = Number(o.maxBuffer);
-    if (explicitOp) args.op = explicitOp;
     const input = o.input === undefined || o.input === null ? undefined : toBytes(o.input);
     return call("proc.exec", args, input);
   }
@@ -578,8 +576,6 @@
       timedOut: r.timedOut,
       durationMs: r.durationMs,
       truncated: r.truncated,
-      changes: r.changes,
-      changesComplete: r.changesComplete,
     };
   }
   const asOutput = (buf, enc) => (enc && enc !== "buffer" ? decode(buf, enc) : buf);
@@ -596,10 +592,10 @@
     if (typeof options === "function") return [String(file), args, {}, options];
     return [String(file), args, options ?? {}, callback];
   }
-  function startAsync(api, cmd, argv, options, callback) {
+  function startAsync(cmd, argv, options, callback) {
     const child = new EventEmitter();
     const enc = options.encoding ?? "utf8";
-    processCall(opAsync, api, argv, options).then(
+    processCall(opAsync, argv, options).then(
       (raw) => {
         const r = processResult(raw);
         child.exitCode = r.code;
@@ -616,8 +612,8 @@
     );
     return child;
   }
-  function runSync(api, cmd, argv, options) {
-    const r = processResult(processCall(op, api, argv, options));
+  function runSync(cmd, argv, options) {
+    const r = processResult(processCall(op, argv, options));
     if (r.code !== 0) throw commandError(cmd, r, options.encoding);
     return asOutput(r.stdout, options.encoding);
   }
@@ -625,24 +621,24 @@
   const childProcess = {
     execFile(file, args, options, callback) {
       [file, args, options, callback] = fileArgs(file, args, options, callback);
-      return startAsync("child_process.execFile", [file, ...args].join(" "), [file, ...args], options, callback);
+      return startAsync([file, ...args].join(" "), [file, ...args], options, callback);
     },
     exec(command, options, callback) {
       if (typeof options === "function") [options, callback] = [{}, options];
       options = options ?? {};
-      return startAsync("child_process.exec", String(command), [shellOf(options), "-c", String(command)], options, callback);
+      return startAsync(String(command), [shellOf(options), "-c", String(command)], options, callback);
     },
     execFileSync(file, args, options) {
       [file, args, options] = fileArgs(file, args, options);
-      return runSync("child_process.execFileSync", [file, ...args].join(" "), [file, ...args], options);
+      return runSync([file, ...args].join(" "), [file, ...args], options);
     },
     execSync(command, options) {
       options = options ?? {};
-      return runSync("child_process.execSync", String(command), [shellOf(options), "-c", String(command)], options);
+      return runSync(String(command), [shellOf(options), "-c", String(command)], options);
     },
     spawnSync(file, args, options) {
       [file, args, options] = fileArgs(file, args, options);
-      const r = processResult(processCall(op, "child_process.spawnSync", [file, ...args], options));
+      const r = processResult(processCall(op, [file, ...args], options));
       const stdout = asOutput(r.stdout, options.encoding);
       const stderr = asOutput(r.stderr, options.encoding);
       return { pid: 0, output: [null, stdout, stderr], stdout, stderr, status: r.code, signal: r.signal };
@@ -660,55 +656,28 @@
       );
   }
 
-  // -------------------------------------------------------------------- sdk
-  // `import { definePlugin, exec, call } from "wendy"`. A plugin is a set of
-  // tools; each tool call is one IPO operation run by the kernel:
-  // input(raw, ctx) → process(input, ctx) → output(result, ctx).
-  const PLUGIN = Symbol("wendy.plugin");
-  function definePlugin(def) {
-    if (!def || typeof def !== "object") throw new TypeError("definePlugin expects an object");
-    if (typeof def.name !== "string" || !/^[a-z0-9][a-z0-9_-]*$/i.test(def.name)) {
-      throw new TypeError("a plugin needs a name made of letters, digits, '-' and '_'");
-    }
-    const tools = def.tools ?? {};
-    for (const [name, tool] of objectEntries(tools)) {
-      if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name)) throw new TypeError(`tool name '${name}' must match [a-zA-Z0-9_-]{1,64}`);
-      if (!tool || typeof tool.process !== "function") throw new TypeError(`tool '${name}' needs a process(input, ctx) function`);
-    }
-    const plugin = { name: def.name, description: String(def.description ?? ""), version: def.version ?? null, tools };
-    defineProperty(plugin, PLUGIN, { value: true });
-    return plugin;
-  }
-  async function exec(command, options, explicitOp) {
-    const argv = typeof command === "string" ? ["/bin/bash", "-c", command] : Array.isArray(command) ? command : null;
-    if (!argv || argv.length === 0) throw new TypeError("exec takes a bash command string or an argv array");
-    const r = processResult(await processCall(opAsync, "wendy.exec", argv, options, explicitOp));
-    return { ...r, stdout: decode(r.stdout, "utf8"), stderr: decode(r.stderr, "utf8") };
-  }
-  const kernelCall = (name, args) => opAsync(name, args);
-  const sdk = {
-    definePlugin,
-    exec: (command, options) => exec(command, options),
-    call: (tool, input) => kernelCall("kernel.call", { tool: String(tool), input: input ?? null }),
-    wake: (tool, input) => kernelCall("kernel.wake", { tool: String(tool), input: input ?? null }),
-    tools: () => kernelCall("kernel.tools", {}),
-  };
-  // What a tool's phases receive: the same SDK, bound to their operation.
-  function makeCtx(opId, plugin) {
+  // ------------------------------------------------------------------ tools
+  // `await tools.read({ path })`: every plugin, as a lazy fiber. Nothing runs
+  // until it is awaited: `then` is the call, and the kernel runs it as a
+  // child of the fiber doing the awaiting. Awaiting a handle twice runs it
+  // once, like a promise.
+  function fiberHandle(plugin, input) {
+    let started = null;
+    const start = () => (started ??= opAsync("kernel.spawn", { plugin, input: input === undefined ? null : input }));
     return objectFreeze({
-      op: opId,
-      plugin,
-      exec: (command, options) => exec(command, options, opId),
-      call: (tool, input) => kernelCall("kernel.call", { tool: String(tool), input: input ?? null, op: opId }),
-      wake: (tool, input) => kernelCall("kernel.wake", { tool: String(tool), input: input ?? null, op: opId }),
-      tools: () => kernelCall("kernel.tools", { op: opId }),
-      log: (...a) => write(2, `[${plugin}] ${format(...a)}\n`),
+      then: (onDone, onFailed) => start().then(onDone, onFailed),
+      catch: (onFailed) => start().catch(onFailed),
+      finally: (onSettled) => start().finally(onSettled),
     });
   }
+  const tools = new Proxy(objectFreeze(objectCreate(null)), {
+    // `then` is excluded so `await tools` is not mistaken for a fiber.
+    get: (_, name) => (typeof name === "string" && name !== "then" ? (input) => fiberHandle(name, input) : undefined),
+  });
 
   // --------------------------------------------------------------- globals
   Object.assign(G, {
-    console, process, Buffer, TextEncoder, TextDecoder,
+    console, process, Buffer, TextEncoder, TextDecoder, tools,
     setTimeout, setInterval, setImmediate, clearTimeout, clearInterval: clearTimeout, clearImmediate: clearTimeout,
     queueMicrotask,
   });
@@ -720,7 +689,6 @@
     timers: { setTimeout, setInterval, setImmediate, clearTimeout, clearInterval: clearTimeout },
     "timers/promises": { setTimeout: (ms, v) => new Promise((r) => setTimeout(() => r(v), ms)) },
     child_process: childProcess,
-    wendy: sdk,
   };
   const namespaces = new Map();
   function builtinNamespace(name) {
@@ -794,15 +762,13 @@
       })),
     );
   }
-  const pluginCache = new Map();
-  async function pluginOf(file) {
-    if (pluginCache.has(file)) return pluginCache.get(file);
-    const rec = load(file, null);
+  // A plugin's entry module, loaded once per realm.
+  const entries = new Map();
+  async function entry(file) {
+    if (!entries.has(file)) entries.set(file, load(file, null));
+    const rec = entries.get(file);
     await rec.done;
-    const plugin = rec.exports.default;
-    if (!plugin || plugin[PLUGIN] !== true) throw new TypeError(`${file}: the default export is not a plugin (use definePlugin from "wendy")`);
-    pluginCache.set(file, plugin);
-    return plugin;
+    return rec.exports;
   }
   return {
     main: (id, file) => settle(id, async () => {
@@ -823,34 +789,15 @@
       return await target.apply(owner, jsonParse(argsJson));
     }),
     eval: (id, code) => settle(id, () => indirectEval(code)),
-    describe: (id, file) => settle(id, async () => {
-      const plugin = await pluginOf(file);
-      const tools = objectEntries(plugin.tools).map(([name, t]) => ({
-        name,
-        description: String(t.description ?? ""),
-        input_schema: t.schema ?? { type: "object" },
-      }));
-      return { name: plugin.name, description: plugin.description, version: plugin.version, tools };
-    }),
-    // One IPO operation: the kernel has already traced its start.
-    invoke: (id, file, tool, inputJson, opId) => settle(id, async () => {
-      const plugin = await pluginOf(file);
-      if (!hasOwn(plugin.tools, tool)) throw new TypeError(`plugin ${plugin.name} has no tool '${tool}'`);
-      const def = plugin.tools[tool];
-      const ctx = makeCtx(opId, plugin.name);
-      let value = jsonParse(inputJson);
-      op("ipo.phase", { op: opId, phase: "input" });
-      if (typeof def.input === "function") value = await def.input(value, ctx);
-      op("ipo.phase", { op: opId, phase: "process" });
-      value = await def.process(value, ctx);
-      op("ipo.phase", { op: opId, phase: "output" });
-      if (typeof def.output === "function") value = await def.output(value, ctx);
-      return value;
+    // One fiber: the host has tagged this entry with its id.
+    run: (id, file, inputJson) => settle(id, async () => {
+      const exports = await entry(file);
+      if (typeof exports.handle !== "function") throw new TypeError(`${file} does not export a handle function`);
+      return await exports.handle(jsonParse(inputJson));
     }),
     onUnhandledRejection(promise, reason) {
       const text = describe(reason) + (reason instanceof Error && reason.stack ? "\n" + reason.stack : "");
       write(2, "Uncaught (in promise) " + text + "\n");
-      op("js.unhandled", { text });
     },
     fire,
   };

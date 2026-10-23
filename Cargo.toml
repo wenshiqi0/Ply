@@ -12,7 +12,6 @@ license = "MIT"
 
 [workspace.dependencies]
 wendy-core = { path = "crates/wendy-core" }
-wendy-trace = { path = "crates/wendy-trace" }
 wendy-storage = { path = "crates/wendy-storage" }
 wendy-io = { path = "crates/wendy-io" }
 wendy-jsc = { path = "crates/wendy-jsc" }
@@ -23,6 +22,8 @@ anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+oxc = { version = "0.155", features = ["transformer", "codegen", "semantic", "ast_visit"] }
+oxc_ecmascript = "0.155"
 regex = "1"
 rusqlite = { version = "0.33", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

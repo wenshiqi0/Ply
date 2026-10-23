@@ -10,8 +10,9 @@
 //!   [`fs`] (cwd-relative file operations), [`glob`] (shell patterns),
 //!   [`time`] (UTC calendar arithmetic).
 //! - Nothing here touches storage directly. [`fs`] is a thin, cwd-aware
-//!   layer over [`wendy_io::Io`], so every call is still gated and traced
-//!   under the caller's actor.
+//!   layer over [`Io`].
+//! - Layers above use the IO layer through this crate only, so the IO
+//!   types they need are re-exported here.
 
 pub mod errno;
 pub mod fs;
@@ -21,3 +22,7 @@ pub mod time;
 
 pub use errno::{Errno, SysError};
 pub use fs::Fs;
+pub use wendy_io::{
+    DirItem, DiskStorage, Entry, EntryKind, ExecResult, ExecSpec, Io, MemoryStorage, MountInfo, MountMode,
+    SqliteStorage, Storage, StorageInfo, StorageSpec,
+};

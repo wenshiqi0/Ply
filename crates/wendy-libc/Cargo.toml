@@ -10,4 +10,3 @@ wendy-io.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-wendy-trace.workspace = true

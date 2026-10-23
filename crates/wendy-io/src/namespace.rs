@@ -12,7 +12,6 @@ use std::sync::{Arc, RwLock};
 use serde::Serialize;
 use wendy_storage::{DirItem, Entry, EntryKind, Storage, StorageInfo, normalize};
 
-use crate::gate::under;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,10 +56,6 @@ pub struct Namespace {
 }
 
 impl Namespace {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Mount `storage` at `at`. Fails if something is already mounted there.
     pub fn mount(&self, at: &str, storage: Arc<dyn Storage>, mode: MountMode) -> io::Result<MountInfo> {
         let at = normalize(Path::new(at))?;
@@ -97,11 +92,6 @@ impl Namespace {
         Ok(info)
     }
 
-    /// Every mount, longest mount point first.
-    pub(crate) fn snapshot(&self) -> Vec<Mount> {
-        self.mounts.read().expect("mount table poisoned").clone()
-    }
-
     pub fn list(&self) -> Vec<MountInfo> {
         let mut infos: Vec<MountInfo> =
             self.mounts.read().expect("mount table poisoned").iter().map(Mount::info).collect();
@@ -124,6 +114,12 @@ impl Namespace {
     pub(crate) fn mount_children(&self, path: &str) -> Vec<String> {
         mount_children(&self.mounts.read().expect("mount table poisoned"), path)
     }
+}
+
+/// `path` equals `prefix` or lies below it, compared by whole components.
+fn under(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
 fn mount_children(mounts: &[Mount], path: &str) -> Vec<String> {

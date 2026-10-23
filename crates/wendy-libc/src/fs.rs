@@ -3,7 +3,7 @@
 //! These are the building blocks for both outlets: `rm -r` and
 //! `fs.rmSync(p, {recursive: true})` both call [`Fs::remove_all`]. Every
 //! method resolves against the current directory, then goes through
-//! [`Io`], which gates and traces it.
+//! [`Io`].
 
 use wendy_io::{DirItem, Entry, EntryKind, Io};
 
@@ -33,16 +33,6 @@ impl Fs {
 
     pub fn with_cwd(&self, cwd: &str) -> Fs {
         Fs { io: self.io.clone(), cwd: self.resolve(cwd) }
-    }
-
-    /// Same filesystem, IO attributed to `label` (an API or program name).
-    pub fn labeled(&self, label: &str) -> Fs {
-        Fs { io: self.io.labeled(label), cwd: self.cwd.clone() }
-    }
-
-    /// Same filesystem, IO attributed to IPO operation `op`.
-    pub fn in_op(&self, op: Option<String>) -> Fs {
-        Fs { io: self.io.in_op(op), cwd: self.cwd.clone() }
     }
 
     pub fn resolve(&self, p: &str) -> String {

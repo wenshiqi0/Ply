@@ -1,19 +1,17 @@
 [package]
 name = "wendy-kernel"
-description = "wendy's IPO kernel: plugins are tool wrappers, every tool call is an input → process → output operation"
+description = "wendy's kernel: each plugin is one function, each execution a fiber"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+oxc.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 wendy-core.workspace = true
-wendy-io.workspace = true
 wendy-jsc.workspace = true
-wendy-storage.workspace = true
-wendy-trace.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

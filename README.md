@@ -1,24 +1,34 @@
 # wendy
 
-一个 agent harness。Rust 是主核心，插件用 TS 写，插件就是工具的封装；每一次工具调用都是内核里的一次 IPO 操作（input → process → output）。
+一个 agent harness。Rust 是主核心，插件用 TS 写：每个插件就是一个函数 `handle(input)`，每次执行是内核调度的一个 fiber。插件之间不互相调用，只互相等待：`await tools.read({ path })` 的那一刻就是调用。
 
-wendy 管控的是 **IO**。插件（JSC 沙箱，对齐 node）的文件 IO 和它启动的真实进程（系统 bash）都走同一层：只有挂载的存储可见，每一次读写和每一次起进程都经过闸门判定并记进 trace；进程只能写读写挂载，它改了什么会被观测下来，同样记进 trace。trace 可以通过 hook 落盘，挂载的存储可以随时在磁盘、内存、数据库之间切换。
+wendy 记录的是 fiber：每个 fiber 的输入、输出（或错误），以及谁等待了谁。插件只能看到挂载的存储，挂载的存储可以在磁盘、内存、数据库之间切换。
 
 设计细节见 [docs/design.md](docs/design.md)。
 
-## 现状
+## 写一个插件
 
-| crate | 状态 |
-|---|---|
-| `wendy-storage` | 完成：磁盘 / 内存 / SQLite 后端，同一套行为测试同时跑三种后端 |
-| `wendy-trace` | 完成：事件 + 内存 hook + JSONL 落盘 hook |
-| `wendy-io` | 完成：挂载表、闸门、按 actor 和 IPO 操作归属的 trace；`exec` 启动真实进程（Seatbelt 限制写入和网络，FSEvents 观测改动） |
-| `wendy-libc` | errno / path / fs / glob / time |
-| `wendy-jsc` | 可用：每个插件一个 realm、一个线程；直接运行 TS；node API：`fs`、`path`、`process`、`child_process`、`console`、定时器、`Buffer`、`events`、`util`、`os`；SDK 模块 `wendy` |
-| `wendy-core` | 描述层：IPO 操作、插件、工具 |
-| `wendy-kernel` | 完成：加载插件、工具调用即 IPO 操作（可嵌套、可唤起）、审批也是 IPO 操作；内置工具 bash / read / edit / create / delete |
-| `wendy-cli` | `wendy tools`、`wendy call`、`wendy mcp`、`wendy run` |
-| `wendy-sh` | 暂停：自研的对齐 bash 的 sh，目前工具直接用系统 bash；源码保留，不参与构建 |
+一个目录就是一个插件，目录名就是插件名。`main.ts` 导出一个 `handle`：
+
+```ts
+// todos/main.ts
+
+/** Count TODO lines in a file. */
+export async function handle(input: { path: string }): Promise<{ todos: number; lines: number }> {
+  const [file, grep] = await Promise.all([
+    tools.read({ path: input.path }),                                   // 等待另一个插件：一个子 fiber
+    tools.bash({ command: `grep -c TODO ${JSON.stringify(input.path)}` }),
+  ]);
+  return { todos: Number(grep.stdout.trim()), lines: file.total_lines };
+}
+```
+
+- `handle` 上的 JSDoc 是插件的描述，`handle` 的参数类型和返回类型就是它的输入和输出（wendy 加载时从签名里读出来）。
+- 参数校验由插件自己做；权限这类控制也放在插件里。
+- 同一个插件的多次执行共享模块里的闭包，在 `await` 处交替执行。
+- 可以用 node 的模块（`fs`、`path`、`child_process` 等），类型声明见 [packages/sdk/globals.d.ts](packages/sdk/globals.d.ts)。
+
+默认带五个插件，写法和上面一样：[bash](plugins/bash/main.ts)、[read](plugins/read/main.ts)、[edit](plugins/edit/main.ts)、[create](plugins/create/main.ts)、[delete](plugins/delete/main.ts)。
 
 ## 试一下
 
@@ -26,65 +36,50 @@ wendy 管控的是 **IO**。插件（JSC 沙箱，对齐 node）的文件 IO 和
 cargo build -p wendy-cli
 ```
 
-默认把当前目录以读写方式挂在它自己的路径上，文件工具和 bash 看到的路径一致：
+默认把当前目录以读写方式挂在它自己的路径上：
 
 ```bash
 ./target/debug/wendy tools
 ```
 
 ```bash
-./target/debug/wendy call --trace trace.jsonl edit '{"path": "src/main.rs", "old_string": "hi", "new_string": "hello"}'
+./target/debug/wendy call --record fibers.jsonl edit '{"path": "src/main.rs", "old_string": "hi", "new_string": "hello"}'
 ```
 
 ```bash
-./target/debug/wendy call bash '{"command": "cargo --version && ls"}'
+./target/debug/wendy call --plugin ./todos todos '{"path": "README.md"}'
 ```
 
 作为 MCP server 给 agent 用（例如 Claude Code）：
 
 ```bash
-claude mcp add wendy -- /path/to/wendy/target/debug/wendy mcp --trace /tmp/wendy-trace.jsonl
+claude mcp add wendy -- /path/to/wendy/target/debug/wendy mcp --record /tmp/wendy-fibers.jsonl
 ```
 
-自己写插件（类型声明见 [packages/sdk/wendy.d.ts](packages/sdk/wendy.d.ts)）：
-
-```ts
-import { definePlugin } from "wendy";
-import fs from "node:fs/promises";
-
-export default definePlugin({
-  name: "notes",
-  tools: {
-    count_todos: {
-      description: "Count TODO lines in a file",
-      schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
-      async process({ path }, ctx) {
-        const text = await fs.readFile(path, "utf8");               // 走 wendy-io
-        const read = await ctx.call("read", { path, limit: 1 });    // 调另一个工具：子操作
-        const grep = await ctx.exec(["grep", "-c", "TODO", path]);  // 受限的真实进程
-        return { todos: Number(grep.stdout.trim()), lines: read.total_lines, bytes: text.length };
-      },
-    },
-  },
-});
-```
+直接运行一个 TS 文件（像 node 一样，定时器跑完才退出；`tools` 可用）：
 
 ```bash
-./target/debug/wendy call --plugin ./my-plugin count_todos '{"path": "README.md"}'
+./target/debug/wendy run ./script.ts -- arg1
 ```
 
-直接运行一个 TS 文件（像 node 一样，定时器跑完才退出）：
+选项：
+- `--mount SPEC`：`AT=disk:PATH[:ro]`、`AT=sqlite:PATH[:ro]`、`AT=memory`，或者 `disk:PATH[:ro]`（挂在它自己的绝对路径上），可以重复多次。
+- `--plugin DIR`：加载一个插件目录，可以重复多次。
+- `--no-default-plugins`：不加载默认的五个插件。
+- `--record FILE`：把每个 fiber 事件（spawn / exit）以 JSON lines 追加到文件。
 
-```bash
-./target/debug/wendy run --mount /work=disk:./project:ro --mount /notes=sqlite:./notes.db ./script.ts -- arg1
-```
+## crate
 
-挂载格式：`AT=disk:PATH[:ro]`、`AT=sqlite:PATH[:ro]`、`AT=memory`，或者 `disk:PATH[:ro]`（挂在它自己的绝对路径上），可以重复多次。
-- `--ask`：每次写入和每次起进程前在终端里输入 y / a / n 确认（a 表示这个路径以后都放行）。
-- `--deny-write PATH`：拒绝写入该路径下的任何文件，也拒绝在这里起进程。
-- `--allow-net`：允许工具启动的进程联网（默认禁止）。
-- `--deny-read PATH`：进程不能读这个宿主目录（例如 `~/.ssh`）。
-- `--trace FILE`：把所有 trace 事件以 JSON lines 追加到文件，每次运行带一个 `run_id`。
+| crate | 内容 |
+|---|---|
+| `wendy-storage` | 磁盘 / 内存 / SQLite 后端，同一套行为测试同时跑三种 |
+| `wendy-io` | 挂载表（mount / unmount / swap，只有挂载的路径存在）；在磁盘挂载上启动真实进程 |
+| `wendy-libc` | errno / path / fs / glob / time |
+| `wendy-jsc` | 内嵌 JavaScriptCore，直接运行 TS；每个插件一个 realm、一个线程；node API 和全局 `tools` |
+| `wendy-core` | 描述层：插件、输入输出的类型、fiber、fiber 事件和 hook |
+| `wendy-kernel` | 加载插件、读出签名、调度 fiber、发出 fiber 事件、默认插件 |
+| `wendy-cli` | `wendy tools`、`wendy call`、`wendy mcp`、`wendy run` |
+| `wendy-sh` | 暂停：自研的对齐 bash 的 sh，源码保留，不参与构建 |
 
 ## 测试
 
@@ -92,4 +87,4 @@ export default definePlugin({
 cargo test --workspace
 ```
 
-目前只支持 macOS（系统 JavaScriptCore、Seatbelt、FSEvents）。
+目前只支持 macOS（系统 JavaScriptCore）。

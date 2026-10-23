@@ -1,29 +1,32 @@
-//! Realms: one plugin, one JSC context group, one OS thread.
+//! Realms: one plugin, one JSC context group, one OS thread; many fibers.
 //!
 //! Important decisions:
 //! - JSC is single-threaded per context group, so every realm gets its own
 //!   group on its own thread. A plugin that blocks its thread (a sync fs
-//!   call waiting for an approval, a long computation) holds up only itself.
-//!   Callers talk to a realm through messages; every reply is a oneshot.
+//!   call, a long computation) holds up only itself. Callers talk to a realm
+//!   through messages; every reply is a oneshot.
+//! - A realm runs every fiber of its plugin. They share the module's
+//!   closures and interleave at `await`, like requests in one node process.
+//! - Every entry into JS (a fiber starting, an async host op completing, a
+//!   timer firing) is tagged with the fiber that caused it; async work
+//!   started during an entry inherits its tag. A plugin awaiting another
+//!   (`tools.x(...)`) is therefore known to be the fiber of the entry the
+//!   `then` ran in. The one blind spot: a fiber continuing after a promise
+//!   another fiber created runs under that other fiber's tag.
 //! - Async host ops run on tokio; completion is a message back to the
 //!   realm's thread, which resolves the deferred promise. JSC drains
 //!   microtasks after each call into JS, so `await` continuations run there.
-//!   Sync host ops (`readFileSync`) block the realm's thread on the same
-//!   futures, like node's sync APIs block its loop.
+//!   Sync host ops (`readFileSync`) block the realm's thread.
 //! - Nothing that arrives from JS is trusted. The prelude shares the realm
 //!   with plugin code, which can replace any global the prelude uses, so
 //!   every host op re-validates here: a module loads only if wendy itself
-//!   resolved it inside the plugin root; trace labels come from a fixed list
-//!   per op; settles, timers and IPO phases must belong to this realm. A
-//!   tampered call can at most ask for something the plugin could have asked
-//!   for honestly, and the tampering is traced.
+//!   resolved it inside the plugin root; settles and timers must belong to
+//!   this realm.
 //! - Each entry into JS gets a CPU budget and the process a memory ceiling
 //!   (a watchdog checks both every 100 ms of CPU). A turn over either is
 //!   terminated, the realm's pending calls fail, the realm stays usable.
-//! - Plugin source is read through wendy-io (its own namespace, read-only),
-//!   so loading code is a traced read like any other and plugins can live on
-//!   any storage. IO the realm performs is attributed to the IPO operation
-//!   it runs for when that is unambiguous (exactly one in flight).
+//! - Plugin source is read through the IO layer (a namespace of its own),
+//!   so plugins can live on any storage.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -37,9 +40,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
-use wendy_io::{Actor, EntryKind, ExecSpec, Io, Runtime as IoRuntime};
-use wendy_libc::{Errno, Fs, SysError, path as lpath};
-use wendy_trace::{Scope, Tracer, Verdict};
+use wendy_libc::{EntryKind, Errno, ExecSpec, Fs, Io, SysError, path as lpath};
 
 use crate::ffi::*;
 use crate::transpile::transpile;
@@ -59,8 +60,6 @@ const BUILTINS: &[&str] = &[
     "timers/promises",
     "child_process",
 ];
-/// `import ... from "wendy"`: the plugin SDK.
-const SDK: &str = "wendy";
 const WATCHDOG_TICK: f64 = 0.1;
 
 /// Where a realm's own code comes from: a directory in a (read-only)
@@ -85,15 +84,15 @@ impl Default for Limits {
     }
 }
 
-/// Who called a bridged op. Filled in by wendy, never by plugin code.
+/// Who started a bridged op. Filled in by wendy, never by plugin code.
 #[derive(Debug, Clone)]
 pub struct Caller {
     pub realm: String,
-    /// The IPO operation the call belongs to, when known.
-    pub op: Option<String>,
+    /// The fiber whose entry the call was made in, if any.
+    pub fiber: Option<String>,
 }
 
-/// The host side of `kernel.*` ops (other tools, waking, listing).
+/// The host side of `kernel.*` ops: awaiting another plugin.
 #[async_trait::async_trait]
 pub trait HostBridge: Send + Sync {
     async fn call(&self, caller: Caller, op: &str, args: Value) -> Result<Value, String>;
@@ -101,7 +100,7 @@ pub trait HostBridge: Send + Sync {
 
 pub struct RealmConfig {
     pub name: String,
-    /// The shared IO layer; the realm acts on it as a `js` actor.
+    /// The namespace the realm's code works on.
     pub io: Io,
     /// Starting directory inside the namespace.
     pub cwd: String,
@@ -155,11 +154,11 @@ impl OpResult {
 type Reply<T> = oneshot::Sender<T>;
 
 enum Msg {
-    /// `api[method](callId, ...args)`; the prelude reports back via `settle`.
-    Api { method: &'static str, args: Vec<String>, op: Option<String>, reply: Reply<Result<Value, JsError>> },
+    /// `api[method](callId, ...args)`, as an entry tagged with `fiber`; the
+    /// prelude reports back via `settle`.
+    Api { method: &'static str, args: Vec<String>, fiber: Option<String>, reply: Reply<Result<Value, JsError>> },
     TakeOutput(Reply<Output>),
     Idle(Reply<()>),
-    Rename(String),
     RawHostCall(String, Value, Reply<Value>),
     Completion(u64, OpResult),
     Timer(u64),
@@ -214,42 +213,34 @@ impl JsRuntime {
         realms.get(realm.0).is_some_and(|r| r.tx.send(msg).is_ok())
     }
 
-    async fn api(&self, realm: RealmId, method: &'static str, args: Vec<String>, op: Option<String>) -> Result<Value, JsError> {
+    async fn api(&self, realm: RealmId, method: &'static str, args: Vec<String>, fiber: Option<String>) -> Result<Value, JsError> {
         let (reply, rx) = oneshot::channel();
-        if !self.send(realm, Msg::Api { method, args, op, reply }) {
+        if !self.send(realm, Msg::Api { method, args, fiber, reply }) {
             return Err(gone());
         }
         rx.await.unwrap_or_else(|_| Err(gone()))
     }
 
-    /// Load `module` (a path in the realm's module namespace) as the entry
-    /// and wait for it to finish evaluating. Returns the names it exports.
+    /// Load `module` (a path in the realm's module namespace) and wait for
+    /// it to finish evaluating. Returns the names it exports.
     pub async fn run_main(&self, realm: RealmId, module: &str) -> Result<Value, JsError> {
         self.api(realm, "main", vec![module.into()], None).await
     }
 
-    /// Call an export of a module (`"default.process"` walks properties),
-    /// awaiting the result if it is a promise.
+    /// Call an export of a module (`"a.b"` walks properties), awaiting the
+    /// result if it is a promise.
     pub async fn call(&self, realm: RealmId, module: &str, export: &str, args: Vec<Value>) -> Result<Value, JsError> {
         self.api(realm, "call", vec![module.into(), export.into(), Value::Array(args).to_string()], None).await
+    }
+
+    /// Run `handle(input)` of a module as fiber `fiber`.
+    pub async fn run_fiber(&self, realm: RealmId, module: &str, input: &Value, fiber: &str) -> Result<Value, JsError> {
+        self.api(realm, "run", vec![module.into(), input.to_string()], Some(fiber.to_string())).await
     }
 
     /// Evaluate a plain-JS script in the realm (awaiting a promise result).
     pub async fn eval(&self, realm: RealmId, code: &str) -> Result<Value, JsError> {
         self.api(realm, "eval", vec![code.into()], None).await
-    }
-
-    /// The plugin a module's default export defines (`definePlugin`), as
-    /// JSON: name, description, version, tools with their input schemas.
-    pub async fn describe_plugin(&self, realm: RealmId, module: &str) -> Result<Value, JsError> {
-        self.api(realm, "describe", vec![module.into()], None).await
-    }
-
-    /// Run one tool of the plugin as IPO operation `op`: its input, process
-    /// and output phases, in this realm.
-    pub async fn invoke_tool(&self, realm: RealmId, module: &str, tool: &str, input: &Value, op: &str) -> Result<Value, JsError> {
-        let args = vec![module.into(), tool.into(), input.to_string(), op.into()];
-        self.api(realm, "invoke", args, Some(op.to_string())).await
     }
 
     /// Everything the realm wrote to stdout/stderr since the last call.
@@ -259,12 +250,6 @@ impl JsRuntime {
             return Output::default();
         }
         rx.await.unwrap_or_default()
-    }
-
-    /// Change the name the realm acts and traces under (its IO actor's
-    /// session). Applies to everything the realm does after this.
-    pub fn rename(&self, realm: RealmId, name: &str) {
-        self.send(realm, Msg::Rename(name.to_string()));
     }
 
     /// Send one host call exactly as given, the way a prelude that plugin
@@ -304,11 +289,6 @@ impl Drop for JsRuntime {
 
 // ---------------------------------------------------------------- engine
 
-struct Pending {
-    reply: Reply<Result<Value, JsError>>,
-    op: Option<String>,
-}
-
 struct Engine {
     group: JSContextGroupRef,
     ctx: JSGlobalContextRef,
@@ -317,18 +297,20 @@ struct Engine {
     fs: Fs,
     code: Fs,
     root: String,
-    tracer: Tracer,
     bridge: Option<Arc<dyn HostBridge>>,
     stdout: String,
     stderr: String,
     exit_code: Option<i32>,
+    /// The fiber the running entry belongs to.
+    current: Option<String>,
     /// Module ids wendy resolved for this realm, and those it loaded.
     resolved: HashSet<String>,
     loaded: HashSet<String>,
-    /// Armed timers: id → repeat interval (ms) for intervals.
-    timers: HashMap<u64, Option<f64>>,
-    pending_ops: HashMap<u64, JSObjectRef>,
-    calls: HashMap<u64, Pending>,
+    /// Armed timers: id → (repeat interval in ms, fiber that armed it).
+    timers: HashMap<u64, (Option<f64>, Option<String>)>,
+    /// Async host ops in flight: id → (resolve function, fiber).
+    pending_ops: HashMap<u64, (JSObjectRef, Option<String>)>,
+    calls: HashMap<u64, Reply<Result<Value, JsError>>>,
     /// Calls failed by a termination; their late settles are expected.
     abandoned: HashSet<u64>,
     idle_waiters: Vec<Reply<()>>,
@@ -342,17 +324,6 @@ impl Engine {
     fn next(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
-    }
-
-    /// The IPO operation in flight, if exactly one is.
-    fn current_op(&self) -> Option<String> {
-        let mut ops = self.calls.values().filter_map(|p| p.op.as_ref());
-        let first = ops.next()?;
-        ops.all(|o| o == first).then(|| first.clone())
-    }
-
-    fn is_active_op(&self, op: &str) -> bool {
-        self.calls.values().any(|p| p.op.as_deref() == Some(op))
     }
 
     fn is_idle(&self) -> bool {
@@ -407,10 +378,13 @@ fn footprint() -> u64 {
     if ok == 0 { info.ri_phys_footprint } else { 0 }
 }
 
-/// Run `f`, which enters JS, with a fresh CPU budget.
-fn enter<T>(f: impl FnOnce() -> T) -> T {
+/// Run `f`, which enters JS, as fiber `fiber` with a fresh CPU budget.
+fn enter<T>(fiber: Option<String>, f: impl FnOnce() -> T) -> T {
+    with(|e| e.current = fiber);
     TICKS.set(0);
-    f()
+    let result = f();
+    with(|e| e.current = None);
+    result
 }
 
 fn engine_main(
@@ -424,7 +398,7 @@ fn engine_main(
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Shutdown => break,
-            Msg::Api { method, args, op, reply } => start_call(method, args, op, reply),
+            Msg::Api { method, args, fiber, reply } => start_call(method, args, fiber, reply),
             Msg::TakeOutput(reply) => {
                 let out = with(|e| Output {
                     stdout: std::mem::take(&mut e.stdout),
@@ -434,15 +408,6 @@ fn engine_main(
                 let _ = reply.send(out);
             }
             Msg::Idle(reply) => with(|e| e.idle_waiters.push(reply)),
-            Msg::Rename(name) => with(|e| {
-                let renamed = |fs: &Fs| {
-                    let actor = Actor { session: name.clone(), ..fs.io().actor().clone() };
-                    Fs::new(fs.io().as_actor(actor), fs.cwd())
-                };
-                e.fs = renamed(&e.fs);
-                e.code = renamed(&e.code);
-                e.name = name;
-            }),
             Msg::RawHostCall(op, args, reply) => {
                 let value = match sync_op(&op, args, None) {
                     OpResult::Json(v) => v,
@@ -461,10 +426,6 @@ fn engine_main(
 
 fn init(config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtime::Handle) -> Result<(), JsError> {
     let fail = |message: String| JsError { message, ..JsError::default() };
-    let actor = Actor::new(IoRuntime::Js, config.name.clone(), "js");
-    let io = config.io.as_actor(actor.clone());
-    let code_io = config.modules.io.as_actor(Actor { label: "module.load".into(), ..actor });
-    let tracer = io.tracer().clone();
     let root = lpath::normalize(&config.modules.root);
     unsafe {
         let group = JSContextGroupCreate();
@@ -482,14 +443,14 @@ fn init(config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtime::Handle) ->
                 ctx,
                 api: null_mut(),
                 name: config.name.clone(),
-                fs: Fs::new(io, config.cwd.clone()),
-                code: Fs::new(code_io, root.clone()),
+                fs: Fs::new(config.io, config.cwd.clone()),
+                code: Fs::new(config.modules.io, root.clone()),
                 root,
-                tracer,
                 bridge: config.bridge,
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: None,
+                current: None,
                 resolved: HashSet::new(),
                 loaded: HashSet::new(),
                 timers: HashMap::new(),
@@ -503,12 +464,12 @@ fn init(config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtime::Handle) ->
                 started: Instant::now(),
             })
         });
-        let prelude = enter(|| eval(ctx, PRELUDE, "wendy:prelude")).map_err(fail)?;
+        let prelude = enter(None, || eval(ctx, PRELUDE, "wendy:prelude")).map_err(fail)?;
         let host = JSObjectMakeFunctionWithCallback(ctx, JsStr::new("host").0, host_sync);
         let host_async_fn = JSObjectMakeFunctionWithCallback(ctx, JsStr::new("hostAsync").0, host_async);
         let settings = json!({ "env": config.env, "argv": config.argv, "version": env!("CARGO_PKG_VERSION") }).to_string();
         let prelude_fn = JSValueToObject(ctx, prelude, null_mut());
-        let api = enter(|| call(ctx, prelude_fn, &[host as JSValueRef, host_async_fn as JSValueRef, string_value(ctx, &settings)]))
+        let api = enter(None, || call(ctx, prelude_fn, &[host as JSValueRef, host_async_fn as JSValueRef, string_value(ctx, &settings)]))
             .map_err(fail)?;
         JSValueProtect(ctx, api);
         let api = api as JSObjectRef;
@@ -522,7 +483,7 @@ fn init(config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtime::Handle) ->
 fn teardown() {
     let Some(engine) = ENGINE.with(|e| e.borrow_mut().take()) else { return };
     unsafe {
-        for (_, resolve) in engine.pending_ops {
+        for (_, (resolve, _)) in engine.pending_ops {
             JSValueUnprotect(engine.ctx, resolve as JSValueRef);
         }
         if !engine.api.is_null() {
@@ -533,25 +494,24 @@ fn teardown() {
     }
 }
 
-/// After each message: report a terminated turn, wake idle waiters.
+/// After each message: handle a terminated turn, wake idle waiters.
 fn after_turn() {
     if let Some(reason) = TERMINATED.with(|t| t.borrow_mut().take()) {
-        let (name, tracer, calls) = with(|e| {
+        let (name, calls) = with(|e| {
             e.stderr.push_str(&format!("wendy: {}: script terminated: {reason}\n", e.name));
             let calls = std::mem::take(&mut e.calls);
             e.abandoned.extend(calls.keys());
-            (e.name.clone(), e.tracer.clone(), calls)
+            (e.name.clone(), calls)
         });
-        tracer.emit(Scope::Exec, "js.terminated", Verdict::Error, json!({ "realm": name, "reason": reason }));
-        for (_, pending) in calls {
+        for (_, reply) in calls {
             let message = format!("{name}: script terminated: {reason}");
-            let _ = pending.reply.send(Err(JsError { message, ..JsError::default() }));
+            let _ = reply.send(Err(JsError { message, ..JsError::default() }));
         }
         // A termination that hit while microtasks drained stays pending in
         // the VM, and the next entry's microtask queue is dropped while JSC
         // clears it. Spend that on an empty entry instead of a real call.
         let ctx = with(|e| e.ctx);
-        let _ = enter(|| unsafe { eval(ctx, "void 0", "wendy:recover") });
+        let _ = enter(None, || unsafe { eval(ctx, "void 0", "wendy:recover") });
         TERMINATED.with(|t| t.borrow_mut().take());
     }
     let waiters = with(|e| if e.is_idle() { std::mem::take(&mut e.idle_waiters) } else { Vec::new() });
@@ -560,48 +520,48 @@ fn after_turn() {
     }
 }
 
-fn start_call(method: &'static str, args: Vec<String>, op: Option<String>, reply: Reply<Result<Value, JsError>>) {
+fn start_call(method: &'static str, args: Vec<String>, fiber: Option<String>, reply: Reply<Result<Value, JsError>>) {
     let (ctx, api, id) = with(|e| {
         let id = e.next();
-        e.calls.insert(id, Pending { reply, op });
+        e.calls.insert(id, reply);
         (e.ctx, e.api, id)
     });
     unsafe {
         let f = JSValueToObject(ctx, get_property(ctx, api, method), null_mut());
         let mut argv = vec![JSValueMakeNumber(ctx, id as f64)];
         argv.extend(args.iter().map(|a| string_value(ctx, a)));
-        if let Err(message) = enter(|| call(ctx, f, &argv))
-            && let Some(pending) = with(|e| e.calls.remove(&id))
+        if let Err(message) = enter(fiber, || call(ctx, f, &argv))
+            && let Some(reply) = with(|e| e.calls.remove(&id))
         {
-            let _ = pending.reply.send(Err(JsError { message, ..JsError::default() }));
+            let _ = reply.send(Err(JsError { message, ..JsError::default() }));
         }
     }
 }
 
 fn complete(id: u64, result: OpResult) {
-    let Some((ctx, resolve)) = with(|e| e.pending_ops.remove(&id).map(|r| (e.ctx, r))) else { return };
+    let Some((ctx, resolve, fiber)) = with(|e| e.pending_ops.remove(&id).map(|(r, f)| (e.ctx, r, f))) else { return };
     unsafe {
         let value = result_value(ctx, result);
-        let _ = enter(|| call(ctx, resolve, &[value]));
+        let _ = enter(fiber, || call(ctx, resolve, &[value]));
         JSValueUnprotect(ctx, resolve as JSValueRef);
     }
 }
 
 fn fire_timer(id: u64) {
     let target = with(|e| {
-        let repeat = *e.timers.get(&id)?;
+        let (repeat, fiber) = e.timers.get(&id).cloned()?;
         match repeat {
             Some(ms) => arm_timer(e, id, ms),
             None => {
                 e.timers.remove(&id);
             }
         }
-        Some((e.ctx, e.api))
+        Some((e.ctx, e.api, fiber))
     });
-    let Some((ctx, api)) = target else { return };
+    let Some((ctx, api, fiber)) = target else { return };
     unsafe {
         let f = JSValueToObject(ctx, get_property(ctx, api, "fire"), null_mut());
-        let _ = enter(|| call(ctx, f, &[JSValueMakeNumber(ctx, id as f64)]));
+        let _ = enter(fiber, || call(ctx, f, &[JSValueMakeNumber(ctx, id as f64)]));
     }
 }
 
@@ -663,51 +623,36 @@ unsafe extern "C" fn host_async(
         let mut reject: JSObjectRef = null_mut();
         let promise = JSObjectMakeDeferredPromise(ctx, &mut resolve, &mut reject, null_mut());
         JSValueProtect(ctx, resolve as JSValueRef);
-        let (id, tx, handle) = with(|e| {
+        // The op belongs to the fiber of the entry it was started in.
+        let (id, tx, handle, fs, fiber, bridge, realm) = with(|e| {
             let id = e.next();
-            e.pending_ops.insert(id, resolve);
-            (id, e.tx.clone(), e.handle.clone())
+            e.pending_ops.insert(id, (resolve, e.current.clone()));
+            (id, e.tx.clone(), e.handle.clone(), e.fs.clone(), e.current.clone(), e.bridge.clone(), e.name.clone())
         });
         let finish = move |result: OpResult| {
             let _ = tx.send(Msg::Completion(id, result));
         };
         if op.starts_with("fs.") {
-            match fs_for(&op, &args, false) {
-                Ok(fs) => {
-                    handle.spawn(async move { finish(fs_op(fs, &op, args, bytes).await) });
-                }
-                Err(denied) => finish(denied),
-            }
+            handle.spawn(async move { finish(fs_op(fs, &op, args, bytes).await) });
         } else if op == "proc.exec" {
-            match exec_request(&args, bytes, false) {
-                Ok((fs, spec)) => {
+            match exec_request(&fs, &args, bytes) {
+                Ok(spec) => {
                     handle.spawn(async move { finish(run_exec(fs, spec).await) });
                 }
-                Err(denied) => finish(denied),
+                Err(invalid) => finish(invalid),
             }
-        } else if op.starts_with("kernel.") {
-            let call = with(|e| {
-                let caller_op = explicit_op(e, &args)?;
-                let bridge = e.bridge.clone().ok_or_else(|| {
-                    OpResult::error("ERR_WENDY_NO_KERNEL", format!("{op}: not running under the wendy kernel"))
-                })?;
-                Ok((bridge, Caller { realm: e.name.clone(), op: caller_op }))
-            });
-            match call {
-                Ok((bridge, caller)) => {
-                    let mut args = args;
-                    if let Value::Object(map) = &mut args {
-                        map.remove("op");
-                    }
+        } else if op == "kernel.spawn" {
+            match bridge {
+                Some(bridge) => {
                     handle.spawn(async move {
-                        let result = match bridge.call(caller, &op, args).await {
+                        let result = match bridge.call(Caller { realm, fiber }, &op, args).await {
                             Ok(value) => OpResult::Json(value),
-                            Err(message) => OpResult::error("ERR_WENDY_TOOL", message),
+                            Err(message) => OpResult::error("ERR_WENDY_FIBER", message),
                         };
                         finish(result)
                     });
                 }
-                Err(denied) => finish(denied),
+                None => finish(OpResult::error("ERR_WENDY_NO_KERNEL", "tools are only available under the wendy kernel")),
             }
         } else {
             finish(OpResult::error("ERR_WENDY", format!("{op} has no async form")));
@@ -716,56 +661,28 @@ unsafe extern "C" fn host_async(
     }
 }
 
-/// The op a call names explicitly (it must be one of this realm's own),
-/// or the one in flight.
-fn explicit_op(e: &Engine, args: &Value) -> Result<Option<String>, OpResult> {
-    match args.get("op") {
-        None | Some(Value::Null) => Ok(e.current_op()),
-        Some(Value::String(op)) if e.is_active_op(op) => Ok(Some(op.clone())),
-        Some(other) => Err(violation(e, "op", &other.to_string())),
-    }
-}
-
-/// A host call no honest prelude makes: refused, and traced.
-fn violation(e: &Engine, what: &str, value: &str) -> OpResult {
-    e.tracer.emit(
-        Scope::Exec,
-        "js.violation",
-        Verdict::Deny,
-        json!({ "realm": e.name, "field": what, "value": value.chars().take(256).collect::<String>() }),
-    );
+fn invalid(what: &str) -> OpResult {
     OpResult::error("ERR_WENDY_INVALID_CALL", format!("invalid {what} in host call"))
 }
 
 fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
     let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     match op {
-        _ if op.starts_with("fs.") => match fs_for(op, &args, true) {
-            Ok(fs) => {
-                let handle = with(|e| e.handle.clone());
-                handle.block_on(fs_op(fs, op, args, bytes))
+        _ if op.starts_with("fs.") => {
+            let (fs, handle) = with(|e| (e.fs.clone(), e.handle.clone()));
+            handle.block_on(fs_op(fs, op, args, bytes))
+        }
+        "proc.exec" => {
+            let (fs, handle) = with(|e| (e.fs.clone(), e.handle.clone()));
+            match exec_request(&fs, &args, bytes) {
+                Ok(spec) => handle.block_on(run_exec(fs, spec)),
+                Err(invalid) => invalid,
             }
-            Err(denied) => denied,
-        },
-        "proc.exec" => match exec_request(&args, bytes, true) {
-            Ok((fs, spec)) => {
-                let handle = with(|e| e.handle.clone());
-                handle.block_on(run_exec(fs, spec))
-            }
-            Err(denied) => denied,
-        },
+        }
         "console.write" => {
             let text = s("text");
             let fd = args.get("fd").and_then(Value::as_u64).unwrap_or(1);
-            with(|e| {
-                if fd == 2 { e.stderr.push_str(&text) } else { e.stdout.push_str(&text) }
-                e.tracer.emit(
-                    Scope::Log,
-                    "js.console",
-                    Verdict::Info,
-                    json!({ "realm": e.name, "fd": if fd == 2 { 2 } else { 1 }, "text": text.chars().take(1024).collect::<String>() }),
-                );
-            });
+            with(|e| if fd == 2 { e.stderr.push_str(&text) } else { e.stdout.push_str(&text) });
             OpResult::Json(Value::Null)
         }
         "timer.set" => {
@@ -773,7 +690,7 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
             let repeat = args.get("repeat").and_then(Value::as_bool).unwrap_or(false);
             let id = with(|e| {
                 let id = e.next();
-                e.timers.insert(id, repeat.then_some(ms.max(1.0)));
+                e.timers.insert(id, (repeat.then_some(ms.max(1.0)), e.current.clone()));
                 arm_timer(e, id, ms);
                 id
             });
@@ -791,7 +708,7 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
             let dir = s("dir");
             let (fs, handle) = with(|e| (e.fs.clone(), e.handle.clone()));
             let target = fs.resolve(&dir);
-            match handle.block_on(fs.labeled("process.chdir").stat(&dir)) {
+            match handle.block_on(fs.stat(&dir)) {
                 Ok(entry) if entry.kind == EntryKind::Dir => {
                     with(|e| e.fs = fs.with_cwd(&target));
                     OpResult::Json(Value::Null)
@@ -812,34 +729,11 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
         "path.extname" => OpResult::Json(json!(lpath::extname(&s("path")))),
         "module.resolve" => resolve_module(&s("spec"), args.get("from")),
         "module.load" => load_module(&s("id")),
-        "ipo.phase" => with(|e| {
-            let op = s("op");
-            let phase = s("phase");
-            if !e.is_active_op(&op) {
-                return violation(e, "op", &op);
-            }
-            if !matches!(phase.as_str(), "input" | "process" | "output") {
-                return violation(e, "phase", &phase);
-            }
-            e.tracer.emit(Scope::Ipo, "ipo.phase", Verdict::Info, json!({ "op": op, "phase": phase, "realm": e.name }));
-            OpResult::Json(Value::Null)
-        }),
-        "js.unhandled" => with(|e| {
-            let text = s("text");
-            e.tracer.emit(
-                Scope::Exec,
-                "js.unhandled_rejection",
-                Verdict::Error,
-                json!({ "realm": e.name, "op": e.current_op(), "reason": text.chars().take(2048).collect::<String>() }),
-            );
-            OpResult::Json(Value::Null)
-        }),
         "settle" => {
             let id = args.get("id").and_then(Value::as_u64).unwrap_or(0);
-            let Some(pending) = with(|e| e.calls.remove(&id)) else {
-                return with(|e| {
-                    if e.abandoned.remove(&id) { OpResult::Json(Value::Null) } else { violation(e, "settle id", &id.to_string()) }
-                });
+            let Some(reply) = with(|e| e.calls.remove(&id)) else {
+                let expected = with(|e| e.abandoned.remove(&id));
+                return if expected { OpResult::Json(Value::Null) } else { invalid("settle id") };
             };
             let result = if args.get("ok").and_then(Value::as_bool) == Some(true) {
                 Ok(args.get("value").cloned().unwrap_or(Value::Null))
@@ -850,7 +744,7 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
                     stack: args.get("stack").and_then(Value::as_str).filter(|st| !st.is_empty()).map(str::to_string),
                 })
             };
-            let _ = pending.reply.send(result);
+            let _ = reply.send(result);
             OpResult::Json(Value::Null)
         }
         other => OpResult::error("ERR_WENDY", format!("unknown host op {other}")),
@@ -864,9 +758,6 @@ fn resolve_module(spec: &str, from: Option<&Value>) -> OpResult {
     if BUILTINS.contains(&bare) {
         return OpResult::Json(json!({ "builtin": bare }));
     }
-    if spec == SDK {
-        return OpResult::Json(json!({ "builtin": SDK }));
-    }
     if spec.starts_with("node:") {
         return OpResult::error("ERR_UNKNOWN_BUILTIN_MODULE", format!("No such built-in module: {spec}"));
     }
@@ -876,16 +767,17 @@ fn resolve_module(spec: &str, from: Option<&Value>) -> OpResult {
             format!("Cannot find package '{spec}' (importing packages is not supported yet)"),
         );
     }
-    let (code, root, base) = match with(|e| {
+    let found = with(|e| {
         let base = match from {
-            None | Some(Value::Null) => Ok(e.root.clone()),
-            Some(Value::String(f)) if e.loaded.contains(f) => Ok(lpath::dirname(f)),
-            Some(other) => Err(violation(e, "importer", &other.to_string())),
-        }?;
-        Ok((e.code.clone(), e.root.clone(), base))
-    }) {
+            None | Some(Value::Null) => e.root.clone(),
+            Some(Value::String(f)) if e.loaded.contains(f) => lpath::dirname(f),
+            Some(_) => return Err(invalid("importer")),
+        };
+        Ok((e.code.clone(), e.root.clone(), base, e.handle.clone()))
+    });
+    let (code, root, base, handle) = match found {
         Ok(found) => found,
-        Err(denied) => return denied,
+        Err(invalid) => return invalid,
     };
     // Decide containment on the path alone, before touching any storage, so
     // a probe outside the root learns nothing about what exists there.
@@ -896,10 +788,8 @@ fn resolve_module(spec: &str, from: Option<&Value>) -> OpResult {
     let mut candidates = vec![target.clone()];
     candidates.extend(["ts", "tsx", "mts", "js", "mjs"].iter().map(|ext| format!("{target}.{ext}")));
     candidates.extend(["index.ts", "index.js"].iter().map(|index| lpath::join(&target, index)));
-    let handle = with(|e| e.handle.clone());
-    let probe = code.labeled("module.resolve");
     for candidate in candidates {
-        if handle.block_on(probe.is_file(&candidate)) {
+        if handle.block_on(code.is_file(&candidate)) {
             with(|e| e.resolved.insert(candidate.clone()));
             return OpResult::Json(json!({ "id": candidate, "dir": lpath::dirname(&candidate) }));
         }
@@ -909,11 +799,8 @@ fn resolve_module(spec: &str, from: Option<&Value>) -> OpResult {
 }
 
 fn load_module(id: &str) -> OpResult {
-    let found = with(|e| if e.resolved.contains(id) { Ok((e.code.clone(), e.handle.clone())) } else { Err(violation(e, "module id", id)) });
-    let (code, handle) = match found {
-        Ok(found) => found,
-        Err(denied) => return denied,
-    };
+    let found = with(|e| e.resolved.contains(id).then(|| (e.code.clone(), e.handle.clone())));
+    let Some((code, handle)) = found else { return invalid("module id") };
     let source = match handle.block_on(code.read(id)) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) => return OpResult::error("ERR_MODULE_NOT_FOUND", format!("{id}: {e}")),
@@ -934,50 +821,6 @@ fn under(path: &str, root: &str) -> bool {
 }
 
 // ------------------------------------------------------------------- fs
-
-/// Trace labels a prelude may claim for an op: the node API names that are
-/// built on it. Anything else is a tampered call.
-fn allowed_labels(op: &str, sync: bool) -> Vec<String> {
-    let methods: &[&str] = match op {
-        "fs.readFile" => &["readFile"],
-        "fs.writeFile" => &["writeFile", "appendFile"],
-        "fs.stat" => &["stat", "lstat"],
-        "fs.readdir" => &["readdir"],
-        "fs.mkdir" => &["mkdir", "mkdtemp"],
-        "fs.rm" => &["rm", "rmdir"],
-        "fs.unlink" => &["unlink"],
-        "fs.rename" => &["rename"],
-        "fs.copyFile" => &["copyFile"],
-        "fs.access" => &["access", "exists"],
-        "fs.realpath" => &["realpath"],
-        "fs.exists" => &["exists"],
-        "proc.exec" if sync => {
-            return ["child_process.execFileSync", "child_process.execSync", "child_process.spawnSync"].map(String::from).to_vec();
-        }
-        "proc.exec" => return ["child_process.execFile", "child_process.exec", "wendy.exec"].map(String::from).to_vec(),
-        _ => &[],
-    };
-    methods
-        .iter()
-        .flat_map(|m| if sync { vec![format!("fs.{m}Sync")] } else { vec![format!("fs.promises.{m}"), format!("fs.{m}")] })
-        .collect()
-}
-
-/// The realm's fs, labeled and attributed for this call, or a refusal.
-fn label_for(e: &Engine, op: &str, args: &Value, sync: bool) -> Result<Fs, OpResult> {
-    let allowed = allowed_labels(op, sync);
-    let label = match args.get("api") {
-        None | Some(Value::Null) => allowed.first().cloned().ok_or_else(|| OpResult::error("ERR_WENDY", format!("unknown host op {op}")))?,
-        Some(Value::String(api)) if allowed.contains(api) => api.clone(),
-        Some(other) => return Err(violation(e, "api label", &other.to_string())),
-    };
-    let op_id = explicit_op(e, args)?;
-    Ok(e.fs.labeled(&label).in_op(op_id))
-}
-
-fn fs_for(op: &str, args: &Value, sync: bool) -> Result<Fs, OpResult> {
-    with(|e| label_for(e, op, args, sync))
-}
 
 /// A node-shaped error object: `ENOENT: no such file or directory, open 'x'`.
 fn node_error(err: SysError, syscall: &str, path: &str, dest: Option<&str>) -> OpResult {
@@ -1068,88 +911,37 @@ async fn fs_op(fs: Fs, op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResul
 
 // ------------------------------------------------------------ processes
 
-/// Validate a `proc.exec` call into the fs (for cwd and attribution) and
-/// the process to start.
-fn exec_request(args: &Value, stdin: Option<Vec<u8>>, sync: bool) -> Result<(Fs, ExecSpec), OpResult> {
-    with(|e| {
-        let fs = label_for(e, "proc.exec", args, sync)?;
-        let argv: Vec<String> = match args.get("argv").and_then(Value::as_array) {
-            Some(items) if !items.is_empty() && items.iter().all(Value::is_string) => {
-                items.iter().filter_map(Value::as_str).map(str::to_string).collect()
-            }
-            _ => return Err(OpResult::error("ERR_INVALID_ARG_TYPE", "argv must be a non-empty array of strings")),
-        };
-        let mut env = BTreeMap::new();
-        if let Some(map) = args.get("env").and_then(Value::as_object) {
-            for (k, v) in map {
-                let Some(v) = v.as_str() else {
-                    return Err(OpResult::error("ERR_INVALID_ARG_TYPE", format!("env.{k} must be a string")));
-                };
-                env.insert(k.clone(), v.to_string());
-            }
+/// Validate a `proc.exec` call into the process to start.
+fn exec_request(fs: &Fs, args: &Value, stdin: Option<Vec<u8>>) -> Result<ExecSpec, OpResult> {
+    let argv: Vec<String> = match args.get("argv").and_then(Value::as_array) {
+        Some(items) if !items.is_empty() && items.iter().all(Value::is_string) => {
+            items.iter().filter_map(Value::as_str).map(str::to_string).collect()
         }
-        let timeout = args
-            .get("timeout")
-            .and_then(Value::as_f64)
-            .filter(|ms| ms.is_finite() && *ms > 0.0)
-            .map(|ms| Duration::from_secs_f64(ms / 1000.0));
-        let max_output = args.get("maxOutput").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let cwd = fs.resolve(args.get("cwd").and_then(Value::as_str).unwrap_or("."));
-        Ok((fs, ExecSpec { argv, cwd, env, stdin, timeout, max_output }))
-    })
+        _ => return Err(OpResult::error("ERR_INVALID_ARG_TYPE", "argv must be a non-empty array of strings")),
+    };
+    let mut env = BTreeMap::new();
+    if let Some(map) = args.get("env").and_then(Value::as_object) {
+        for (k, v) in map {
+            let Some(v) = v.as_str() else {
+                return Err(OpResult::error("ERR_INVALID_ARG_TYPE", format!("env.{k} must be a string")));
+            };
+            env.insert(k.clone(), v.to_string());
+        }
+    }
+    let timeout = args
+        .get("timeout")
+        .and_then(Value::as_f64)
+        .filter(|ms| ms.is_finite() && *ms > 0.0)
+        .map(|ms| Duration::from_secs_f64(ms / 1000.0));
+    let max_output = args.get("maxOutput").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let cwd = fs.resolve(args.get("cwd").and_then(Value::as_str).unwrap_or("."));
+    Ok(ExecSpec { argv, cwd, env, stdin, timeout, max_output })
 }
 
 async fn run_exec(fs: Fs, spec: ExecSpec) -> OpResult {
     let program = spec.argv[0].clone();
     match fs.io().exec(spec).await {
-        Ok(r) => OpResult::Json(json!({
-            "code": r.code,
-            "signal": r.signal,
-            "stdout": base64(&r.stdout),
-            "stderr": base64(&r.stderr),
-            "truncated": r.truncated,
-            "timedOut": r.timed_out,
-            "durationMs": r.duration_ms,
-            "changes": r.changes,
-            "changesComplete": r.changes_complete,
-        })),
+        Ok(result) => OpResult::Json(serde_json::to_value(result).unwrap_or(Value::Null)),
         Err(err) => node_error(SysError::from(err), "spawn", &program, None),
-    }
-}
-
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn labels_are_the_node_names_built_on_each_op() {
-        assert!(allowed_labels("fs.readFile", true).contains(&"fs.readFileSync".to_string()));
-        assert!(allowed_labels("fs.readFile", false).contains(&"fs.promises.readFile".to_string()));
-        assert!(!allowed_labels("fs.readFile", false).contains(&"fs.readFileSync".to_string()));
-        assert!(allowed_labels("fs.writeFile", true).contains(&"fs.appendFileSync".to_string()));
-        assert!(allowed_labels("proc.exec", false).contains(&"wendy.exec".to_string()));
-        assert!(allowed_labels("module.load", true).is_empty());
-    }
-
-    #[test]
-    fn base64_matches_the_standard_alphabet() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
-        assert_eq!(base64(&[0xff, 0xfe]), "//4=");
     }
 }

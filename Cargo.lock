@@ -1510,15 +1510,10 @@ name = "wendy-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "clap",
  "serde_json",
  "tokio",
- "wendy-io",
- "wendy-jsc",
  "wendy-kernel",
- "wendy-storage",
- "wendy-trace",
 ]
 
 [[package]]
@@ -1533,14 +1528,12 @@ dependencies = [
 name = "wendy-io"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "libc",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "wendy-storage",
- "wendy-trace",
 ]
 
 [[package]]
@@ -1554,10 +1547,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "wendy-io",
  "wendy-libc",
- "wendy-storage",
- "wendy-trace",
 ]
 
 [[package]]
@@ -1565,14 +1555,12 @@ name = "wendy-kernel"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "oxc",
  "serde_json",
  "tempfile",
  "tokio",
  "wendy-core",
- "wendy-io",
  "wendy-jsc",
- "wendy-storage",
- "wendy-trace",
 ]
 
 [[package]]
@@ -1581,7 +1569,6 @@ version = "0.1.0"
 dependencies = [
  "tokio",
  "wendy-io",
- "wendy-trace",
 ]
 
 [[package]]
@@ -1593,15 +1580,6 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "wendy-trace"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]

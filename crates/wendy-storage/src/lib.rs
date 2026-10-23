@@ -3,9 +3,9 @@
 //! Important decisions:
 //! - This crate knows nothing about runtimes, tracing or policy. A
 //!   [`Storage`] is just a rooted tree of files and directories; wendy-io
-//!   mounts it and wraps it with the gate and the trace. That is what lets a
-//!   mount move from a host directory to an in-memory tree to a database
-//!   without the execution side noticing.
+//!   mounts it into a namespace. That is what lets a mount move from a host
+//!   directory to an in-memory tree to a database without the execution
+//!   side noticing.
 //! - Every path a storage sees is absolute *within that storage* (`/` is the
 //!   storage root), never a host path. [`DiskStorage`] maps it under its root
 //!   and refuses anything that resolves outside, including through symlinks.

@@ -1,4 +1,4 @@
-//! One error vocabulary for both outlets: sh prints [`Errno::message`]
+//! One error vocabulary for every runtime: a shell prints [`Errno::message`]
 //! (`No such file or directory`), node surfaces [`Errno::code`] (`ENOENT`).
 
 use std::io;
@@ -14,6 +14,7 @@ pub enum Errno {
     EROFS,
     EXDEV,
     EINVAL,
+    ENOTSUP,
     EIO,
 }
 
@@ -29,6 +30,7 @@ impl Errno {
             Errno::EROFS => "EROFS",
             Errno::EXDEV => "EXDEV",
             Errno::EINVAL => "EINVAL",
+            Errno::ENOTSUP => "ENOTSUP",
             Errno::EIO => "EIO",
         }
     }
@@ -45,6 +47,7 @@ impl Errno {
             Errno::EROFS => "Read-only file system",
             Errno::EXDEV => "Invalid cross-device link",
             Errno::EINVAL => "Invalid argument",
+            Errno::ENOTSUP => "Operation not supported",
             Errno::EIO => "Input/output error",
         }
     }
@@ -61,6 +64,7 @@ impl Errno {
             Errno::EROFS => "read-only file system",
             Errno::EXDEV => "cross-device link not permitted",
             Errno::EINVAL => "invalid argument",
+            Errno::ENOTSUP => "operation not supported on socket",
             Errno::EIO => "i/o error",
         }
     }
@@ -77,6 +81,7 @@ impl Errno {
             Errno::EROFS => 30,
             Errno::EXDEV => 18,
             Errno::EINVAL => 22,
+            Errno::ENOTSUP => 95,
             Errno::EIO => 5,
         }
     }
@@ -93,13 +98,14 @@ impl Errno {
             K::ReadOnlyFilesystem => Errno::EROFS,
             K::CrossesDevices => Errno::EXDEV,
             K::InvalidInput | K::InvalidData => Errno::EINVAL,
+            K::Unsupported => Errno::ENOTSUP,
             _ => Errno::EIO,
         }
     }
 }
 
 /// A failed system call: the errno plus the layer's own detail (e.g. which
-/// policy rule denied it), which goes to the trace rather than to stderr.
+/// path was outside every mount).
 #[derive(Debug, Clone)]
 pub struct SysError {
     pub errno: Errno,

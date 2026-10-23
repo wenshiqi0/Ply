@@ -11,12 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-wendy-io.workspace = true
-wendy-jsc.workspace = true
 wendy-kernel.workspace = true
-wendy-storage.workspace = true
-wendy-trace.workspace = true
