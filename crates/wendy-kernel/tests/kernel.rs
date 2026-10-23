@@ -80,7 +80,7 @@ impl World {
 async fn default_plugins_describe_themselves_and_work_on_the_workspace() {
     let w = world().await;
     let names: Vec<String> = w.kernel.plugins().into_iter().map(|p| p.name).collect();
-    assert_eq!(names, ["bash", "create", "delete", "edit", "read"]);
+    assert_eq!(names, ["agent", "bash", "create", "edit", "remove"]);
     let edit = w.kernel.plugins().into_iter().find(|p| p.name == "edit").unwrap();
     assert!(edit.description.starts_with("Replace an exact string in a file."), "{}", edit.description);
     let Type::Object { fields } = &edit.input else { panic!("{:?}", edit.input) };
@@ -97,9 +97,9 @@ async fn default_plugins_describe_themselves_and_work_on_the_workspace() {
     );
     assert_eq!(edit.input.to_json_schema()["required"], json!(["path", "old_string", "new_string"]));
 
-    let read = w.kernel.call("read", json!({ "path": "notes.txt", "offset": 2, "limit": 2 })).await.unwrap();
-    assert_eq!(read["content"], "     2\tbeta\n     3\tgamma");
-    assert_eq!((read["total_lines"].clone(), read["truncated"].clone()), (json!(4), json!(true)));
+    let agent = w.kernel.plugins().into_iter().find(|p| p.name == "agent").unwrap();
+    assert!(agent.description.starts_with("Work on a task with a language model"), "{}", agent.description);
+    assert_eq!(agent.input.to_json_schema()["required"], json!(["prompt"]));
 
     let created = w.kernel.call("create", json!({ "path": "src/lib/new.txt", "content": "fresh\n" })).await.unwrap();
     assert_eq!(created, json!({ "path": format!("{}/src/lib/new.txt", w.root), "bytes": 6, "overwritten": false }));
@@ -116,9 +116,9 @@ async fn default_plugins_describe_themselves_and_work_on_the_workspace() {
     assert_eq!(edited["replacements"], 2);
     assert_eq!(std::fs::read_to_string(w.work.path().join("notes.txt")).unwrap(), "alpha\n$& B\ngamma\n$& B\n");
 
-    let err = w.kernel.call("delete", json!({ "path": "src" })).await.unwrap_err();
+    let err = w.kernel.call("remove", json!({ "path": "src" })).await.unwrap_err();
     assert!(err.to_string().contains("set recursive"), "{err}");
-    w.kernel.call("delete", json!({ "path": "src", "recursive": true })).await.unwrap();
+    w.kernel.call("remove", json!({ "path": "src", "recursive": true })).await.unwrap();
     assert!(!w.work.path().join("src").exists());
 
     let bash = w.kernel.call("bash", json!({ "command": "echo made > made.txt; cat made.txt; echo oops >&2; exit 2" })).await.unwrap();
@@ -126,7 +126,9 @@ async fn default_plugins_describe_themselves_and_work_on_the_workspace() {
     let slow = w.kernel.call("bash", json!({ "command": "sleep 5", "timeout_ms": 200 })).await.unwrap();
     assert_eq!((slow["timed_out"].clone(), slow["signal"].clone()), (json!(true), json!("SIGKILL")));
 
-    assert_eq!(w.kernel.call("read", json!({})).await.unwrap_err().to_string(), "Error: 'path' must be a non-empty string");
+    assert_eq!(w.kernel.call("remove", json!({})).await.unwrap_err().to_string(), "Error: 'path' must be a non-empty string");
+    let err = w.kernel.call("agent", json!({ "prompt": " " })).await.unwrap_err();
+    assert_eq!(err.to_string(), "Error: 'prompt' must be a non-empty string");
     assert!(matches!(w.kernel.call("nope", json!({})).await, Err(KernelError::UnknownPlugin(_))));
 }
 
@@ -138,37 +140,36 @@ async fn awaiting_a_plugin_is_a_child_fiber_and_every_fiber_is_recorded() {
             "count_lines",
             r#"
 /** Count lines of a file two ways. */
-export async function handle(input: { path: string }): Promise<{ read: number; wc: number }> {
-  const [read, wc] = await Promise.all([
-    tools.read({ path: input.path }),
+export async function handle(input: { path: string }): Promise<{ lines: number; betas: number }> {
+  const [wc, grep] = await Promise.all([
     tools.bash({ command: `wc -l < ${input.path}` }),
+    tools.bash({ command: `grep -c beta ${input.path}` }),
   ]);
-  return { read: read.total_lines, wc: Number(wc.stdout.trim()) };
+  return { lines: Number(wc.stdout.trim()), betas: Number(grep.stdout.trim()) };
 }
 "#,
         ))
         .await
         .unwrap();
     let r = w.kernel.call("count_lines", json!({ "path": "notes.txt" })).await.unwrap();
-    assert_eq!(r, json!({ "read": 4, "wc": 4 }));
+    assert_eq!(r, json!({ "lines": 4, "betas": 2 }));
 
     let spawns = w.events.spawns();
     let (outer, parent, _, input) = spawns.iter().find(|s| s.2 == "count_lines").unwrap().clone();
     assert_eq!((parent, input), (None, json!({ "path": "notes.txt" })));
     let children: Vec<_> = spawns.iter().filter(|s| s.1.as_deref() == Some(outer.as_str())).collect();
-    let mut child_plugins: Vec<&str> = children.iter().map(|s| s.2.as_str()).collect();
-    child_plugins.sort();
-    assert_eq!(child_plugins, ["bash", "read"]);
+    let child_plugins: Vec<&str> = children.iter().map(|s| s.2.as_str()).collect();
+    assert_eq!(child_plugins, ["bash", "bash"]);
     for child in &children {
         assert!(matches!(w.events.exit_of(&child.0), Some(Exit::Done { .. })));
     }
     assert_eq!(w.events.exit_of(&outer), Some(Exit::Done { output: r }));
 
     // A failure is recorded with its error.
-    let _ = w.kernel.call("read", json!({ "path": "missing.txt" })).await.unwrap_err();
-    let failed = w.events.spawns().into_iter().rev().find(|s| s.2 == "read").unwrap().0;
+    let _ = w.kernel.call("remove", json!({ "path": "missing.txt" })).await.unwrap_err();
+    let failed = w.events.spawns().into_iter().rev().find(|s| s.2 == "remove").unwrap().0;
     let Some(Exit::Failed { error, .. }) = w.events.exit_of(&failed) else { panic!() };
-    assert!(error.starts_with("Error: ENOENT"), "{error}");
+    assert_eq!(error, "Error: missing.txt: no such file or directory");
 
     // The host may start a fiber nobody awaits.
     let woken = w.kernel.wake("create", json!({ "path": "woken.txt", "content": "later" })).unwrap();
@@ -234,6 +235,21 @@ async fn plugins_that_collide_or_are_not_plugins_do_not_load() {
     assert!(err.to_string().contains("module init failed"), "{err}");
     assert_eq!(w.kernel.plugins().len(), 5);
 
+    // Every realm lists the loaded plugins as tools, and the list follows loads.
+    w.kernel
+        .load(w.plugin(
+            "lister",
+            "/** List tools. */\nexport const handle = (name: string) => ({ names: Object.keys(tools), has: name in tools, description: tools[name].description, wraps: tools.lister.wrapsInput, params: tools.lister.parameters });\n",
+        ))
+        .await
+        .unwrap();
+    let listed = w.kernel.call("lister", json!("edit")).await.unwrap();
+    assert_eq!(listed["names"], json!(["agent", "bash", "create", "edit", "lister", "remove"]));
+    assert_eq!(listed["has"], true);
+    assert!(listed["description"].as_str().unwrap().starts_with("Replace an exact string"));
+    assert_eq!(listed["wraps"], true);
+    assert_eq!(listed["params"], json!({ "type": "object", "properties": { "input": { "type": "string" } }, "required": ["input"] }));
+
     w.kernel.load(w.plugin("forever", "export const handle = (): Promise<unknown> => tools.forever({});\n")).await.unwrap();
     let err = w.kernel.call("forever", json!({})).await.unwrap_err();
     assert!(err.to_string().contains("nested deeper than 16"), "{err}");
@@ -254,7 +270,7 @@ async fn records_are_the_events_as_json_lines_and_scripts_can_await_plugins() {
     let script = w.plugins.path().join("script.ts");
     std::fs::write(
         &script,
-        "const r = await tools.read({ path: process.argv[2] });\nsetTimeout(() => console.log('lines', r.total_lines), 20);\n",
+        "const r = await tools.bash({ command: `wc -l < ${process.argv[2]}` });\nsetTimeout(() => console.log('lines', r.stdout.trim()), 20);\n",
     )
     .unwrap();
     let outcome = w.kernel.run_script(&script, vec!["notes.txt".into()]).await.unwrap();

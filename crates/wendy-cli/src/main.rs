@@ -9,9 +9,9 @@
 //!
 //! Everything runs over explicitly mounted storage (default: the current
 //! directory, read-write, at its own path, so the file plugins and the
-//! system bash see the same paths). The default plugins (bash, read, edit,
-//! create, delete) are loaded unless `--no-default-plugins`; `--plugin DIR`
-//! adds more. `--record FILE` appends every fiber event as a JSON line.
+//! system bash see the same paths). The default plugins (agent, bash,
+//! create, edit, remove) are loaded unless `--no-default-plugins`;
+//! `--plugin DIR` adds more. `--record FILE` appends every fiber event as a JSON line.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use wendy_kernel::{Io, JsonlRecorder, Kernel, KernelConfig, KernelError, MountMode, PluginSource, PluginSpec, StorageSpec, Type};
+use wendy_kernel::{Io, JsonlRecorder, Kernel, KernelConfig, KernelError, MountMode, PluginSource, StorageSpec};
 
 #[derive(Parser)]
 #[command(name = "wendy", version, about = "wendy agent harness")]
@@ -55,7 +55,7 @@ struct Setup {
     /// Load a plugin directory (its name is the directory's). Repeatable.
     #[arg(long = "plugin", value_name = "DIR")]
     plugins: Vec<PathBuf>,
-    /// Do not load bash, read, edit, create and delete.
+    /// Do not load agent, bash, create, edit and remove.
     #[arg(long)]
     no_default_plugins: bool,
     /// Append every fiber event (JSON lines) to this file.
@@ -182,25 +182,6 @@ async fn run(args: RunArgs) -> Result<i32> {
 
 // ------------------------------------------------------------------- mcp
 
-/// MCP tool arguments are always an object. A plugin whose input is
-/// something else takes it as `{ "input": ... }`.
-fn wraps_input(input: &Type) -> bool {
-    !matches!(input, Type::Object { .. } | Type::Map { .. } | Type::Unknown | Type::Undefined)
-}
-
-fn input_schema(spec: &PluginSpec) -> Value {
-    match &spec.input {
-        Type::Unknown => json!({ "type": "object" }),
-        Type::Undefined => json!({ "type": "object", "properties": {} }),
-        input if wraps_input(input) => json!({
-            "type": "object",
-            "properties": { "input": input.to_json_schema() },
-            "required": ["input"],
-        }),
-        input => input.to_json_schema(),
-    }
-}
-
 /// One JSON-RPC message per line on stdin/stdout. Requests are handled
 /// concurrently; stdout carries nothing but protocol messages.
 async fn serve_mcp(setup: Setup) -> Result<i32> {
@@ -246,19 +227,19 @@ async fn handle_mcp(kernel: &Kernel, message: Value) -> Option<Value> {
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({
-            "tools": kernel.plugins().iter().map(|p| json!({
-                "name": p.name,
-                "description": p.description,
-                "inputSchema": input_schema(p),
+            "tools": kernel.catalog().into_iter().map(|t| json!({
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": t.parameters,
             })).collect::<Vec<_>>(),
         })),
         "tools/call" => match params.get("name").and_then(Value::as_str) {
             None => Err((-32602, "tools/call needs a tool name".into())),
-            Some(name) => match kernel.plugins().into_iter().find(|p| p.name == name) {
+            Some(name) => match kernel.catalog().into_iter().find(|t| t.name == name) {
                 None => Err((-32602, format!("unknown tool: {name}"))),
-                Some(spec) => {
+                Some(tool) => {
                     let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                    let input = if wraps_input(&spec.input) { arguments.get("input").cloned().unwrap_or(Value::Null) } else { arguments };
+                    let input = if tool.wraps_input { arguments.get("input").cloned().unwrap_or(Value::Null) } else { arguments };
                     match kernel.call(name, input).await {
                         Ok(output) => Ok(tool_result(&output)),
                         Err(err) => Ok(json!({ "content": [{ "type": "text", "text": err.to_string() }], "isError": true })),

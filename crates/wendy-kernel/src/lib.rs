@@ -14,7 +14,10 @@
 //!   handed to the registered [`FiberHook`]s, as core defines it.
 //! - Plugin code is read through its own read-only namespace, separate from
 //!   the workspace the plugins work on.
-//! - The five default plugins (bash, read, edit, create, delete) are plain
+//! - Every realm sees the loaded plugins through `tools`, as tools (name,
+//!   description, argument schema); the kernel republishes that list
+//!   whenever a plugin loads.
+//! - The five default plugins (agent, bash, create, edit, remove) are plain
 //!   plugins shipped inside the binary.
 
 mod signature;
@@ -30,7 +33,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use wendy_jsc::{Caller, HostBridge, JsRuntime, ModuleSource, RealmConfig, RealmId};
 
-pub use wendy_core::{Exit, Fiber, FiberEvent, FiberHook, Field, Payload, PluginSpec, Type};
+pub use wendy_core::{Exit, Fiber, FiberEvent, FiberHook, Field, Payload, PluginSpec, ToolSchema, Type};
 pub use wendy_jsc::{
     DiskStorage, Io, JsError, Limits, MemoryStorage, MountInfo, MountMode, Output, SqliteStorage, Storage, StorageInfo,
     StorageSpec,
@@ -38,11 +41,11 @@ pub use wendy_jsc::{
 
 /// The plugins every wendy ships: (name, entry source).
 const DEFAULT_PLUGINS: [(&str, &str); 5] = [
+    ("agent", include_str!("../../../plugins/agent/main.ts")),
     ("bash", include_str!("../../../plugins/bash/main.ts")),
-    ("read", include_str!("../../../plugins/read/main.ts")),
-    ("edit", include_str!("../../../plugins/edit/main.ts")),
     ("create", include_str!("../../../plugins/create/main.ts")),
-    ("delete", include_str!("../../../plugins/delete/main.ts")),
+    ("edit", include_str!("../../../plugins/edit/main.ts")),
+    ("remove", include_str!("../../../plugins/remove/main.ts")),
 ];
 
 pub struct KernelConfig {
@@ -74,7 +77,7 @@ pub enum PluginSource {
 }
 
 impl PluginSource {
-    /// bash, read, edit, create, delete.
+    /// agent, bash, create, edit, remove.
     pub fn defaults() -> Vec<PluginSource> {
         DEFAULT_PLUGINS.iter().map(|(name, source)| PluginSource::Embedded { name: (*name).into(), source: (*source).into() }).collect()
     }
@@ -123,6 +126,8 @@ struct Inner {
     limits: Limits,
     max_depth: usize,
     plugins: RwLock<Vec<Loaded>>,
+    /// Every realm this kernel started (plugins and scripts).
+    realms: Mutex<Vec<RealmId>>,
     hooks: RwLock<Vec<Arc<dyn FiberHook>>>,
     /// Fibers in flight → nesting depth.
     fibers: Mutex<HashMap<String, usize>>,
@@ -154,6 +159,7 @@ impl Kernel {
                 limits: config.limits,
                 max_depth: config.max_depth,
                 plugins: RwLock::new(Vec::new()),
+                realms: Mutex::new(Vec::new()),
                 hooks: RwLock::new(Vec::new()),
                 fibers: Mutex::new(HashMap::new()),
                 run: format!("{:x}", now_ms()),
@@ -185,18 +191,33 @@ impl Kernel {
 
         let realm = self.realm(&name, &root, vec![entry.clone()]).await?;
         inner.js.run_main(realm, &entry).await.map_err(|e| KernelError::Load(e.message))?;
-        let mut plugins = inner.plugins.write().expect("plugin table poisoned");
-        if plugins.iter().any(|p| p.spec.name == name) {
-            return Err(KernelError::Load(format!("a plugin named `{name}` is already loaded")));
+        {
+            let mut plugins = inner.plugins.write().expect("plugin table poisoned");
+            if plugins.iter().any(|p| p.spec.name == name) {
+                return Err(KernelError::Load(format!("a plugin named `{name}` is already loaded")));
+            }
+            plugins.push(Loaded { spec: spec.clone(), realm, entry });
         }
-        plugins.push(Loaded { spec: spec.clone(), realm, entry });
+        self.publish_catalog();
         Ok(spec)
+    }
+
+    /// The loaded plugins as tools, as every realm's `tools` lists them.
+    pub fn catalog(&self) -> Vec<ToolSchema> {
+        self.plugins().iter().map(PluginSpec::tool_schema).collect()
+    }
+
+    fn publish_catalog(&self) {
+        let catalog = serde_json::to_value(self.catalog()).unwrap_or_default();
+        for realm in self.inner.realms.lock().expect("realm list poisoned").iter() {
+            self.inner.js.set_catalog(*realm, catalog.clone());
+        }
     }
 
     async fn realm(&self, name: &str, root: &str, argv: Vec<String>) -> Result<RealmId, KernelError> {
         let inner = &self.inner;
         let bridge: Arc<dyn HostBridge> = Arc::new(Bridge(Arc::downgrade(inner)));
-        inner
+        let realm = inner
             .js
             .create_realm(RealmConfig {
                 name: name.into(),
@@ -209,7 +230,10 @@ impl Kernel {
                 bridge: Some(bridge),
             })
             .await
-            .map_err(|e| KernelError::Load(e.message))
+            .map_err(|e| KernelError::Load(e.message))?;
+        inner.realms.lock().expect("realm list poisoned").push(realm);
+        inner.js.set_catalog(realm, serde_json::to_value(self.catalog()).unwrap_or_default());
+        Ok(realm)
     }
 
     /// Mount a plugin's code in the code namespace: (name, root, entry).

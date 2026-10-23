@@ -15,20 +15,38 @@ wendy 记录的是 fiber：每个 fiber 的输入、输出（或错误），以�
 
 /** Count TODO lines in a file. */
 export async function handle(input: { path: string }): Promise<{ todos: number; lines: number }> {
-  const [file, grep] = await Promise.all([
-    tools.read({ path: input.path }),                                   // 等待另一个插件：一个子 fiber
-    tools.bash({ command: `grep -c TODO ${JSON.stringify(input.path)}` }),
+  const file = JSON.stringify(input.path);
+  const [grep, wc] = await Promise.all([
+    tools.bash({ command: `grep -c TODO ${file}` }),   // 等待另一个插件：一个子 fiber
+    tools.bash({ command: `wc -l < ${file}` }),
   ]);
-  return { todos: Number(grep.stdout.trim()), lines: file.total_lines };
+  return { todos: Number(grep.stdout.trim()), lines: Number(wc.stdout.trim()) };
 }
 ```
 
 - `handle` 上的 JSDoc 是插件的描述，`handle` 的参数类型和返回类型就是它的输入和输出（wendy 加载时从签名里读出来）。
 - 参数校验由插件自己做；权限这类控制也放在插件里。
 - 同一个插件的多次执行共享模块里的闭包，在 `await` 处交替执行。
+- `Object.keys(tools)` 列出已加载的插件，`tools.edit.description` / `tools.edit.parameters` 是它作为工具的描述和参数 schema。
 - 可以用 node 的模块（`fs`、`path`、`child_process` 等），类型声明见 [packages/sdk/globals.d.ts](packages/sdk/globals.d.ts)。
 
-默认带五个插件，写法和上面一样：[bash](plugins/bash/main.ts)、[read](plugins/read/main.ts)、[edit](plugins/edit/main.ts)、[create](plugins/create/main.ts)、[delete](plugins/delete/main.ts)。
+默认带五个插件，写法和上面一样：
+
+| 插件 | 做什么 |
+|---|---|
+| [agent](plugins/agent/main.ts) | 用语言模型完成一个任务，其他插件就是它的工具。模型连接用 pi 的模型层（pi-ai），对话只在这一次任务里存在 |
+| [bash](plugins/bash/main.ts) | 用系统 bash 运行命令 |
+| [create](plugins/create/main.ts) | 新建文件 |
+| [edit](plugins/edit/main.ts) | 精确替换文件里的一段文字 |
+| [remove](plugins/remove/main.ts) | 删除文件或目录 |
+
+agent 需要本机装有 [pi](https://github.com/earendil-works/pi-coding-agent)（`npm install -g @earendil-works/pi-coding-agent`，或用 `WENDY_PI_AI` 指向一个 pi-ai 包），模型默认是 `deepseek/deepseek-v4-flash`，鉴权读 pi-ai 认的环境变量（例如 `DEEPSEEK_API_KEY`）：
+
+```bash
+./target/debug/wendy call --record fibers.jsonl agent '{"prompt": "把 app.py 的输出改成 hello, wendy，然后运行验证"}'
+```
+
+agent 每次调用其他插件都是它的子 fiber，记录里能看到完整的过程。
 
 ## 试一下
 

@@ -661,6 +661,11 @@
   // until it is awaited: `then` is the call, and the kernel runs it as a
   // child of the fiber doing the awaiting. Awaiting a handle twice runs it
   // once, like a promise.
+  //
+  // `tools` can be listed (`Object.keys(tools)`), and each entry says what
+  // it is as a tool: `description`, `parameters` (JSON Schema of the tool
+  // arguments) and `wrapsInput` (the arguments carry the input as
+  // `{ input }`). The kernel keeps that list current.
   function fiberHandle(plugin, input) {
     let started = null;
     const start = () => (started ??= opAsync("kernel.spawn", { plugin, input: input === undefined ? null : input }));
@@ -670,9 +675,31 @@
       finally: (onSettled) => start().finally(onSettled),
     });
   }
-  const tools = new Proxy(objectFreeze(objectCreate(null)), {
+  const catalog = () => op("kernel.catalog") ?? [];
+  function toolEntry(name) {
+    const call = (input) => fiberHandle(name, input);
+    const known = catalog().find((t) => t.name === name);
+    if (known) {
+      Object.defineProperties(call, {
+        description: { value: known.description, enumerable: true },
+        parameters: { value: known.parameters, enumerable: true },
+        wrapsInput: { value: known.wraps_input, enumerable: true },
+      });
+    }
+    return objectFreeze(call);
+  }
+  const tools = new Proxy(objectCreate(null), {
     // `then` is excluded so `await tools` is not mistaken for a fiber.
-    get: (_, name) => (typeof name === "string" && name !== "then" ? (input) => fiberHandle(name, input) : undefined),
+    get: (_, name) => (typeof name === "string" && name !== "then" ? toolEntry(name) : undefined),
+    has: (_, name) => typeof name === "string" && catalog().some((t) => t.name === name),
+    ownKeys: () => catalog().map((t) => t.name),
+    getOwnPropertyDescriptor: (_, name) =>
+      typeof name === "string" && catalog().some((t) => t.name === name)
+        ? { value: toolEntry(name), enumerable: true, configurable: true, writable: false }
+        : undefined,
+    set: () => false,
+    defineProperty: () => false,
+    deleteProperty: () => false,
   });
 
   // --------------------------------------------------------------- globals

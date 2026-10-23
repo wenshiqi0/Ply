@@ -19,7 +19,7 @@ pub mod plugin;
 pub mod types;
 
 pub use fiber::{Exit, Fiber, FiberEvent, FiberHook};
-pub use plugin::PluginSpec;
+pub use plugin::{PluginSpec, ToolSchema};
 pub use types::{Field, Type};
 
 /// Opaque data a fiber takes or returns.

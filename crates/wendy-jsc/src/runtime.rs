@@ -159,6 +159,7 @@ enum Msg {
     Api { method: &'static str, args: Vec<String>, fiber: Option<String>, reply: Reply<Result<Value, JsError>> },
     TakeOutput(Reply<Output>),
     Idle(Reply<()>),
+    Catalog(Value),
     RawHostCall(String, Value, Reply<Value>),
     Completion(u64, OpResult),
     Timer(u64),
@@ -252,6 +253,12 @@ impl JsRuntime {
         rx.await.unwrap_or_default()
     }
 
+    /// What `tools` lists in this realm: the loaded plugins as tools
+    /// (`[{ name, description, parameters, wraps_input }]`).
+    pub fn set_catalog(&self, realm: RealmId, catalog: Value) {
+        self.send(realm, Msg::Catalog(catalog));
+    }
+
     /// Send one host call exactly as given, the way a prelude that plugin
     /// code had tampered with could. For testing the host-side checks.
     #[doc(hidden)]
@@ -298,6 +305,8 @@ struct Engine {
     code: Fs,
     root: String,
     bridge: Option<Arc<dyn HostBridge>>,
+    /// The plugins `tools` lists, as the kernel last described them.
+    catalog: Value,
     stdout: String,
     stderr: String,
     exit_code: Option<i32>,
@@ -408,6 +417,7 @@ fn engine_main(
                 let _ = reply.send(out);
             }
             Msg::Idle(reply) => with(|e| e.idle_waiters.push(reply)),
+            Msg::Catalog(catalog) => with(|e| e.catalog = catalog),
             Msg::RawHostCall(op, args, reply) => {
                 let value = match sync_op(&op, args, None) {
                     OpResult::Json(v) => v,
@@ -447,6 +457,7 @@ fn init(config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtime::Handle) ->
                 code: Fs::new(config.modules.io, root.clone()),
                 root,
                 bridge: config.bridge,
+                catalog: json!([]),
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: None,
@@ -702,6 +713,7 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
             }
             OpResult::Json(Value::Null)
         }
+        "kernel.catalog" => OpResult::Json(with(|e| e.catalog.clone())),
         "clock.now" => OpResult::Json(json!(with(|e| e.started.elapsed().as_secs_f64() * 1000.0))),
         "process.cwd" => OpResult::Json(json!(with(|e| e.fs.cwd().to_string()))),
         "process.chdir" => {
