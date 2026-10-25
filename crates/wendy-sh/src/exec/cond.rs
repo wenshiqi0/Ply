@@ -1,5 +1,5 @@
 //! `[[ ... ]]` and the `test` / `[` builtin. File tests are IO (stat calls),
-//! so they go through the IO layer and show up in the trace.
+//! so they go through the mounted IO layer.
 
 use wendy_io::EntryKind;
 use wendy_libc::Fs;
@@ -92,7 +92,7 @@ impl Shell {
     }
 
     fn test_fs(&self) -> Fs {
-        Fs::new(self.rt.io.labeled("test"), self.st.cwd.clone())
+        Fs::new(self.rt.io.clone(), self.st.cwd.clone())
     }
 
     pub(crate) async fn test_unary(&mut self, op: &str, arg: &str) -> bool {

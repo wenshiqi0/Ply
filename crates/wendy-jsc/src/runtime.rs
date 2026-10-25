@@ -7,16 +7,14 @@
 //!   through messages; every reply is a oneshot.
 //! - A realm runs every fiber of its plugin. They share the module's
 //!   closures and interleave at `await`, like requests in one node process.
-//! - Every entry into JS (a fiber starting, an async host op completing, a
-//!   timer firing) is tagged with the fiber that caused it; async work
-//!   started during an entry inherits its tag. A plugin awaiting another
-//!   (`tools.x(...)`) is therefore known to be the fiber of the entry the
-//!   `then` ran in. The one blind spot: a fiber continuing after a promise
-//!   another fiber created runs under that other fiber's tag.
-//! - Async host ops run on tokio; completion is a message back to the
-//!   realm's thread, which resolves the deferred promise. JSC drains
-//!   microtasks after each call into JS, so `await` continuations run there.
-//!   Sync host ops (`readFileSync`) block the realm's thread.
+//! - OXC lowers async/await (including async generators) to Promise
+//!   continuations. Registering a reaction captures its consumer's scope
+//!   in a native callable; Rust queues and executes the continuation with
+//!   that identity. Sharing a Promise does not share its producer's scope.
+//! - Host IO runs on tokio; completion returns to the owning realm. User
+//!   continuations run as separate messages, so terminating one JS turn
+//!   does not discard other fibers' continuations in JSC's microtask queue.
+//!   Sync host ops still block this realm, but observe cancellation.
 //! - Nothing that arrives from JS is trusted. The prelude shares the realm
 //!   with plugin code, which can replace any global the prelude uses, so
 //!   every host op re-validates here: a module loads only if wendy itself
@@ -24,7 +22,8 @@
 //!   this realm.
 //! - Each entry into JS gets a CPU budget and the process a memory ceiling
 //!   (a watchdog checks both every 100 ms of CPU). A turn over either is
-//!   terminated, the realm's pending calls fail, the realm stays usable.
+//!   terminated and its owning invocation fails; siblings remain runnable.
+//!   The memory ceiling measures the process, not individual fibers.
 //! - Plugin source is read through the IO layer (a namespace of its own),
 //!   so plugins can live on any storage.
 
@@ -34,18 +33,24 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::ptr::null_mut;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use wendy_libc::{EntryKind, Errno, ExecSpec, Fs, Io, SysError, path as lpath};
+use wendy_core::{CleanupStatus, FiberEvent};
 
 use crate::ffi::*;
-use crate::transpile::transpile;
+use crate::http::Http;
+use crate::checkpoints::Checkpoints;
+use crate::transpile::{lower_async, transpile};
 
 const PRELUDE: &str = include_str!("prelude.js");
+const ASYNC: &str = include_str!("async.js");
+const PI_AI: &str = include_str!("vendor/pi-ai.js");
 const BUILTINS: &[&str] = &[
     "fs",
     "fs/promises",
@@ -88,7 +93,11 @@ impl Default for Limits {
 #[derive(Debug, Clone)]
 pub struct Caller {
     pub realm: String,
-    /// The fiber whose entry the call was made in, if any.
+    /// Native identity, distinct even when a script uses a plugin's label.
+    pub realm_id: RealmId,
+    /// This operation originated in the plugin's onLoad invocation.
+    pub loading: bool,
+    /// The fiber owning the running continuation, if any.
     pub fiber: Option<String>,
 }
 
@@ -97,6 +106,8 @@ pub struct Caller {
 #[async_trait::async_trait]
 pub trait HostBridge: Send + Sync {
     async fn call(&self, caller: Caller, op: &str, args: Value) -> Result<Value, String>;
+    /// Runtime lifecycle observations do not require an active JS fiber.
+    fn on_event(&self, _event: FiberEvent) {}
 }
 
 pub struct RealmConfig {
@@ -115,8 +126,12 @@ pub struct RealmConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RealmId(usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FailureKind { #[default] Failed, Cancelled, CpuLimit, MemoryLimit }
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct JsError {
+    pub kind: FailureKind,
     /// `Name: message` of what was thrown.
     pub message: String,
     /// Set when the code called `process.exit(code)`.
@@ -147,7 +162,7 @@ pub(crate) enum OpResult {
 }
 
 impl OpResult {
-    fn error(code: &str, message: impl Into<String>) -> OpResult {
+    pub(crate) fn error(code: &str, message: impl Into<String>) -> OpResult {
         OpResult::Error(json!({ "code": code, "message": message.into() }))
     }
 }
@@ -157,25 +172,46 @@ type Reply<T> = oneshot::Sender<T>;
 enum Msg {
     /// `api[method](callId, ...args)`, as an entry tagged with `fiber`; the
     /// prelude reports back via `settle`.
-    Api { method: &'static str, args: Vec<String>, fiber: Option<String>, reply: Reply<Result<Value, JsError>> },
+    Api { id: u64, method: &'static str, args: Vec<String>, fiber: Option<String>, cancel: Arc<CallCancellation>, reply: Reply<Result<Value, JsError>> },
     TakeOutput(Reply<Output>),
     Idle(Reply<()>),
     Directory(Value),
     RawHostCall(String, Value, Reply<Value>),
     Completion(u64, OpResult),
     Timer(u64),
+    Continuation(u64),
+    CancelCall(u64),
+    DiscardDisposals(Vec<u64>),
     Shutdown,
 }
 
 struct RealmThread {
     tx: Sender<Msg>,
     thread: Option<JoinHandle<()>>,
+    cancel: watch::Sender<bool>,
+    next_call: AtomicU64,
 }
 
 /// Owns the realm threads. Dropping it stops them.
 pub struct JsRuntime {
     handle: tokio::runtime::Handle,
-    realms: Mutex<Vec<RealmThread>>,
+    realms: Mutex<HashMap<RealmId, RealmThread>>,
+    next_realm: AtomicUsize,
+}
+
+struct StartingRealm<'a> {
+    runtime: &'a JsRuntime,
+    id: Option<RealmId>,
+}
+
+impl Drop for StartingRealm<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            // close_realm starts cleanup immediately, even if its returned
+            // join handle is dropped while this create future is cancelled.
+            drop(self.runtime.close_realm(id));
+        }
+    }
 }
 
 fn gone() -> JsError {
@@ -189,38 +225,70 @@ impl JsRuntime {
     }
 
     pub fn start_with(handle: tokio::runtime::Handle) -> JsRuntime {
-        JsRuntime { handle, realms: Mutex::new(Vec::new()) }
+        JsRuntime { handle, realms: Mutex::new(HashMap::new()), next_realm: AtomicUsize::new(0) }
     }
 
     pub async fn create_realm(&self, config: RealmConfig) -> Result<RealmId, JsError> {
+        // Never reuse IDs: late messages for a retired realm cannot reach a
+        // new realm occupying the same registry slot.
+        let id = RealmId(self.next_realm.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| JsError { message: "realm ID space exhausted".into(), ..JsError::default() })?);
         let (tx, rx) = channel();
         let (ready, ready_rx) = oneshot::channel();
         let loop_tx = tx.clone();
         let handle = self.handle.clone();
+        let (cancel, cancelled) = watch::channel(false);
         let thread = std::thread::Builder::new()
             .name(format!("wendy-js-{}", config.name))
-            .spawn(move || engine_main(config, rx, loop_tx, handle, ready))
+            .spawn(move || engine_main(id, config, rx, loop_tx, handle, ready, cancelled))
             .map_err(|e| JsError { message: format!("starting realm thread: {e}"), ..JsError::default() })?;
-        let id = {
-            let mut realms = self.realms.lock().expect("realm table poisoned");
-            realms.push(RealmThread { tx, thread: Some(thread) });
-            RealmId(realms.len() - 1)
-        };
+        self.realms.lock().expect("realm table poisoned").insert(id, RealmThread { tx, thread: Some(thread), cancel, next_call: AtomicU64::new(0) });
+        let mut starting = StartingRealm { runtime: self, id: Some(id) };
         ready_rx.await.unwrap_or_else(|_| Err(gone()))?;
+        starting.id = None;
         Ok(id)
+    }
+
+    /// Retire a realm immediately; await the returned handle to wait for
+    /// its thread and JSC context to finish. Dropping the handle still reaps
+    /// the thread. Queued/future calls observe a stopped realm.
+    pub fn close_realm(&self, id: RealmId) -> tokio::task::JoinHandle<Result<(), JsError>> {
+        let realm = self.realms.lock().expect("realm table poisoned").remove(&id);
+        if let Some(realm) = &realm {
+            realm.cancel.send_replace(true);
+            let _ = realm.tx.send(Msg::Shutdown);
+        }
+        self.handle.spawn_blocking(move || {
+            if let Some(mut realm) = realm
+                && let Some(thread) = realm.thread.take()
+            {
+                thread.join().map_err(|_| JsError { message: "realm thread panicked while closing".into(), ..JsError::default() })?;
+            }
+            Ok(())
+        })
     }
 
     fn send(&self, realm: RealmId, msg: Msg) -> bool {
         let realms = self.realms.lock().expect("realm table poisoned");
-        realms.get(realm.0).is_some_and(|r| r.tx.send(msg).is_ok())
+        realms.get(&realm).is_some_and(|r| r.tx.send(msg).is_ok())
     }
 
     async fn api(&self, realm: RealmId, method: &'static str, args: Vec<String>, fiber: Option<String>) -> Result<Value, JsError> {
         let (reply, rx) = oneshot::channel();
-        if !self.send(realm, Msg::Api { method, args, fiber, reply }) {
-            return Err(gone());
-        }
-        rx.await.unwrap_or_else(|_| Err(gone()))
+        let (id, tx) = {
+            let realms = self.realms.lock().expect("realm table poisoned");
+            let realm = realms.get(&realm).ok_or_else(gone)?;
+            (realm.next_call.fetch_add(1, Ordering::Relaxed) + 1, realm.tx.clone())
+        };
+        let args = if method == "eval" {
+            vec![lower_async(&args[0], Path::new("wendy:eval")).map_err(|message| JsError { message, ..JsError::default() })?]
+        } else { args };
+        let cancel = Arc::new(CallCancellation::new());
+        let mut guard = CallGuard { tx: tx.clone(), id: Some(id), cancel: cancel.clone() };
+        tx.send(Msg::Api { id, method, args, fiber, cancel, reply }).map_err(|_| gone())?;
+        let result = rx.await.unwrap_or_else(|_| Err(gone()));
+        guard.id = None;
+        result
     }
 
     /// Load `module` (a path in the realm's module namespace) and wait for
@@ -240,6 +308,16 @@ impl JsRuntime {
         self.api(realm, "run", vec![module.into(), input.to_string()], Some(fiber.to_string())).await
     }
 
+    /// Invoke a callback registered in this realm, with its own fiber identity.
+    pub async fn call_event(&self, realm: RealmId, callback: u64, input: &Value, fiber: &str) -> Result<Value, JsError> {
+        self.api(realm, "event", vec![callback.to_string(), input.to_string()], Some(fiber.into())).await
+    }
+
+    /// Invoke a plugin-owned command callback as its own fiber.
+    pub async fn call_command(&self, realm: RealmId, callback: u64, input: &Value, fiber: &str) -> Result<Value, JsError> {
+        self.api(realm, "command", vec![callback.to_string(), input.to_string()], Some(fiber.into())).await
+    }
+
     /// Run the module's `onLoad` (if it has one) and keep what it returns.
     /// Returns `{ data, methods }`: its plain members, and the names of its
     /// function members.
@@ -248,7 +326,7 @@ impl JsRuntime {
     }
 
     /// Call a function member of what the module's `onLoad` returned, on
-    /// behalf of fiber `fiber` (whose `tools.x` awaits it makes children).
+    /// behalf of fiber `fiber` (whose `plugins.x` awaits it makes children).
     pub async fn call_method(
         &self,
         realm: RealmId,
@@ -274,7 +352,7 @@ impl JsRuntime {
         rx.await.unwrap_or_default()
     }
 
-    /// What `tools` and `ctx` hold in this realm: every plugin, as the
+    /// What the imported plugin directory and `ctx` hold: every plugin, as the
     /// kernel describes it (name, description, tool schema, what its
     /// `onLoad` mounted, load state).
     pub fn set_directory(&self, realm: RealmId, directory: Value) {
@@ -304,11 +382,12 @@ impl JsRuntime {
 
 impl Drop for JsRuntime {
     fn drop(&mut self) {
-        let mut realms = self.realms.lock().expect("realm table poisoned");
-        for r in realms.iter() {
+        let realms: Vec<_> = self.realms.lock().expect("realm table poisoned").drain().map(|(_, realm)| realm).collect();
+        for r in &realms {
+            r.cancel.send_replace(true);
             let _ = r.tx.send(Msg::Shutdown);
         }
-        for r in realms.iter_mut() {
+        for mut r in realms {
             if let Some(t) = r.thread.take() {
                 let _ = t.join();
             }
@@ -318,7 +397,47 @@ impl Drop for JsRuntime {
 
 // ---------------------------------------------------------------- engine
 
+// Dropping a panicking/aborted host task must settle its owner too.
+struct HostCompletion { tx: Sender<Msg>, id: u64, completed: bool }
+impl HostCompletion {
+    fn finish(mut self, result: OpResult) { self.completed = true; let _ = self.tx.send(Msg::Completion(self.id, result)); }
+}
+impl Drop for HostCompletion {
+    fn drop(&mut self) {
+        if !self.completed { let _ = self.tx.send(Msg::Completion(self.id, OpResult::error("ERR_WENDY_HOST_TASK", "host operation panicked or was cancelled"))); }
+    }
+}
+
+#[derive(Debug)]
+struct CallCancellation { flag: AtomicBool, signal: watch::Sender<bool>, timed_out: AtomicBool, deadline: Option<Instant> }
+impl CallCancellation {
+    fn new() -> Self { Self { flag: AtomicBool::new(false), signal: watch::channel(false).0, timed_out: AtomicBool::new(false), deadline: None } }
+    fn stop(&self) { self.flag.store(true, Ordering::Relaxed); self.signal.send_replace(true); }
+    fn expire(&self) { if !self.timed_out.swap(true, Ordering::Relaxed) { self.stop(); } }
+    fn with_deadline(deadline: Instant) -> Self { Self { deadline: Some(deadline), ..Self::new() } }
+    fn is_stopped(&self) -> bool {
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) { self.expire(); }
+        self.flag.load(Ordering::Relaxed)
+    }
+}
+struct CallGuard { tx: Sender<Msg>, id: Option<u64>, cancel: Arc<CallCancellation> }
+impl Drop for CallGuard {
+    fn drop(&mut self) { if let Some(id) = self.id { self.cancel.stop(); let _ = self.tx.send(Msg::CancelCall(id)); } }
+}
+
+#[derive(Debug)]
+struct Invocation { id: u64, fiber: Option<String>, cancel: Arc<CallCancellation> }
+type Scope = Option<Arc<Invocation>>;
+struct ActiveCall { reply: Reply<Result<Value, JsError>>, scope: Arc<Invocation>, disposals: Vec<u64>, method: &'static str }
+struct CleanupRun { owner: Option<String>, watches: Vec<u64>, deadline: tokio::task::AbortHandle }
+struct Binding { scope: Scope, fatal: bool }
+struct Continuation {
+    scope: Scope, fatal: bool, callback: RootedValue, receiver: RootedValue,
+    args: Vec<RootedValue>,
+}
+
 struct Engine {
+    id: RealmId,
     group: JSContextGroupRef,
     ctx: JSGlobalContextRef,
     api: JSObjectRef,
@@ -327,29 +446,39 @@ struct Engine {
     code: Fs,
     root: String,
     bridge: Option<Arc<dyn HostBridge>>,
-    /// The plugins `tools` and `ctx` reflect, as the kernel last described
+    http: Arc<Http>,
+    checkpoints: Arc<Checkpoints>,
+    terminal: Arc<crate::terminal::Terminal>,
+    terminal_owner: Option<u64>,
+    /// The plugins the imported directory and `ctx` reflect, as last described
     /// them.
     directory: Value,
     stdout: String,
     stderr: String,
     exit_code: Option<i32>,
     /// The fiber the running entry belongs to.
-    current: Option<String>,
+    current: Scope,
+    binding_class: JSClassRef,
+    continuations: HashMap<u64, Continuation>,
+    http_owners: HashMap<u64, Scope>,
+    cancel_handlers: HashMap<u64, HashMap<u64, RootedValue>>,
     /// Module ids wendy resolved for this realm, and those it loaded.
     resolved: HashSet<String>,
     loaded: HashSet<String>,
     /// Armed timers: id → (repeat interval in ms, fiber that armed it).
-    timers: HashMap<u64, (Option<f64>, Option<String>)>,
+    timers: HashMap<u64, (Option<f64>, Scope)>,
     /// Async host ops in flight: id → (resolve function, fiber).
-    pending_ops: HashMap<u64, (JSObjectRef, Option<String>)>,
-    calls: HashMap<u64, Reply<Result<Value, JsError>>>,
-    /// Calls failed by a termination; their late settles are expected.
-    abandoned: HashSet<u64>,
+    pending_ops: HashMap<u64, (JSObjectRef, Scope)>,
+    pending_jobs: HashMap<u64, tokio::task::AbortHandle>,
+    timer_jobs: HashMap<u64, tokio::task::AbortHandle>,
+    calls: HashMap<u64, ActiveCall>,
+    cleanups: HashMap<u64, CleanupRun>,
     idle_waiters: Vec<Reply<()>>,
     next_id: u64,
     tx: Sender<Msg>,
     handle: tokio::runtime::Handle,
     started: Instant,
+    cancelled: watch::Receiver<bool>,
 }
 
 impl Engine {
@@ -359,7 +488,7 @@ impl Engine {
     }
 
     fn is_idle(&self) -> bool {
-        self.timers.is_empty() && self.pending_ops.is_empty() && self.calls.is_empty()
+        self.timers.is_empty() && self.pending_ops.is_empty() && self.calls.is_empty() && self.cleanups.is_empty() && self.continuations.is_empty()
     }
 }
 
@@ -371,7 +500,7 @@ thread_local! {
     static TICKS: Cell<u32> = const { Cell::new(0) };
     static BUDGET_TICKS: Cell<u32> = const { Cell::new(u32::MAX) };
     static MEMORY_CEILING: Cell<u64> = const { Cell::new(0) };
-    static TERMINATED: RefCell<Option<String>> = const { RefCell::new(None) };
+    static TERMINATED: RefCell<Option<(FailureKind, String, Scope)>> = const { RefCell::new(None) };
 }
 
 /// Short, non-reentrant access to the engine. Never call into JS inside.
@@ -382,15 +511,19 @@ fn with<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
 unsafe extern "C" fn should_terminate(_ctx: JSContextRef, _context: *mut c_void) -> bool {
     let ticks = TICKS.get() + 1;
     TICKS.set(ticks);
-    let reason = if ticks >= BUDGET_TICKS.get() {
-        Some(format!("used more than {:.1}s of CPU in one turn", f64::from(BUDGET_TICKS.get()) * WATCHDOG_TICK))
+    let stopping = with(|e| *e.cancelled.borrow() || e.current.as_ref().is_some_and(|scope| scope.cancel.is_stopped()));
+    let reason = if stopping {
+        Some((FailureKind::Cancelled, "fiber cancelled by host".into()))
+    } else if ticks >= BUDGET_TICKS.get() {
+        Some((FailureKind::CpuLimit, format!("used more than {:.1}s of CPU in one turn", f64::from(BUDGET_TICKS.get()) * WATCHDOG_TICK)))
     } else {
         let ceiling = MEMORY_CEILING.get();
-        (ceiling > 0 && footprint() > ceiling).then(|| format!("process memory passed {} MiB", ceiling >> 20))
+        (ceiling > 0 && footprint() > ceiling).then(|| (FailureKind::MemoryLimit, format!("process memory passed {} MiB", ceiling >> 20)))
     };
     match reason {
-        Some(reason) => {
-            TERMINATED.with(|t| *t.borrow_mut() = Some(reason));
+        Some((kind, reason)) => {
+            let scope = with(|e| e.current.clone());
+            TERMINATED.with(|t| *t.borrow_mut() = Some((kind, reason, scope)));
             true
         }
         None => {
@@ -411,26 +544,43 @@ fn footprint() -> u64 {
 }
 
 /// Run `f`, which enters JS, as fiber `fiber` with a fresh CPU budget.
-fn enter<T>(fiber: Option<String>, f: impl FnOnce() -> T) -> T {
-    with(|e| e.current = fiber);
+fn enter<T>(scope: Scope, f: impl FnOnce() -> T) -> T {
+    let previous = with(|e| std::mem::replace(&mut e.current, scope));
     TICKS.set(0);
     let result = f();
-    with(|e| e.current = None);
+    with(|e| e.current = previous);
     result
 }
 
 fn engine_main(
+    id: RealmId,
     config: RealmConfig,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
     handle: tokio::runtime::Handle,
     ready: Reply<Result<(), JsError>>,
+    cancelled: watch::Receiver<bool>,
 ) {
-    let _ = ready.send(init(config, tx, handle));
+    match init(id, config, tx, handle, cancelled) {
+        Ok(()) => { let _ = ready.send(Ok(())); }
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            teardown();
+            return;
+        }
+    }
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Shutdown => break,
-            Msg::Api { method, args, fiber, reply } => start_call(method, args, fiber, reply),
+            Msg::Api { id, method, args, fiber, cancel, reply } => start_call(id, method, args, fiber, cancel, reply),
+            Msg::Continuation(id) => run_continuation(id),
+            Msg::CancelCall(id) => fail_call(id, FailureKind::Cancelled, "the awaiting fiber call was cancelled".into()),
+            Msg::DiscardDisposals(ids) => unsafe {
+                let (ctx, api) = with(|e| (e.ctx, e.api));
+                let callback = get_property(ctx, api, "discardDisposals");
+                let ids = RootedValue::new(ctx, json_value(ctx, &json!(ids).to_string()));
+                let _ = enter(None, || call(ctx, callback as JSObjectRef, &[ids.get()]));
+            },
             Msg::TakeOutput(reply) => {
                 let out = with(|e| Output {
                     stdout: std::mem::take(&mut e.stdout),
@@ -457,7 +607,7 @@ fn engine_main(
     teardown();
 }
 
-fn init(config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtime::Handle) -> Result<(), JsError> {
+fn init(id: RealmId, config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtime::Handle, cancelled: watch::Receiver<bool>) -> Result<(), JsError> {
     let fail = |message: String| JsError { message, ..JsError::default() };
     let root = lpath::normalize(&config.modules.root);
     unsafe {
@@ -472,6 +622,7 @@ fn init(config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtime::Handle) ->
         JSGlobalContextSetName(ctx, name.0);
         ENGINE.with(|e| {
             *e.borrow_mut() = Some(Engine {
+                id,
                 group,
                 ctx,
                 api: null_mut(),
@@ -480,42 +631,71 @@ fn init(config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtime::Handle) ->
                 code: Fs::new(config.modules.io, root.clone()),
                 root,
                 bridge: config.bridge,
+                http: Arc::new(Http::default()),
+                checkpoints: Arc::new(Checkpoints::default()),
+                terminal: Arc::new(crate::terminal::Terminal::default()),
+                terminal_owner: None,
                 directory: json!([]),
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: None,
                 current: None,
+                binding_class: binding_class(),
+                continuations: HashMap::new(),
+                http_owners: HashMap::new(),
+                cancel_handlers: HashMap::new(),
                 resolved: HashSet::new(),
                 loaded: HashSet::new(),
                 timers: HashMap::new(),
                 pending_ops: HashMap::new(),
+                pending_jobs: HashMap::new(),
+                timer_jobs: HashMap::new(),
                 calls: HashMap::new(),
-                abandoned: HashSet::new(),
+                cleanups: HashMap::new(),
                 idle_waiters: Vec::new(),
                 next_id: 0,
                 tx,
                 handle,
                 started: Instant::now(),
+                cancelled,
             })
         });
-        let prelude = enter(None, || eval(ctx, PRELUDE, "wendy:prelude")).map_err(fail)?;
-        let host = JSObjectMakeFunctionWithCallback(ctx, JsStr::new("host").0, host_sync);
-        let host_async_fn = JSObjectMakeFunctionWithCallback(ctx, JsStr::new("hostAsync").0, host_async);
+        let binder = RootedValue::new(ctx, JSObjectMakeFunctionWithCallback(ctx, JsStr::new("bindContinuation").0, bind_continuation) as JSValueRef);
+        let cancel_hook = RootedValue::new(ctx, JSObjectMakeFunctionWithCallback(ctx, JsStr::new("registerPromiseCancel").0, register_promise_cancel) as JSValueRef);
+        let unregister_hook = RootedValue::new(ctx, JSObjectMakeFunctionWithCallback(ctx, JsStr::new("unregisterPromiseCancel").0, unregister_promise_cancel) as JSValueRef);
+        let bootstrap = RootedValue::new(ctx, eval(ctx, ASYNC, "wendy:async").map_err(fail)?);
+        let helpers = RootedValue::new(ctx, call(ctx, bootstrap.get() as JSObjectRef, &[binder.get(), cancel_hook.get(), unregister_hook.get()]).map_err(fail)?);
+        let lowered = lower_async(PRELUDE, Path::new("wendy:prelude")).map_err(fail)?;
+        let factory = RootedValue::new(ctx, eval(ctx, "(function(eval, babelHelpers, code) { return eval(code); })", "wendy:prelude").map_err(fail)?);
+        let intrinsic_eval = RootedValue::new(ctx, eval(ctx, "eval", "wendy:prelude").map_err(fail)?);
+        let lowered = RootedValue::new(ctx, string_value(ctx, &(lowered + "\n//# sourceURL=wendy:prelude")));
+        let prelude = RootedValue::new(ctx, call(ctx, factory.get() as JSObjectRef, &[intrinsic_eval.get(), helpers.get(), lowered.get()]).map_err(fail)?);
+        let host = RootedValue::new(ctx, JSObjectMakeFunctionWithCallback(ctx, JsStr::new("host").0, host_sync) as JSValueRef);
+        let host_async_fn = RootedValue::new(ctx, JSObjectMakeFunctionWithCallback(ctx, JsStr::new("hostAsync").0, host_async) as JSValueRef);
         let settings = json!({ "env": config.env, "argv": config.argv, "version": env!("CARGO_PKG_VERSION") }).to_string();
-        let prelude_fn = JSValueToObject(ctx, prelude, null_mut());
-        let api = enter(None, || call(ctx, prelude_fn, &[host as JSValueRef, host_async_fn as JSValueRef, string_value(ctx, &settings)]))
-            .map_err(fail)?;
+        let settings = RootedValue::new(ctx, string_value(ctx, &settings));
+        let prelude_fn = JSValueToObject(ctx, prelude.get(), null_mut());
+        let api = enter(None, || call(ctx, prelude_fn, &[host.get(), host_async_fn.get(), settings.get(), helpers.get()])).map_err(fail)?;
+        if !JSValueIsObject(ctx, api) { return Err(fail("prelude did not return its API".into())); }
         JSValueProtect(ctx, api);
         let api = api as JSObjectRef;
         with(|e| e.api = api);
         let on_rejection = JSValueToObject(ctx, get_property(ctx, api, "onUnhandledRejection"), null_mut());
+        if !JSObjectIsFunction(ctx, on_rejection) { return Err(fail("prelude rejection callback missing".into())); }
         JSGlobalContextSetUnhandledRejectionCallback(ctx, on_rejection, null_mut());
     }
     Ok(())
 }
 
 fn teardown() {
-    let Some(engine) = ENGINE.with(|e| e.borrow_mut().take()) else { return };
+    let cleanups = ENGINE.with(|e| e.borrow().as_ref().map(|e| e.cleanups.keys().copied().collect::<Vec<_>>()).unwrap_or_default());
+    for id in cleanups { finish_cleanup(id, CleanupStatus::Cancelled, Some("realm closed before cleanup completed".into())); }
+    let Some(mut engine) = ENGINE.with(|e| e.borrow_mut().take()) else { return };
+    engine.http.abort_all();
+    for job in engine.pending_jobs.values().chain(engine.timer_jobs.values()) { job.abort(); }
+    engine.continuations.clear();
+    engine.cancel_handlers.clear();
+    for call in engine.calls.values() { call.scope.cancel.stop(); }
     unsafe {
         for (_, (resolve, _)) in engine.pending_ops {
             JSValueUnprotect(engine.ctx, resolve as JSValueRef);
@@ -524,29 +704,20 @@ fn teardown() {
             JSValueUnprotect(engine.ctx, engine.api as JSValueRef);
         }
         JSGlobalContextRelease(engine.ctx);
+        JSClassRelease(engine.binding_class);
         JSContextGroupRelease(engine.group);
     }
 }
 
 /// After each message: handle a terminated turn, wake idle waiters.
 fn after_turn() {
-    if let Some(reason) = TERMINATED.with(|t| t.borrow_mut().take()) {
-        let (name, calls) = with(|e| {
-            e.stderr.push_str(&format!("wendy: {}: script terminated: {reason}\n", e.name));
-            let calls = std::mem::take(&mut e.calls);
-            e.abandoned.extend(calls.keys());
-            (e.name.clone(), calls)
-        });
-        for (_, reply) in calls {
-            let message = format!("{name}: script terminated: {reason}");
-            let _ = reply.send(Err(JsError { message, ..JsError::default() }));
-        }
-        // A termination that hit while microtasks drained stays pending in
-        // the VM, and the next entry's microtask queue is dropped while JSC
-        // clears it. Spend that on an empty entry instead of a real call.
+    if let Some((kind, reason, scope)) = TERMINATED.with(|t| t.borrow_mut().take()) {
+        let name = with(|e| { e.stderr.push_str(&format!("wendy: {}: script terminated: {reason}\n", e.name)); e.name.clone() });
+        // Clear JSC's pending termination before rejecting Promise chains.
         let ctx = with(|e| e.ctx);
         let _ = enter(None, || unsafe { eval(ctx, "void 0", "wendy:recover") });
         TERMINATED.with(|t| t.borrow_mut().take());
+        if let Some(scope) = scope { fail_call(scope.id, kind, format!("{name}: script terminated: {reason}")); }
     }
     let waiters = with(|e| if e.is_idle() { std::mem::take(&mut e.idle_waiters) } else { Vec::new() });
     for w in waiters {
@@ -554,35 +725,232 @@ fn after_turn() {
     }
 }
 
-fn start_call(method: &'static str, args: Vec<String>, fiber: Option<String>, reply: Reply<Result<Value, JsError>>) {
-    let (ctx, api, id) = with(|e| {
-        let id = e.next();
-        e.calls.insert(id, reply);
-        (e.ctx, e.api, id)
+// Native bound functions carry an unforgeable consumer scope. Their JS
+// callback is an ordinary readonly property so JSC traces cycles correctly;
+// only the Arc scope lives in private data (finalizers may run off-thread).
+unsafe extern "C" fn drop_binding(object: JSObjectRef) {
+    let data = unsafe { JSObjectGetPrivate(object) } as *mut Binding;
+    if !data.is_null() { drop(unsafe { Box::from_raw(data) }); }
+}
+unsafe fn binding_class() -> JSClassRef {
+    let definition = JSClassDefinition {
+        version: 0, attributes: 0, class_name: c"WendyContinuation".as_ptr(), parent: null_mut(),
+        static_values: std::ptr::null(), static_functions: std::ptr::null(), initialize: std::ptr::null(),
+        finalize: Some(drop_binding), has_property: std::ptr::null(), get_property: std::ptr::null(),
+        set_property: std::ptr::null(), delete_property: std::ptr::null(), get_property_names: std::ptr::null(),
+        call: Some(enqueue_continuation), construct: std::ptr::null(), has_instance: std::ptr::null(), convert: std::ptr::null(),
+    };
+    unsafe { JSClassCreate(&definition) }
+}
+unsafe extern "C" fn register_promise_cancel(ctx: JSContextRef, _f: JSObjectRef, _this: JSObjectRef, argc: usize, argv: *const JSValueRef, _exc: *mut JSValueRef) -> JSValueRef {
+    unsafe {
+        if argc > 0 {
+            let reject = *argv;
+            if !JSValueIsObject(ctx, reject) || !JSObjectIsFunction(ctx, JSValueToObject(ctx, reject, null_mut())) { return JSValueMakeNumber(ctx, 0.0); }
+            let scope = with(|e| e.current.clone());
+            if let Some(scope) = scope {
+                let active = with(|e| e.calls.contains_key(&scope.id));
+                if active {
+                    let root = RootedValue::new(ctx, reject);
+                    let id = with(|e| { let id = e.next(); e.cancel_handlers.entry(scope.id).or_default().insert(id, root); id });
+                    return JSValueMakeNumber(ctx, id as f64);
+                }
+            }
+        }
+        JSValueMakeNumber(ctx, 0.0)
+    }
+}
+unsafe extern "C" fn unregister_promise_cancel(ctx: JSContextRef, _f: JSObjectRef, _this: JSObjectRef, argc: usize, argv: *const JSValueRef, _exc: *mut JSValueRef) -> JSValueRef {
+    unsafe {
+        if argc > 0 {
+            let id = JSValueToNumber(ctx, *argv, null_mut()) as u64;
+            with(|e| { for handlers in e.cancel_handlers.values_mut() { handlers.remove(&id); } });
+        }
+        JSValueMakeUndefined(ctx)
+    }
+}
+unsafe extern "C" fn bind_continuation(ctx: JSContextRef, _f: JSObjectRef, _this: JSObjectRef, argc: usize, argv: *const JSValueRef, _exc: *mut JSValueRef) -> JSValueRef {
+    unsafe {
+        if argc == 0 || !JSValueIsObject(ctx, *argv) { return JSValueMakeUndefined(ctx); }
+        let callback = JSValueToObject(ctx, *argv, null_mut());
+        if !JSObjectIsFunction(ctx, callback) { return JSValueMakeUndefined(ctx); }
+        let (class, scope) = with(|e| (e.binding_class, e.current.clone()));
+        let data = Box::into_raw(Box::new(Binding { scope, fatal: argc > 1 && JSValueToBoolean(ctx, *argv.add(1)) }));
+        let bound = RootedValue::new(ctx, JSObjectMake(ctx, class, data.cast()) as JSValueRef);
+        JSObjectSetProperty(ctx, bound.get() as JSObjectRef, JsStr::new("callback").0, callback as JSValueRef, 2 | 4 | 8, null_mut());
+        bound.get()
+    }
+}
+unsafe extern "C" fn enqueue_continuation(ctx: JSContextRef, function: JSObjectRef, receiver: JSObjectRef, argc: usize, argv: *const JSValueRef, _exc: *mut JSValueRef) -> JSValueRef {
+    unsafe {
+        let private = JSObjectGetPrivate(function) as *const Binding;
+        if private.is_null() { return JSValueMakeUndefined(ctx); }
+        let binding = &*private;
+        if binding.scope.as_ref().is_some_and(|s| s.cancel.is_stopped()) { return JSValueMakeUndefined(ctx); }
+        let callback = RootedValue::new(ctx, get_property(ctx, function, "callback"));
+        let receiver = RootedValue::new(ctx, receiver as JSValueRef);
+        let args = (0..argc).map(|i| RootedValue::new(ctx, *argv.add(i))).collect();
+        let work = Continuation { scope: binding.scope.clone(), fatal: binding.fatal, callback, receiver, args };
+        with(|e| { let id = e.next(); e.continuations.insert(id, work); let _ = e.tx.send(Msg::Continuation(id)); });
+        JSValueMakeUndefined(ctx)
+    }
+}
+fn run_continuation(id: u64) {
+    let Some((ctx, work)) = with(|e| e.continuations.remove(&id).map(|work| (e.ctx, work))) else { return };
+    if work.scope.as_ref().is_some_and(|s| s.cancel.is_stopped()) { return; }
+    unsafe {
+        let args: Vec<_> = work.args.iter().map(RootedValue::get).collect();
+        let mut exception = std::ptr::null();
+        let value = enter(work.scope.clone(), || JSObjectCallAsFunction(ctx, work.callback.get() as JSObjectRef, work.receiver.get() as JSObjectRef, args.len(), args.as_ptr(), &mut exception));
+        if TERMINATED.with(|t| t.borrow().is_some()) { return; }
+        if !exception.is_null() {
+            let message = describe_exception(ctx, exception);
+            if work.fatal { if let Some(scope) = &work.scope { fail_call(scope.id, FailureKind::Failed, message.clone()); } }
+            with(|e| e.stderr.push_str(&format!("Uncaught {message}\n")));
+        }
+        let _ = value;
+    }
+}
+fn fail_call(id: u64, kind: FailureKind, message: String) {
+    fail_call_error(id, JsError { kind, message, ..JsError::default() });
+}
+fn fail_call_error(id: u64, mut error: JsError) {
+    let Some(active) = with(|e| e.calls.remove(&id)) else { return };
+    active.scope.cancel.is_stopped();
+    let timed_out = active.scope.cancel.timed_out.load(Ordering::Relaxed);
+    if timed_out { error.message = "onDispose exceeded its two-second deadline".into(); }
+    let message = error.message.clone();
+    retire_scope(&active.scope, &message);
+    let status = if timed_out { CleanupStatus::TimedOut } else if error.kind == FailureKind::Cancelled { CleanupStatus::Cancelled } else { CleanupStatus::Failed };
+    finish_cleanup(id, status, Some(error.message.clone()));
+    if !active.disposals.is_empty() { start_disposal(active.disposals, active.scope.fiber.clone()); }
+    let _ = active.reply.send(Err(error));
+}
+
+// Stop every resource owned by this invocation, including work a cleanup
+// callback started without awaiting. Ordinary successful calls retain their
+// Node-style timers; disposal invocations always retire their whole scope.
+fn retire_scope(scope: &Invocation, message: &str) {
+    scope.cancel.stop();
+    let id = scope.id;
+    let ctx = with(|e| e.ctx);
+    let owned = |scope: &Scope| scope.as_ref().is_some_and(|scope| scope.id == id);
+    let (resolves, timers, rejects) = with(|e| {
+        if e.terminal_owner == Some(id) { e.terminal.release(); e.terminal_owner = None; }
+        let op_ids: Vec<_> = e.pending_ops.iter().filter(|(_, (_, scope))| owned(scope)).map(|(id, _)| *id).collect();
+        let mut resolves = Vec::new();
+        for op in op_ids {
+            if let Some(job) = e.pending_jobs.remove(&op) { job.abort(); }
+            if let Some((resolve, _)) = e.pending_ops.remove(&op) { resolves.push(resolve); }
+        }
+        let timer_ids: Vec<_> = e.timers.iter().filter(|(_, (_, scope))| owned(scope)).map(|(id, _)| *id).collect();
+        for timer in &timer_ids { e.timers.remove(timer); if let Some(job) = e.timer_jobs.remove(timer) { job.abort(); } }
+        e.continuations.retain(|_, work| !owned(&work.scope));
+        let http_ids: Vec<_> = e.http_owners.iter().filter(|(_, scope)| owned(scope)).map(|(id, _)| *id).collect();
+        for http in http_ids { e.http_owners.remove(&http); e.http.abort(http); }
+        (resolves, timer_ids, e.cancel_handlers.remove(&id).unwrap_or_default())
     });
     unsafe {
-        let f = JSValueToObject(ctx, get_property(ctx, api, method), null_mut());
-        let mut argv = vec![JSValueMakeNumber(ctx, id as f64)];
-        argv.extend(args.iter().map(|a| string_value(ctx, a)));
-        if let Err(message) = enter(fiber, || call(ctx, f, &argv))
-            && let Some(reply) = with(|e| e.calls.remove(&id))
-        {
-            let _ = reply.send(Err(JsError { message, ..JsError::default() }));
+        for resolve in resolves { JSValueUnprotect(ctx, resolve as JSValueRef); }
+        let error = RootedValue::new(ctx, string_value(ctx, message));
+        for reject in rejects.into_values() { let _ = enter(None, || call(ctx, reject.get() as JSObjectRef, &[error.get()])); }
+        if !timers.is_empty() {
+            let api = with(|e| e.api);
+            let discard = get_property(ctx, api, "discardTimers");
+            let ids = RootedValue::new(ctx, json_value(ctx, &json!(timers).to_string()));
+            let _ = enter(None, || call(ctx, discard as JSObjectRef, &[ids.get()]));
+        }
+    }
+}
+
+// Cleanup has its own bounded invocation, so an interrupted generator's
+// finally block is not required to release plugin-owned session state.
+fn cleanup_event(id: u64, owner: Option<String>, status: CleanupStatus, error: Option<String>) {
+    let (realm, bridge) = with(|e| {
+        if matches!(status, CleanupStatus::Failed | CleanupStatus::TimedOut | CleanupStatus::Cancelled) {
+            e.stderr.push_str(&format!("wendy: onDispose {id}: {status:?}: {}\n", error.as_deref().unwrap_or("")));
+        }
+        (e.name.clone(), e.bridge.clone())
+    });
+    let event = FiberEvent::Cleanup { at_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+        id, realm, owner, status, error };
+    if let Some(bridge) = bridge {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bridge.on_event(event))).is_err() {
+            with(|e| e.stderr.push_str("wendy: cleanup event observer panicked\n"));
+        }
+    }
+}
+fn finish_cleanup(id: u64, status: CleanupStatus, error: Option<String>) {
+    let Some(cleanup) = with(|e| e.cleanups.remove(&id)) else { return };
+    cleanup.deadline.abort();
+    // A timeout can happen before dispose has removed its JS callbacks.
+    // Defer bookkeeping until JSC's termination bit has been cleared.
+    with(|e| { let _ = e.tx.send(Msg::DiscardDisposals(cleanup.watches)); });
+    cleanup_event(id, cleanup.owner, status, error);
+}
+fn start_disposal(ids: Vec<u64>, owner: Option<String>) {
+    // Across all realms these private call ids occupy their own JS-safe range.
+    static NEXT_CLEANUP: AtomicU64 = AtomicU64::new(1_u64 << 52);
+    let id = NEXT_CLEANUP.fetch_add(1, Ordering::Relaxed);
+    let (tx, handle) = with(|e| (e.tx.clone(), e.handle.clone()));
+    let deadline_at = Instant::now() + Duration::from_secs(2);
+    let cancel = Arc::new(CallCancellation::with_deadline(deadline_at));
+    let deadline_cancel = cancel.clone();
+    // Arm before calling JS: a callback can block before its first await.
+    let deadline = handle.spawn(async move {
+        tokio::time::sleep_until(deadline_at.into()).await;
+        // The flag/watch interrupts CPU and synchronous waits without
+        // requiring the busy realm to consume this message first.
+        deadline_cancel.expire();
+        let _ = tx.send(Msg::CancelCall(id));
+    });
+    with(|e| { e.cleanups.insert(id, CleanupRun { owner: owner.clone(), watches: ids.clone(), deadline: deadline.abort_handle() }); });
+    cleanup_event(id, owner, CleanupStatus::Started, None);
+    let (reply, _result) = oneshot::channel();
+    // Enter on the next engine turn, after the failed invocation has left
+    // the JS stack. Nested JS entry would drain lazy thenable jobs under
+    // the failed caller's scope instead of this cleanup's scope.
+    with(|e| { let _ = e.tx.send(Msg::Api { id, method: "dispose", args: vec![json!(ids).to_string()], fiber: None, cancel, reply }); });
+}
+
+fn start_call(id: u64, method: &'static str, args: Vec<String>, fiber: Option<String>, cancel: Arc<CallCancellation>, reply: Reply<Result<Value, JsError>>) {
+    let (ctx, api, scope) = with(|e| {
+        let scope = Arc::new(Invocation { id, fiber, cancel });
+        e.calls.insert(id, ActiveCall { reply, scope: scope.clone(), disposals: Vec::new(), method });
+        (e.ctx, e.api, scope)
+    });
+    if scope.cancel.is_stopped() { fail_call(id, FailureKind::Cancelled, "call cancelled before execution".into()); return; }
+    unsafe {
+        let f = RootedValue::new(ctx, JSValueToObject(ctx, get_property(ctx, api, method), null_mut()) as JSValueRef);
+        // A Vec's storage is on the Rust heap, outside JSC's root scan. Root
+        // each argument immediately: constructing the next one can run GC.
+        let mut roots = Vec::with_capacity(args.len() + 1);
+        roots.push(RootedValue::new(ctx, JSValueMakeNumber(ctx, id as f64)));
+        for arg in &args {
+            roots.push(RootedValue::new(ctx, string_value(ctx, arg)));
+        }
+        let argv: Vec<_> = roots.iter().map(RootedValue::get).collect();
+        if let Err(message) = enter(Some(scope), || call(ctx, f.get() as JSObjectRef, &argv)) {
+            if TERMINATED.with(|t| t.borrow().is_none()) { fail_call(id, FailureKind::Failed, message); }
         }
     }
 }
 
 fn complete(id: u64, result: OpResult) {
-    let Some((ctx, resolve, fiber)) = with(|e| e.pending_ops.remove(&id).map(|(r, f)| (e.ctx, r, f))) else { return };
+    let Some((ctx, resolve, fiber)) = with(|e| {
+        e.pending_jobs.remove(&id);
+        e.pending_ops.remove(&id).map(|(r, f)| (e.ctx, r, f))
+    }) else { return };
     unsafe {
-        let value = result_value(ctx, result);
-        let _ = enter(fiber, || call(ctx, resolve, &[value]));
+        let value = RootedValue::new(ctx, result_value(ctx, result));
+        let _ = enter(fiber, || call(ctx, resolve, &[value.get()]));
         JSValueUnprotect(ctx, resolve as JSValueRef);
     }
 }
 
 fn fire_timer(id: u64) {
     let target = with(|e| {
+        e.timer_jobs.remove(&id);
         let (repeat, fiber) = e.timers.get(&id).cloned()?;
         match repeat {
             Some(ms) => arm_timer(e, id, ms),
@@ -599,12 +967,13 @@ fn fire_timer(id: u64) {
     }
 }
 
-fn arm_timer(e: &Engine, id: u64, ms: f64) {
+fn arm_timer(e: &mut Engine, id: u64, ms: f64) {
     let tx = e.tx.clone();
-    e.handle.spawn(async move {
+    let task = e.handle.spawn(async move {
         tokio::time::sleep(Duration::from_secs_f64(ms / 1000.0)).await;
         let _ = tx.send(Msg::Timer(id));
     });
+    e.timer_jobs.insert(id, task.abort_handle());
 }
 
 // ------------------------------------------------------------ host calls
@@ -639,7 +1008,14 @@ unsafe extern "C" fn host_sync(
 ) -> JSValueRef {
     unsafe {
         let (op, args, bytes) = read_call(ctx, argc, argv);
-        result_value(ctx, sync_op(&op, args, bytes))
+        // Permit finalizers and error reporting to settle an interrupted
+        // call; rejecting console/settle here could recursively reject the
+        // unhandled-rejection reporter while a realm is shutting down.
+        let cleanup = matches!(op.as_str(), "settle" | "console.write" | "timer.clear" | "http.abort" | "terminal.close" | "kernel.directory" | "clock.now");
+        let result = if !cleanup && with(|e| *e.cancelled.borrow() || e.current.as_ref().is_some_and(|scope| scope.cancel.is_stopped())) {
+            OpResult::error("ERR_WENDY_CANCELLED", "fiber or realm cancelled")
+        } else { sync_op(&op, args, bytes) };
+        result_value(ctx, result)
     }
 }
 
@@ -658,39 +1034,55 @@ unsafe extern "C" fn host_async(
         let promise = JSObjectMakeDeferredPromise(ctx, &mut resolve, &mut reject, null_mut());
         JSValueProtect(ctx, resolve as JSValueRef);
         // The op belongs to the fiber of the entry it was started in.
-        let (id, tx, handle, fs, fiber, bridge, realm) = with(|e| {
+        let (id, tx, handle, fs, fiber, bridge, realm, realm_id, loading) = with(|e| {
             let id = e.next();
             e.pending_ops.insert(id, (resolve, e.current.clone()));
-            (id, e.tx.clone(), e.handle.clone(), e.fs.clone(), e.current.clone(), e.bridge.clone(), e.name.clone())
+            let loading = e.current.as_ref().and_then(|scope| e.calls.get(&scope.id)).is_some_and(|call| call.method == "load");
+            (id, e.tx.clone(), e.handle.clone(), e.fs.clone(), e.current.clone(), e.bridge.clone(), e.name.clone(), e.id, loading)
         });
-        let finish = move |result: OpResult| {
-            let _ = tx.send(Msg::Completion(id, result));
-        };
-        if op.starts_with("fs.") {
-            handle.spawn(async move { finish(fs_op(fs, &op, args, bytes).await) });
+        let completion = HostCompletion { tx, id, completed: false };
+        let finish = move |result: OpResult| completion.finish(result);
+        let job = if with(|e| *e.cancelled.borrow() || e.current.as_ref().is_some_and(|scope| scope.cancel.is_stopped())) {
+            finish(closed_realm());
+            None
+        } else if op.starts_with("fs.") {
+            Some(handle.spawn(async move { finish(fs_op(fs, &op, args, bytes).await) }))
+        } else if op == "sh.exec" {
+            Some(handle.spawn(async move { finish(crate::sh::execute(fs, args).await) }))
         } else if op == "proc.exec" {
             match exec_request(&fs, &args, bytes) {
                 Ok(spec) => {
-                    handle.spawn(async move { finish(run_exec(fs, spec).await) });
+                    Some(handle.spawn(async move { finish(run_exec(fs, spec).await) }))
                 }
-                Err(invalid) => finish(invalid),
+                Err(invalid) => { finish(invalid); None }
             }
+        } else if op == "terminal.read" {
+            let terminal = with(|e| e.terminal.clone());
+            Some(handle.spawn(async move { finish(terminal.read(args).await) }))
+        } else if op.starts_with("checkpoint.") {
+            let checkpoints = with(|e| e.checkpoints.clone());
+            Some(handle.spawn_blocking(move || finish(checkpoints.call(&op, args))))
+        } else if op.starts_with("http.") {
+            let http = with(|e| e.http.clone());
+            Some(handle.spawn(async move { finish(http.call(&op, args).await) }))
         } else if op.starts_with("kernel.") {
             match bridge {
                 Some(bridge) => {
-                    handle.spawn(async move {
-                        let result = match bridge.call(Caller { realm, fiber }, &op, args).await {
+                    Some(handle.spawn(async move {
+                        let result = match bridge.call(Caller { realm, realm_id, loading, fiber: fiber.as_ref().and_then(|scope| scope.fiber.clone()) }, &op, args).await {
                             Ok(value) => OpResult::Json(value),
                             Err(message) => OpResult::error("ERR_WENDY_FIBER", message),
                         };
                         finish(result)
-                    });
+                    }))
                 }
-                None => finish(OpResult::error("ERR_WENDY_NO_KERNEL", "other plugins are only reachable under the wendy kernel")),
+                None => { finish(OpResult::error("ERR_WENDY_NO_KERNEL", "other plugins are only reachable under the wendy kernel")); None }
             }
         } else {
             finish(OpResult::error("ERR_WENDY", format!("{op} has no async form")));
-        }
+            None
+        };
+        if let Some(job) = job { with(|e| { e.pending_jobs.insert(id, job.abort_handle()); }); }
         promise as JSValueRef
     }
 }
@@ -699,17 +1091,83 @@ fn invalid(what: &str) -> OpResult {
     OpResult::error("ERR_WENDY_INVALID_CALL", format!("invalid {what} in host call"))
 }
 
+fn closed_realm() -> OpResult { OpResult::error("ERR_WENDY_REALM_CLOSED", "the realm is closing") }
+
+fn blocking<T>(future: impl std::future::Future<Output = T>) -> Result<T, OpResult> {
+    let (handle, mut cancelled, scope) = with(|e| (e.handle.clone(), e.cancelled.clone(), e.current.clone()));
+    handle.block_on(async move {
+        let stop_scope = async {
+            match scope {
+                Some(scope) => { let _ = scope.cancel.signal.subscribe().wait_for(|stopped| *stopped).await; }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancelled.wait_for(|closed| *closed) => Err(closed_realm()),
+            _ = stop_scope => Err(OpResult::error("ERR_WENDY_CANCELLED", "fiber cancelled by host")),
+            result = future => Ok(result),
+        }
+    })
+}
+
 fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
     let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     match op {
+        _ if op.starts_with("terminal.") => with(|e| {
+            if op == "terminal.open" && e.current.is_none() { return invalid("terminal owner"); }
+            let result = e.terminal.call(op, args);
+            if matches!(result, OpResult::Json(_)) {
+                if op == "terminal.open" { e.terminal_owner = e.current.as_ref().map(|s| s.id); }
+                if op == "terminal.close" { e.terminal_owner = None; }
+            }
+            result
+        }),
+        "models.source" => {
+            static COMPILED: OnceLock<Result<String, String>> = OnceLock::new();
+            match COMPILED.get_or_init(|| lower_async(PI_AI, Path::new("wendy:pi-ai"))) {
+                Ok(code) => OpResult::Json(json!(code)), Err(error) => OpResult::error("ERR_SYNTAX", error),
+            }
+        },
+        "fiber.watch" => with(|e| {
+            let Some(scope) = e.current.clone() else { return invalid("cleanup owner"); };
+            if e.cleanups.contains_key(&scope.id) { return invalid("cleanup cannot register nested cleanup"); }
+            let id = e.next();
+            let Some(call) = e.calls.get_mut(&scope.id) else { return invalid("cleanup owner"); };
+            call.disposals.push(id);
+            OpResult::Json(json!(id))
+        }),
+        "fiber.unwatch" => with(|e| {
+            let Some(scope) = e.current.clone() else { return invalid("cleanup owner"); };
+            let id = args.get("id").and_then(Value::as_u64).unwrap_or(0);
+            if let Some(call) = e.calls.get_mut(&scope.id) { call.disposals.retain(|watch| *watch != id); }
+            OpResult::Json(Value::Null)
+        }),
+        "fiber.unhandled" => {
+            if let Some(scope) = with(|e| e.current.clone()) { fail_call(scope.id, FailureKind::Failed, s("error")); }
+            OpResult::Json(Value::Null)
+        }
+        "models.credentials" => crate::http::credentials(&args),
+        "http.auth_configured" => crate::http::auth_configured(&args),
+        "http.open" => with(|e| {
+            let result = e.http.open(args, bytes);
+            if let OpResult::Json(value) = &result { if let Some(id) = value.as_u64() { e.http_owners.insert(id, e.current.clone()); } }
+            result
+        }),
+        "http.abort" => {
+            if let Some(id) = args.get("id").and_then(Value::as_u64) {
+                with(|e| { e.http_owners.remove(&id); e.http.abort(id); });
+            }
+            OpResult::Json(Value::Null)
+        }
         _ if op.starts_with("fs.") => {
-            let (fs, handle) = with(|e| (e.fs.clone(), e.handle.clone()));
-            handle.block_on(fs_op(fs, op, args, bytes))
+            let fs = with(|e| e.fs.clone());
+            blocking(fs_op(fs, op, args, bytes)).unwrap_or_else(|error| error)
         }
         "proc.exec" => {
-            let (fs, handle) = with(|e| (e.fs.clone(), e.handle.clone()));
+            let fs = with(|e| e.fs.clone());
             match exec_request(&fs, &args, bytes) {
-                Ok(spec) => handle.block_on(run_exec(fs, spec)),
+                Ok(spec) => blocking(run_exec(fs, spec)).unwrap_or_else(|error| error),
                 Err(invalid) => invalid,
             }
         }
@@ -732,7 +1190,10 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
         }
         "timer.clear" => {
             if let Some(id) = args.get("id").and_then(Value::as_u64) {
-                with(|e| e.timers.remove(&id));
+                with(|e| {
+                    e.timers.remove(&id);
+                    if let Some(job) = e.timer_jobs.remove(&id) { job.abort(); }
+                });
             }
             OpResult::Json(Value::Null)
         }
@@ -741,9 +1202,10 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
         "process.cwd" => OpResult::Json(json!(with(|e| e.fs.cwd().to_string()))),
         "process.chdir" => {
             let dir = s("dir");
-            let (fs, handle) = with(|e| (e.fs.clone(), e.handle.clone()));
+            let fs = with(|e| e.fs.clone());
             let target = fs.resolve(&dir);
-            match handle.block_on(fs.stat(&dir)) {
+            let stat = match blocking(fs.stat(&dir)) { Ok(stat) => stat, Err(error) => return error };
+            match stat {
                 Ok(entry) if entry.kind == EntryKind::Dir => {
                     with(|e| e.fs = fs.with_cwd(&target));
                     OpResult::Json(Value::Null)
@@ -766,20 +1228,48 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
         "module.load" => load_module(&s("id")),
         "settle" => {
             let id = args.get("id").and_then(Value::as_u64).unwrap_or(0);
+            let owner = with(|e| e.current.as_ref().map(|scope| scope.id));
+            if owner != Some(id) { return invalid("settle owner"); }
+            if with(|e| e.current.as_ref().is_some_and(|scope| scope.cancel.is_stopped())) {
+                fail_call(id, FailureKind::Cancelled, "call cancelled before completion".into());
+                return OpResult::Json(Value::Null);
+            }
             let Some(reply) = with(|e| e.calls.remove(&id)) else {
-                let expected = with(|e| e.abandoned.remove(&id));
+                let expected = with(|e| e.current.as_ref().is_some_and(|scope| scope.id == id && scope.cancel.is_stopped()));
                 return if expected { OpResult::Json(Value::Null) } else { invalid("settle id") };
             };
             let result = if args.get("ok").and_then(Value::as_bool) == Some(true) {
                 Ok(args.get("value").cloned().unwrap_or(Value::Null))
             } else {
                 Err(JsError {
+                    kind: FailureKind::Failed,
                     message: s("error"),
                     exit_code: args.get("exit").and_then(Value::as_i64).map(|c| c as i32),
                     stack: args.get("stack").and_then(Value::as_str).filter(|st| !st.is_empty()).map(str::to_string),
                 })
             };
-            let _ = reply.send(result);
+            if result.is_err() {
+                // Put it back so the common cleanup path retires this scope.
+                let error = result.unwrap_err();
+                with(|e| { e.calls.insert(id, reply); });
+                fail_call_error(id, error);
+            } else {
+                with(|e| { if e.terminal_owner == Some(id) { e.terminal.release(); e.terminal_owner = None; } });
+                if matches!(reply.method, "event" | "command") || with(|e| e.cleanups.contains_key(&id)) {
+                    retire_scope(&reply.scope, "callback completed; pending callback work cancelled");
+                }
+                finish_cleanup(id, CleanupStatus::Done, None);
+                with(|e| { e.cancel_handlers.remove(&id); });
+                if !reply.disposals.is_empty() {
+                    unsafe {
+                        let (ctx, api) = with(|e| (e.ctx, e.api));
+                        let callback = get_property(ctx, api, "discardDisposals");
+                        let ids = RootedValue::new(ctx, json_value(ctx, &json!(reply.disposals).to_string()));
+                        let _ = call(ctx, callback as JSObjectRef, &[ids.get()]);
+                    }
+                }
+                let _ = reply.reply.send(result);
+            }
             OpResult::Json(Value::Null)
         }
         other => OpResult::error("ERR_WENDY", format!("unknown host op {other}")),
@@ -789,6 +1279,10 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
 // -------------------------------------------------------------- modules
 
 fn resolve_module(spec: &str, from: Option<&Value>) -> OpResult {
+    if matches!(spec, "wendy:models" | "wendy:checkpoints" | "wendy:lifecycle" | "wendy:sh" | "wendy:events" | "wendy:http" | "wendy:terminal" | "wendy:plugins" | "wendy:commands") || spec.strip_prefix("wendy:async/helpers/").is_some_and(|name|
+        ["asyncToGenerator", "wrapAsyncGenerator", "awaitAsyncGenerator", "asyncGeneratorDelegate", "asyncIterator"].contains(&name)) {
+        return OpResult::Json(json!({ "builtin": spec }));
+    }
     let bare = spec.strip_prefix("node:").unwrap_or(spec);
     if BUILTINS.contains(&bare) {
         return OpResult::Json(json!({ "builtin": bare }));

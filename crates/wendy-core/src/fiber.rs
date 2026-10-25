@@ -15,6 +15,9 @@ pub struct Fiber {
     #[serde(default)]
     pub detached: bool,
     pub input: Payload,
+    /// Present for an event-listener invocation, rather than onHandle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -28,12 +31,49 @@ pub enum Exit {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stack: Option<String>,
     },
+    Cancelled {
+        reason: String,
+    },
+    #[serde(rename = "budget_exceeded")]
+    BudgetExceeded {
+        resource: BudgetResource,
+        error: String,
+    },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetResource { Cpu, Memory }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupStatus { Started, Done, Failed, TimedOut, Cancelled }
 
 /// What happens to a fiber, as hooks see it and records store it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "lowercase")]
 pub enum FiberEvent {
+    /// An event emitted by its owning plugin. Identity is supplied by the kernel.
+    Plugin {
+        at_ms: u64,
+        id: String,
+        name: String,
+        plugin: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fiber: Option<String>,
+        data: Payload,
+    },
+    /// Runtime cleanup is independent of the owner's already-emitted exit.
+    Cleanup {
+        at_ms: u64,
+        id: u64,
+        realm: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+        status: CleanupStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     Spawn {
         /// Milliseconds since the Unix epoch.
         at_ms: u64,
@@ -69,7 +109,7 @@ mod tests {
     fn events_serialize_as_tagged_records_and_round_trip() {
         let spawn = FiberEvent::Spawn {
             at_ms: 1,
-            fiber: Fiber { id: "f2".into(), parent: Some("f1".into()), plugin: "read".into(), detached: false, input: json!({ "path": "a" }) },
+            fiber: Fiber { id: "f2".into(), parent: Some("f1".into()), plugin: "read".into(), detached: false, input: json!({ "path": "a" }), event: None },
         };
         let exit = FiberEvent::Exit {
             at_ms: 4,
@@ -86,4 +126,17 @@ mod tests {
             assert_eq!(serde_json::from_value::<FiberEvent>(json).unwrap(), event);
         }
     }
+    #[test]
+    fn cancellation_and_budget_exits_have_distinct_round_trip_states() {
+        for (exit, status) in [
+            (Exit::Cancelled { reason: "requested".into() }, "cancelled"),
+            (Exit::BudgetExceeded { resource: BudgetResource::Cpu, error: "CPU limit".into() }, "budget_exceeded"),
+            (Exit::BudgetExceeded { resource: BudgetResource::Memory, error: "memory limit".into() }, "budget_exceeded"),
+        ] {
+            let value = serde_json::to_value(&exit).unwrap();
+            assert_eq!(value["status"], status);
+            assert_eq!(serde_json::from_value::<Exit>(value).unwrap(), exit);
+        }
+    }
+
 }

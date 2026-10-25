@@ -12,10 +12,8 @@ serde_json.workspace = true
 tokio.workspace = true
 wendy-io.workspace = true
 wendy-libc.workspace = true
-wendy-trace.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio.workspace = true
 wendy-storage.workspace = true
-wendy-trace.workspace = true

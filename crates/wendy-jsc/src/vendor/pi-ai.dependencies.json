@@ -1,0 +1,67 @@
+[
+  {
+    "name": "@earendil-works/pi-ai",
+    "version": "0.82.1",
+    "license": "MIT"
+  },
+  {
+    "name": "abort-controller",
+    "version": "3.0.0",
+    "license": "MIT"
+  },
+  {
+    "name": "event-target-shim",
+    "version": "5.0.1",
+    "license": "MIT"
+  },
+  {
+    "name": "headers-polyfill",
+    "version": "5.0.1",
+    "license": "MIT"
+  },
+  {
+    "name": "openai",
+    "version": "6.26.0",
+    "license": "Apache-2.0"
+  },
+  {
+    "name": "partial-json",
+    "version": "0.1.7",
+    "license": "MIT"
+  },
+  {
+    "name": "punycode",
+    "version": "2.3.1",
+    "license": "MIT"
+  },
+  {
+    "name": "set-cookie-parser",
+    "version": "3.2.1",
+    "license": "MIT"
+  },
+  {
+    "name": "tr46",
+    "version": "5.1.1",
+    "license": "MIT"
+  },
+  {
+    "name": "typebox",
+    "version": "1.1.38",
+    "license": "MIT"
+  },
+  {
+    "name": "web-streams-polyfill",
+    "version": "4.3.0",
+    "license": "MIT"
+  },
+  {
+    "name": "webidl-conversions",
+    "version": "7.0.0",
+    "license": "BSD-2-Clause"
+  },
+  {
+    "name": "whatwg-url",
+    "version": "14.2.0",
+    "license": "MIT"
+  }
+]

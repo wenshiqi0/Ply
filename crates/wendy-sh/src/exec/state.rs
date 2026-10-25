@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::syntax::Command;
 
@@ -243,15 +244,28 @@ pub struct State {
 /// An output stream. Writes from several fds pointing at the same sink stay
 /// in order, which is what `2>&1` needs.
 #[derive(Clone, Default)]
-pub struct Sink(Arc<Mutex<Vec<u8>>>);
+pub struct Sink {
+    buffer: Arc<Mutex<Vec<u8>>>,
+    limit: Option<(usize, Arc<AtomicBool>)>,
+}
 
 impl Sink {
     pub fn new() -> Self {
         Self::default()
     }
 
+    pub fn bounded(limit: usize, truncated: Arc<AtomicBool>) -> Self {
+        Self { buffer: Arc::default(), limit: Some((limit, truncated)) }
+    }
+
     pub fn write(&self, data: &[u8]) {
-        self.0.lock().expect("sink poisoned").extend_from_slice(data);
+        let mut buffer = self.buffer.lock().expect("sink poisoned");
+        let count = self.limit.as_ref().map(|(limit, flag)| {
+            let count = data.len().min(limit.saturating_sub(buffer.len()));
+            if count != data.len() { flag.store(true, Ordering::Relaxed); }
+            count
+        }).unwrap_or(data.len());
+        buffer.extend_from_slice(&data[..count]);
     }
 
     pub fn write_str(&self, s: &str) {
@@ -259,11 +273,11 @@ impl Sink {
     }
 
     pub fn take(&self) -> Vec<u8> {
-        std::mem::take(&mut *self.0.lock().expect("sink poisoned"))
+        std::mem::take(&mut *self.buffer.lock().expect("sink poisoned"))
     }
 
     pub fn same(&self, other: &Sink) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.buffer, &other.buffer)
     }
 }
 

@@ -1,3 +1,4 @@
+import plugins from "wendy:plugins";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -36,6 +37,6 @@ export async function onHandle(input: {
 
 /** Offer this plugin to the model as a tool. */
 export async function onLoad() {
-  await tools.context.loaded;
+  await plugins.context.loaded;
   await ctx.registerTool("read");
 }

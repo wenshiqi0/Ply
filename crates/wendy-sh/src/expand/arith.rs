@@ -276,6 +276,7 @@ impl P {
 
 pub fn eval(src: &str, vars: &mut dyn ArithVars) -> Result<i64, String> {
     let toks = tokenize(src)?;
+    if toks.len() > 256 { return Err("maximum arithmetic expression size exceeded (256 tokens)".into()); }
     if toks.is_empty() {
         return Ok(0);
     }

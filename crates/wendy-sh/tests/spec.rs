@@ -50,7 +50,7 @@ const SPEC: &[(&str, &str, &str, i32)] = &[
 async fn matches_spec() {
     let mut failures = Vec::new();
     for (name, script, expected, status) in SPEC {
-        let (_dir, mut sh, _io, _hook) = common::shell();
+        let (_dir, mut sh, _io) = common::shell();
         let out = sh.exec(script).await;
         if out.stdout_str() != *expected || out.status != *status {
             failures.push(format!(
@@ -66,7 +66,7 @@ async fn matches_spec() {
 
 #[tokio::test]
 async fn error_messages_look_like_bash() {
-    let (_dir, mut sh, _io, _hook) = common::shell();
+    let (_dir, mut sh, _io) = common::shell();
     let out = sh.exec("nosuch arg\ncd /nowhere\necho ${x:?is required}").await;
     assert_eq!(
         out.stderr_str(),
@@ -81,8 +81,22 @@ async fn error_messages_look_like_bash() {
 
 #[tokio::test]
 async fn state_persists_across_execs_like_one_session() {
-    let (_dir, mut sh, _io, _hook) = common::shell();
+    let (_dir, mut sh, _io) = common::shell();
     sh.exec("cd sub; x=42; f() { echo f:$1; }").await;
     let out = sh.exec("pwd; echo $x; f again").await;
     assert_eq!(out.stdout_str(), "/work/sub\n42\nf:again\n");
+}
+
+
+#[tokio::test]
+async fn excessive_nesting_is_a_shell_error_instead_of_a_host_stack_overflow() {
+    let (_dir, mut sh, _) = common::shell();
+    let command = format!("{} : {}", "( ".repeat(1000), ") ".repeat(1000));
+    let out = sh.exec(&command).await;
+    assert_eq!(out.status, 2);
+    assert!(out.stderr_str().contains("nesting exceeded"));
+    let command = format!("echo $(({}1))", "!".repeat(1000));
+    let out = sh.exec(&command).await;
+    assert!(out.stderr_str().contains("arithmetic expression size"));
+    assert_eq!(sh.exec("echo alive").await.stdout_str(), "alive\n");
 }

@@ -1,16 +1,24 @@
-import { execFile } from "node:child_process";
+import plugins from "wendy:plugins";
+import path from "node:path";
+import { exec } from "wendy:sh";
+import * as events from "wendy:events";
+
+let beforeExecute: string;
+type Decision = boolean | null | { allow?: boolean; reason?: string; requires_approval?: boolean };
 
 /**
- * Run a command with the system bash, in the workspace by default. Returns
- * the exit code and what it printed; processes it leaves behind are stopped
- * when it exits.
+ * Run a script with Wendy sh in the mounted workspace. Supports its shell
+ * syntax, builtins and bundled utilities (cat, ls, grep, sed, find, sort,
+ * head, tail, wc, du, etc.). Unsupported commands return 127; scripts are
+ * never forwarded to a system shell. Awaits bash.beforeExecute listeners
+ * before executing any part of the script.
  */
 export async function onHandle(input: {
-  /** The bash command or script to run. */
+  /** The script interpreted by Wendy sh. */
   command: string;
   /** Working directory (default: the workspace). */
   cwd?: string;
-  /** Stop it after this many milliseconds (default 120000). */
+  /** Inspection + execution deadline; approval waiting has its own deadline. */
   timeout_ms?: number;
 }): Promise<{
   exit_code: number | null;
@@ -18,20 +26,52 @@ export async function onHandle(input: {
   timed_out: boolean;
   stdout: string;
   stderr: string;
+  status?: "approval_required";
+  approval?: unknown;
 }> {
   if (typeof input?.command !== "string" || input.command === "") throw new Error("'command' must be a non-empty string");
-  const options = { cwd: input.cwd ?? ".", timeout: input.timeout_ms ?? 120_000 };
-  return await new Promise((resolve, reject) => {
-    execFile("/bin/bash", ["-c", input.command], options, (err: any, stdout: string, stderr: string) => {
-      // A string code means it could not start at all (e.g. ENOTSUP).
-      if (err && typeof err.code === "string") return reject(err);
-      resolve({ exit_code: err ? err.code : 0, signal: err?.signal ?? null, timed_out: Boolean(err?.killed), stdout, stderr });
-    });
-  });
+  if (input.cwd !== undefined && typeof input.cwd !== "string") throw new Error("'cwd' must be a string");
+  const timeout = input.timeout_ms ?? 120000;
+  if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new Error("'timeout_ms' must be a positive safe integer");
+  const started = Date.now();
+  const request = { command: input.command, cwd: path.resolve(input.cwd ?? "."), timeout_ms: timeout };
+  const results = await events.emit<typeof request, Decision>(beforeExecute, request, { timeout_ms: timeout });
+  const assessments: unknown[] = [];
+  for (const result of results) {
+    if (result && typeof result === "object" && result.requires_approval === true) assessments.push(result);
+    else if (result === false || (result && typeof result === "object" && result.allow === false)) {
+      throw new Error("bash.beforeExecute denied: " + (result && typeof result === "object" && typeof result.reason === "string" ? result.reason : "command rejected by a listener"));
+    }
+  }
+  // Human/service waiting does not consume the execution budget.
+  const remaining = timeout - (Date.now() - started);
+  if (remaining <= 0) return { exit_code: null, signal: null, timed_out: true, stdout: "", stderr: "" };
+  let approval: any;
+  if (assessments.length) {
+    const current = await fiber.info();
+    const pending = { schema_version: 1, id: current.id + ":approval", tool: "bash", command: request.command, cwd: request.cwd, assessments,
+      source: { fiber: current.id, parent: current.parent }, requested_at: Date.now() };
+    approval = typeof ctx.requestCommandApproval === "function"
+      ? await ctx.requestCommandApproval(pending)
+      : { status: "pending", request: pending, responses: [], reason: "approval_provider_missing" };
+    const matches = approval?.request?.id === pending.id && approval.request.command === request.command && approval.request.cwd === request.cwd;
+    if (!matches || !["approved", "rejected", "pending"].includes(approval?.status)) {
+      approval = { status: "pending", request: pending, responses: [], reason: "invalid_approval_response" };
+    }
+    if (approval.status === "rejected") throw new Error("command approval rejected by user or environment");
+    if (approval.status !== "approved") {
+      await fiber.record({ type: "command_approval_required", approval });
+      return { status: "approval_required", approval, exit_code: null, signal: null, timed_out: false, stdout: "", stderr: "" };
+    }
+    await fiber.record({ type: "command_approved", approval });
+  }
+  const output = await exec({ ...request, timeout_ms: remaining });
+  return approval ? { ...output, approval } : output;
 }
 
-/** Offer this plugin to the model as a tool. */
+/** Declare the tool's event and offer the tool to the model. */
 export async function onLoad() {
-  await tools.context.loaded;
+  beforeExecute = await events.define("beforeExecute");
+  await plugins.context.loaded;
   await ctx.registerTool("bash");
 }

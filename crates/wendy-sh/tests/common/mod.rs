@@ -4,10 +4,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use wendy_io::{AllowAll, Gate, Io, MountMode};
+use wendy_io::{Io, MountMode};
 use wendy_sh::Shell;
 use wendy_storage::{DiskStorage, MemoryStorage};
-use wendy_trace::{MemoryHook, Tracer};
 
 /// Files every test directory starts with.
 pub const FIXTURE: &[(&str, &str)] = &[
@@ -31,23 +30,20 @@ pub fn fixture_dir() -> tempfile::TempDir {
 
 /// A shell whose cwd and HOME is `dir`, mounted read-write at `/work`,
 /// with an in-memory `/tmp`.
-pub fn shell_in(dir: &Path, gate: Arc<dyn Gate>) -> (Shell, Io, Arc<MemoryHook>) {
-    let tracer = Tracer::new();
-    let hook = MemoryHook::new();
-    tracer.add_hook(hook.clone());
-    let io = Io::new(tracer, gate);
+pub fn shell_in(dir: &Path) -> (Shell, Io) {
+    let io = Io::new();
     io.mount("/work", Arc::new(DiskStorage::open(dir).unwrap()), MountMode::ReadWrite).unwrap();
     io.mount("/tmp", Arc::new(MemoryStorage::empty()), MountMode::ReadWrite).unwrap();
     let mut sh = Shell::new(&io);
     sh.set_cwd("/work");
     sh.set_var("HOME", "/work", true);
-    (sh, io, hook)
+    (sh, io)
 }
 
-pub fn shell() -> (tempfile::TempDir, Shell, Io, Arc<MemoryHook>) {
+pub fn shell() -> (tempfile::TempDir, Shell, Io) {
     let dir = fixture_dir();
-    let (sh, io, hook) = shell_in(dir.path(), Arc::new(AllowAll));
-    (dir, sh, io, hook)
+    let (sh, io) = shell_in(dir.path());
+    (dir, sh, io)
 }
 
 /// Every file under `dir` with its contents (to compare side effects).

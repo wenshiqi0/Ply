@@ -24,7 +24,7 @@ use oxc::codegen::Codegen;
 use oxc::parser::Parser;
 use oxc::semantic::SemanticBuilder;
 use oxc::span::{GetSpan, SourceType};
-use oxc::transformer::{TransformOptions, Transformer};
+use oxc::transformer::{HelperLoaderMode, TransformOptions, Transformer};
 use oxc_ecmascript::BoundNames;
 
 /// The wrapper's parameter list; the loader calls the function with these.
@@ -32,14 +32,31 @@ pub const WRAPPER_PARAMS: &str = "__exports, __require, __import, __meta";
 
 pub fn transpile(source: &str, path: &Path) -> Result<String, String> {
     let js = strip_types(source, path)?;
-    rewrite_modules(&js, path)
+    // Wrap top-level await before lowering it, so every continuation uses
+    // the same scheduler as async functions, including imported JS files.
+    let wrapped = rewrite_modules(&js, path)?;
+    lower_async(&wrapped, path)
+}
+
+/// Lower native async/await to explicit Promise continuations. JSC's C API
+/// cannot attach host identity to native await continuations. The private
+/// helper binding is supplied lexically by the loader, never as a global.
+pub(crate) fn lower_async(source: &str, path: &Path) -> Result<String, String> {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+    if let Some(error) = parsed.diagnostics.first() { return Err(format!("{}: {error}", path.display())); }
+    let mut program = parsed.program;
+    let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
+    let mut options = TransformOptions::default();
+    options.env.es2017.async_to_generator = true;
+    options.env.es2018.async_generator_functions = true;
+    options.helper_loader.mode = HelperLoaderMode::External;
+    let result = Transformer::new(&allocator, path, &options).build_with_scoping(scoping, &mut program);
+    if let Some(error) = result.diagnostics.first() { return Err(format!("{}: {error}", path.display())); }
+    Ok(Codegen::new().build(&program).code)
 }
 
 fn strip_types(source: &str, path: &Path) -> Result<String, String> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if !matches!(ext, "ts" | "mts" | "cts" | "tsx") {
-        return Ok(source.to_string());
-    }
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(path).map_err(|e| e.to_string())?;
     let parsed = Parser::new(&allocator, source, source_type).parse();
@@ -52,6 +69,10 @@ fn strip_types(source: &str, path: &Path) -> Result<String, String> {
     // for their side effects still load.
     let mut options = TransformOptions::default();
     options.typescript.only_remove_type_imports = true;
+    // Imported helper bindings cannot collide with a plugin's own names.
+    options.env.es2017.async_to_generator = true;
+    options.env.es2018.async_generator_functions = true;
+    options.helper_loader.module_name = "wendy:async".into();
     let result = Transformer::new(&allocator, path, &options).build_with_scoping(scoping, &mut program);
     if let Some(e) = result.diagnostics.first() {
         return Err(format!("{}: {e}", path.display()));
@@ -286,7 +307,7 @@ mod tests {
             "import fs, { readFileSync as rf, type Stats } from 'node:fs';\nimport * as path from 'node:path';\nimport './side';\nconst n: number = 1;\ninterface X { a: string }\nexport const x: number = n + 1;\n",
             "m.ts",
         );
-        assert!(out.contains("const __im1 = __require(\"node:fs\"); const fs = __im1.default; const { \"readFileSync\": rf } = __im1;"), "{out}");
+        for expected in ["const __im1 = __require(\"node:fs\");", "const fs = __im1.default;", "\"readFileSync\": rf"] { assert!(out.contains(expected), "{out}"); }
         assert!(out.contains("const path = __im2;"), "{out}");
         assert!(out.contains("__require(\"./side\");"), "{out}");
         assert!(out.contains("__export(\"x\", () => x);"), "{out}");
@@ -316,15 +337,15 @@ mod tests {
             assert!(out.contains(needle), "missing {needle} in:\n{out}");
         }
         let expr = t("export default { ok: true };", "m.js");
-        assert!(expr.contains("const __default1 = ({ ok: true });"), "{expr}");
+        assert!(expr.contains("const __default1 = { ok: true };"), "{expr}");
     }
 
     #[test]
     fn rewrites_dynamic_import_and_import_meta() {
         let out = t("const m = await import('./x.js'); console.log(import.meta.url);", "m.js");
-        assert!(out.contains("await __import('./x.js')"), "{out}");
+        assert!(out.contains("yield __import(\"./x.js\")"), "{out}");
         assert!(out.contains("__meta.url"), "{out}");
-        assert!(out.starts_with("(async function"), "{out}");
+        assert!(out.contains("babelHelpers.asyncToGenerator"), "{out}");
         let sync = t("async function f() { await g(); } const h = async () => await 1;", "m.js");
         assert!(sync.starts_with("(function"), "{sync}");
     }

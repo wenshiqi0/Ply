@@ -188,7 +188,7 @@ async fn cd(sh: &mut Shell, args: &[String], fds: &Fds) -> Status {
         sh.report(fds, "cd: too many arguments");
         return Ok(1);
     }
-    let fs = Fs::new(sh.rt.io.labeled("cd"), sh.st.cwd.clone());
+    let fs = Fs::new(sh.rt.io.clone(), sh.st.cwd.clone());
     match fs.stat(&target).await {
         Ok(entry) if entry.kind == wendy_io::EntryKind::Dir => {}
         Ok(_) => {
@@ -215,7 +215,7 @@ async fn source(sh: &mut Shell, args: &[String], fds: &Fds) -> Status {
         sh.report(fds, "source: filename argument required");
         return Ok(2);
     };
-    let fs = Fs::new(sh.rt.io.labeled("source"), sh.st.cwd.clone());
+    let fs = Fs::new(sh.rt.io.clone(), sh.st.cwd.clone());
     let text = match fs.read(file).await {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) => {

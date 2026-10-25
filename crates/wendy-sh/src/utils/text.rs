@@ -787,21 +787,21 @@ pub(crate) async fn seq(ctx: UtilCtx<'_>) -> i32 {
     let decimals = nums.iter().map(|n| n.split_once('.').map_or(0, |(_, d)| d.len())).max().unwrap_or(0);
     let fmt = |v: f64| if decimals == 0 { format!("{}", v.round() as i64) } else { format!("{v:.decimals$}") };
     let pad = if width { fmt(first).len().max(fmt(last).len()) } else { 0 };
-    let mut values = Vec::new();
     let mut v = first;
     let mut count = 0;
     while (step > 0.0 && v <= last + 1e-9) || (step < 0.0 && v >= last - 1e-9) {
+        if ctx.output_truncated.load(std::sync::atomic::Ordering::Relaxed) { return 1; }
+        if count % 1024 == 0 { tokio::task::yield_now().await; }
         let s = fmt(v);
-        values.push(if width { format!("{s:0>pad$}") } else { s });
+        if count > 0 { ctx.out(&sep); }
+        ctx.out(&if width { format!("{s:0>pad$}") } else { s });
         count += 1;
         v = first + step * count as f64;
         if count > 10_000_000 {
             break;
         }
     }
-    if !values.is_empty() {
-        ctx.out(&format!("{}\n", values.join(&sep)));
-    }
+    if count > 0 { ctx.out("\n"); }
     0
 }
 

@@ -2,13 +2,13 @@
 //
 // Evaluated once per realm. The host functions arrive as parameters and are
 // never put on the global object, so plugin code can only reach the outside
-// world through the modules defined here (and therefore through wendy-io).
+// world through the modules defined here (wendy-io and the model HTTP host).
 //
 // This file is not a security boundary: plugin code runs in the same realm
 // and can replace globals. The Rust side validates every host call. The
 // built-ins captured below only keep the runtime working when plugin code
 // monkeypatches JSON, eval or Object.
-(function (host, hostAsync, configJson) {
+(function (host, hostAsync, configJson, asyncHelpers) {
   "use strict";
   const jsonParse = JSON.parse;
   const jsonStringify = JSON.stringify;
@@ -16,7 +16,12 @@
   const { create: objectCreate, assign: objectAssign, entries: objectEntries, freeze: objectFreeze, hasOwn: objectHasOwn } = Object;
   const config = jsonParse(configJson);
   const G = globalThis;
+  // Only generated code sees the lexical helper binding. Module globals
+  // cannot replace it, and the native callback stores identity privately.
+  const evaluate = indirectEval("(function(eval, babelHelpers, code) { return eval(code); })");
+  const compile = code => evaluate(indirectEval, asyncHelpers, code);
   const EXIT = Symbol("wendy.exit");
+  const disposals = new Map();
 
   // ---------------------------------------------------------------- host ops
   function makeError(e) {
@@ -284,7 +289,7 @@
     if (typeof fn !== "function") throw new TypeError('The "callback" argument must be of type function');
     const delay = Math.max(0, Number(ms) || 0);
     const id = op("timer.set", { ms: delay, repeat });
-    timers.set(id, { fn, args, repeat });
+    timers.set(id, { fn: asyncHelpers.bind(fn, true), args, repeat });
     return new Timeout(id);
   }
   const setTimeout = (fn, ms, ...args) => arm(fn, ms, args, false);
@@ -661,16 +666,18 @@
   const fiber = objectFreeze({
     info: () => opAsync("kernel.fiber_info", {}),
     record: (data) => opAsync("kernel.record", { data }),
+    limitChildren: (plugin, limit, started = 0) => opAsync("kernel.limit_children", { plugin, limit, started }),
+    childBudget: (plugin) => opAsync("kernel.child_budget", { plugin }),
   });
 
-  // ------------------------------------------------------------------ tools
-  // `tools.<name>` is every plugin, kept current by the kernel.
+  // --------------------------------------------------------------- plugins
+  // Imported from wendy:plugins; kept current by the kernel.
   //
-  // - `await tools.bash(input)` runs its `onHandle` as a lazy fiber: nothing
+  // - `await plugins.bash(input)` runs its `onHandle` as a lazy fiber: nothing
   //   runs until it is awaited, `then` is the call, and the kernel runs it
   //   as a child of the fiber doing the awaiting. Awaiting a handle twice
   //   runs it once, like a promise.
-  // - `await tools.context.loaded` waits until its `onLoad` has returned.
+  // - `await plugins.context.loaded` waits until its `onLoad` has returned.
   // - `description`, and for plugins with `onHandle` `parameters` (JSON
   //   Schema of its tool arguments) and `wrapsInput`.
   function fiberHandle(plugin, input) {
@@ -684,7 +691,7 @@
   }
   const directory = () => op("kernel.directory") ?? [];
   const findPlugin = (name) => directory().find((p) => p.name === name);
-  function toolEntry(name) {
+  function pluginEntry(name) {
     const entry = (input) => fiberHandle(name, input);
     const props = {
       loaded: { get: () => opAsync("kernel.loaded", { plugin: name }), enumerable: true },
@@ -700,14 +707,14 @@
     Object.defineProperties(entry, props);
     return objectFreeze(entry);
   }
-  const tools = new Proxy(objectCreate(null), {
-    // `then` is excluded so `await tools` is not mistaken for a fiber.
-    get: (_, name) => (typeof name === "string" && name !== "then" ? toolEntry(name) : undefined),
+  const plugins = new Proxy(objectCreate(null), {
+    // `then` is excluded so `await plugins` is not mistaken for a fiber.
+    get: (_, name) => (typeof name === "string" && name !== "then" ? pluginEntry(name) : undefined),
     has: (_, name) => typeof name === "string" && findPlugin(name) !== undefined,
     ownKeys: () => directory().map((p) => p.name),
     getOwnPropertyDescriptor: (_, name) =>
       typeof name === "string" && findPlugin(name) !== undefined
-        ? { value: toolEntry(name), enumerable: true, configurable: true, writable: false }
+        ? { value: pluginEntry(name), enumerable: true, configurable: true, writable: false }
         : undefined,
     set: () => false,
     defineProperty: () => false,
@@ -744,7 +751,7 @@
 
   // --------------------------------------------------------------- globals
   Object.assign(G, {
-    console, process, Buffer, TextEncoder, TextDecoder, tools, ctx, fiber,
+    console, process, Buffer, TextEncoder, TextDecoder, ctx, fiber,
     setTimeout, setInterval, setImmediate, clearTimeout, clearInterval: clearTimeout, clearImmediate: clearTimeout,
     queueMicrotask,
   });
@@ -758,9 +765,89 @@
     child_process: childProcess,
   };
   const namespaces = new Map();
+  const eventCallbacks = new Map();
+  const eventSubscriptions = new Map();
+  const commandCallbacks = new Map();
+  let nextEventCallback = 0;
+  let nextCommandCallback = 0;
   function builtinNamespace(name) {
+    if (name.startsWith("wendy:async/helpers/")) {
+      const helper = asyncHelpers[name.slice("wendy:async/helpers/".length)];
+      if (typeof helper !== "function") throw new TypeError("unknown async helper");
+      return objectFreeze({ default: helper });
+    }
     if (!namespaces.has(name)) {
-      const m = BUILTIN[name];
+      if (name === "wendy:plugins") {
+        // Only the default export: named exports would snapshot a changing
+        // directory while plugins are still loading.
+        const ns = objectFreeze({ default: plugins });
+        namespaces.set(name, ns);
+        return ns;
+      }
+      // The browser bundle and its fetch/stream scope are instantiated once
+      // in this realm, only when a plugin imports the embedded model layer.
+      const m = name === "wendy:models" ? compile(op("models.source"))({
+        credentials: (profile) => op("models.credentials", profile),
+        open: (args, body) => op("http.open", args, body && plain(body)),
+        headers: (id) => opAsync("http.headers", { id }),
+        read: (id) => opAsync("http.read", { id }),
+        abort: (id) => op("http.abort", { id }),
+      }) : name === "wendy:lifecycle" ? {
+        onDispose(callback) {
+          if (typeof callback !== "function") throw new TypeError("cleanup must be a function");
+          const id = op("fiber.watch", {});
+          disposals.set(id, callback);
+          return () => { disposals.delete(id); op("fiber.unwatch", { id }); };
+        },
+      } : name === "wendy:http" ? {
+        hasCredentials: provider => op("http.auth_configured", { provider }),
+        requestJson: request => opAsync("http.request_json", request),
+      } : name === "wendy:terminal" ? {
+        open: () => op("terminal.open", {}),
+        render: (id, lines) => op("terminal.render", { id, lines }),
+        flush: id => op("terminal.flush", { id }),
+        read: (id, timeout_ms = 100) => opAsync("terminal.read", { id, timeout_ms }),
+        close: id => op("terminal.close", { id }),
+      } : name === "wendy:sh" ? {
+        exec: request => opAsync("sh.exec", { ...request, env: process.env }),
+      } : name === "wendy:commands" ? {
+        async register(command) {
+          if (!command || typeof command.handler !== "function") throw new TypeError("command handler must be a function");
+          const id = ++nextCommandCallback;
+          commandCallbacks.set(id, command.handler);
+          try {
+            await opAsync("kernel.command_register", { name: command.name, description: command.description, callback: id });
+          } catch (error) { commandCallbacks.delete(id); throw error; }
+        },
+        list: () => opAsync("kernel.command_list", {}),
+        run: (name, input) => opAsync("kernel.command_run", { name, input: input === undefined ? null : input }),
+      } : name === "wendy:events" ? {
+        define: name => opAsync("kernel.event_define", { name }),
+        async on(name, callback) {
+          if (typeof callback !== "function") throw new TypeError("event listener must be a function");
+          const id = ++nextEventCallback;
+          eventCallbacks.set(id, callback);
+          try {
+            const subscription = await opAsync("kernel.event_on", { name, callback: id });
+            eventSubscriptions.set(subscription, id);
+            return subscription;
+          } catch (error) { eventCallbacks.delete(id); throw error; }
+        },
+        async off(subscription) {
+          const removed = await opAsync("kernel.event_off", { subscription });
+          const callback = eventSubscriptions.get(subscription);
+          if (callback !== undefined) eventCallbacks.delete(callback);
+          eventSubscriptions.delete(subscription);
+          return removed;
+        },
+        emit: (name, data, options = {}) => opAsync("kernel.event_emit", { name, data, timeout_ms: options.timeout_ms ?? 30000 }),
+        list: () => opAsync("kernel.event_list", {}),
+      } : name === "wendy:checkpoints" ? {
+        create: (snapshot) => opAsync("checkpoint.create", { snapshot }),
+        claim: (id) => opAsync("checkpoint.claim", { id }),
+        update: (lease, snapshot) => opAsync("checkpoint.update", { lease, snapshot }),
+        finish: (lease, remove) => opAsync("checkpoint.finish", { lease, remove }),
+      } : BUILTIN[name];
       const ns = Object.assign(Object.create(null), m);
       ns.default = m;
       namespaces.set(name, ns);
@@ -774,7 +861,7 @@
     let rec = modules.get(r.id);
     if (rec) return rec;
     const code = op("module.load", { id: r.id });
-    const fn = indirectEval(code + "\n//# sourceURL=" + r.id);
+    const fn = compile(code + "\n//# sourceURL=" + r.id);
     const exports = Object.create(null);
     rec = { exports, done: Promise.resolve() };
     modules.set(r.id, rec);
@@ -839,6 +926,7 @@
     await rec.done;
     return rec.exports;
   }
+  asyncHelpers.setUnhandled(reason => op("fiber.unhandled", { error: describe(reason), stack: reason?.stack ?? null }));
   return {
     main: (id, file) => settle(id, async () => {
       const rec = load(file, null);
@@ -857,7 +945,7 @@
       if (typeof target !== "function") throw new TypeError(`${exportPath} is not a function`);
       return await target.apply(owner, jsonParse(argsJson));
     }),
-    eval: (id, code) => settle(id, () => indirectEval(code)),
+    eval: (id, code) => settle(id, () => evaluate(indirectEval, asyncHelpers, code)),
     // One fiber: the host has tagged this entry with its id.
     run: (id, file, inputJson) => settle(id, async () => {
       const exports = await entry(file);
@@ -880,6 +968,17 @@
       loadedMounts.set(file, mounted ?? {});
       return { data, methods };
     }),
+    // Callback stays in its subscribing realm; the kernel creates the child fiber.
+    event: (id, callback, inputJson) => settle(id, async () => {
+      const handler = eventCallbacks.get(Number(callback));
+      if (typeof handler !== "function") throw new Error("event subscription was removed");
+      return await handler(jsonParse(inputJson));
+    }),
+    command: (id, callback, inputJson) => settle(id, async () => {
+      const handler = commandCallbacks.get(Number(callback));
+      if (typeof handler !== "function") throw new Error("command registration was removed");
+      return await handler(jsonParse(inputJson));
+    }),
     // A function onLoad returned (on ctx), called from another realm.
     method: (id, file, name, argsJson) => settle(id, async () => {
       const mounted = loadedMounts.get(file);
@@ -891,7 +990,26 @@
     onUnhandledRejection(promise, reason) {
       const text = describe(reason) + (reason instanceof Error && reason.stack ? "\n" + reason.stack : "");
       write(2, "Uncaught (in promise) " + text + "\n");
+      asyncHelpers.onUnhandled(promise, reason);
     },
+    dispose: (id, idsJson) => settle(id, async () => {
+      const errors = [];
+      // Detach the whole batch before invoking any callback. If the first
+      // callback blocks, later callbacks must not stay rooted in this Map.
+      const callbacks = jsonParse(idsJson).map(watch => {
+        const callback = disposals.get(watch);
+        disposals.delete(watch);
+        return callback;
+      });
+      for (const callback of callbacks) {
+        if (callback) {
+          try { await callback(); } catch (error) { reportUncaught(error); errors.push(describe(error)); }
+        }
+      }
+      if (errors.length) throw new Error("onDispose cleanup failed: " + errors.join("; "));
+    }),
+    discardDisposals(ids) { for (const id of ids) disposals.delete(id); },
+    discardTimers(ids) { for (const id of ids) timers.delete(id); },
     fire,
   };
 });

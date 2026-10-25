@@ -6,6 +6,7 @@
 #![allow(non_camel_case_types, non_upper_case_globals, clippy::missing_safety_doc)]
 
 use std::ffi::c_void;
+use std::ffi::c_char;
 use std::ptr::{null, null_mut};
 
 pub type JSContextGroupRef = *const c_void;
@@ -15,6 +16,28 @@ pub type JSValueRef = *const c_void;
 pub type JSObjectRef = *mut c_void;
 pub type JSStringRef = *mut c_void;
 pub type JSClassRef = *mut c_void;
+
+/// Layout of the C API's JSClassDefinition (unused hooks stay null).
+#[repr(C)]
+pub struct JSClassDefinition {
+    pub version: i32,
+    pub attributes: u32,
+    pub class_name: *const c_char,
+    pub parent: JSClassRef,
+    pub static_values: *const c_void,
+    pub static_functions: *const c_void,
+    pub initialize: *const c_void,
+    pub finalize: Option<unsafe extern "C" fn(JSObjectRef)>,
+    pub has_property: *const c_void,
+    pub get_property: *const c_void,
+    pub set_property: *const c_void,
+    pub delete_property: *const c_void,
+    pub get_property_names: *const c_void,
+    pub call: Option<Callback>,
+    pub construct: *const c_void,
+    pub has_instance: *const c_void,
+    pub convert: *const c_void,
+}
 pub type Callback = unsafe extern "C" fn(
     ctx: JSContextRef,
     function: JSObjectRef,
@@ -63,6 +86,14 @@ unsafe extern "C" {
     pub fn JSValueGetTypedArrayType(ctx: JSContextRef, v: JSValueRef, exception: *mut JSValueRef) -> u32;
 
     pub fn JSObjectMakeFunctionWithCallback(ctx: JSContextRef, name: JSStringRef, cb: Callback) -> JSObjectRef;
+    pub fn JSClassCreate(definition: *const JSClassDefinition) -> JSClassRef;
+    pub fn JSClassRelease(class: JSClassRef);
+    pub fn JSObjectMake(ctx: JSContextRef, class: JSClassRef, private: *mut c_void) -> JSObjectRef;
+    pub fn JSObjectGetPrivate(object: JSObjectRef) -> *mut c_void;
+    pub fn JSObjectIsFunction(ctx: JSContextRef, object: JSObjectRef) -> bool;
+    pub fn JSValueToNumber(ctx: JSContextRef, value: JSValueRef, exception: *mut JSValueRef) -> f64;
+    pub fn JSValueToBoolean(ctx: JSContextRef, value: JSValueRef) -> bool;
+    pub fn JSObjectSetProperty(ctx: JSContextRef, object: JSObjectRef, name: JSStringRef, value: JSValueRef, attributes: u32, exception: *mut JSValueRef);
     pub fn JSObjectGetProperty(ctx: JSContextRef, obj: JSObjectRef, name: JSStringRef, exception: *mut JSValueRef) -> JSValueRef;
     pub fn JSObjectCallAsFunction(
         ctx: JSContextRef,
@@ -81,6 +112,11 @@ unsafe extern "C" {
     pub fn JSObjectMakeTypedArray(ctx: JSContextRef, kind: u32, len: usize, exception: *mut JSValueRef) -> JSObjectRef;
     pub fn JSObjectGetTypedArrayBytesPtr(ctx: JSContextRef, obj: JSObjectRef, exception: *mut JSValueRef) -> *mut c_void;
     pub fn JSObjectGetTypedArrayByteLength(ctx: JSContextRef, obj: JSObjectRef, exception: *mut JSValueRef) -> usize;
+
+    // Test-only full, synchronous GC; the public JSGarbageCollect merely
+    // schedules collection. Exported by the system framework.
+    #[cfg(test)]
+    pub fn JSSynchronousGarbageCollectForDebugging(ctx: JSContextRef);
 
     // Exported by the system framework, declared in JSC's private headers
     // (JSContextRefPrivate.h). Stable since macOS 10.6 / 12 respectively.
@@ -123,6 +159,33 @@ impl Drop for JsStr {
         if !self.0.is_null() {
             unsafe { JSStringRelease(self.0) }
         }
+    }
+}
+
+/// A JS value kept alive while Rust owns it, including inside a heap-backed
+/// collection that JSC's conservative stack scan cannot see.
+///
+/// Create the root before making another allocating JSC call. The context
+/// must outlive the root, and both creation and drop belong on its JS thread.
+pub struct RootedValue {
+    ctx: JSContextRef,
+    value: JSValueRef,
+}
+
+impl RootedValue {
+    pub unsafe fn new(ctx: JSContextRef, value: JSValueRef) -> Self {
+        unsafe { JSValueProtect(ctx, value) };
+        Self { ctx, value }
+    }
+
+    pub fn get(&self) -> JSValueRef {
+        self.value
+    }
+}
+
+impl Drop for RootedValue {
+    fn drop(&mut self) {
+        unsafe { JSValueUnprotect(self.ctx, self.value) };
     }
 }
 
@@ -186,6 +249,7 @@ pub unsafe fn get_property(ctx: JSContextRef, obj: JSObjectRef, name: &str) -> J
 /// Call `f(args)`; an exception comes back as its `String(...)`/stack text.
 pub unsafe fn call(ctx: JSContextRef, f: JSObjectRef, args: &[JSValueRef]) -> Result<JSValueRef, String> {
     unsafe {
+        if f.is_null() || !JSObjectIsFunction(ctx, f) { return Err("value is not callable".into()); }
         let mut exc: JSValueRef = null();
         let r = JSObjectCallAsFunction(ctx, f, null_mut(), args.len(), args.as_ptr(), &mut exc);
         if exc.is_null() { Ok(r) } else { Err(describe_exception(ctx, exc)) }
@@ -216,5 +280,37 @@ pub unsafe fn describe_exception(ctx: JSContextRef, exc: JSValueRef) -> String {
             }
         }
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arguments_on_the_rust_heap_survive_full_gc() {
+        unsafe {
+            let group = JSContextGroupCreate();
+            let ctx = JSGlobalContextCreateInGroup(group, null_mut());
+            let actual = {
+                let inspect = RootedValue::new(ctx, eval(ctx, "(...args) => JSON.stringify(args)", "gc-test").unwrap());
+                let mut roots = Vec::new();
+                for n in 0..64 {
+                    let text = format!("argument-{n}:{}", "多 agent 上下文 / ".repeat(1024));
+                    roots.push(RootedValue::new(ctx, string_value(ctx, &text)));
+                    // Older arguments are only in the Vec, not on the
+                    // machine stack. Collect while building the call.
+                    JSSynchronousGarbageCollectForDebugging(ctx);
+                }
+                let args: Vec<_> = roots.iter().map(RootedValue::get).collect();
+                let result = call(ctx, inspect.get() as JSObjectRef, &args).unwrap();
+                to_rust_string(ctx, result)
+            };
+            JSGlobalContextRelease(ctx);
+            JSContextGroupRelease(group);
+            let actual: Vec<String> = serde_json::from_str(&actual).unwrap();
+            let expected: Vec<_> = (0..64).map(|n| format!("argument-{n}:{}", "多 agent 上下文 / ".repeat(1024))).collect();
+            assert_eq!(actual, expected);
+        }
     }
 }

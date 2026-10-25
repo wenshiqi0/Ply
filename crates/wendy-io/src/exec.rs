@@ -54,6 +54,26 @@ pub struct ExecResult {
 
 const DEFAULT_MAX_OUTPUT: usize = 1 << 20;
 
+struct ProcessGroup(i32);
+
+impl ProcessGroup {
+    fn kill(&mut self) {
+        let pid = std::mem::take(&mut self.0);
+        if pid > 0 { kill_group(pid); }
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) { self.kill(); }
+}
+
+#[derive(Default)]
+struct ExecJobs(Vec<tokio::task::AbortHandle>);
+
+impl Drop for ExecJobs {
+    fn drop(&mut self) { for job in &self.0 { job.abort(); } }
+}
+
 impl Io {
     /// Start a real process, wait for it, and return what it printed.
     pub async fn exec(&self, spec: ExecSpec) -> io::Result<ExecResult> {
@@ -93,10 +113,15 @@ impl Io {
         let started = Instant::now();
         let mut child = cmd.spawn()?;
         let pid = child.id().unwrap_or(0) as i32;
+        // Also clean up the group if the exec future is cancelled while a
+        // realm is being retired, before the normal wait/timeout path runs.
+        let mut group = ProcessGroup(pid);
+        let mut jobs = ExecJobs::default();
         if let (Some(data), Some(mut stdin)) = (spec.stdin.clone(), child.stdin.take()) {
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let _ = stdin.write_all(&data).await;
             });
+            jobs.0.push(task.abort_handle());
         }
         let cap = if spec.max_output == 0 { DEFAULT_MAX_OUTPUT } else { spec.max_output };
         // Readers fill a shared buffer, so what was read survives even if
@@ -122,6 +147,7 @@ impl Io {
         };
         let (out_task, out) = read_capped(child.stdout.take().map(|s| Box::new(s) as _));
         let (err_task, err) = read_capped(child.stderr.take().map(|s| Box::new(s) as _));
+        jobs.0.extend([out_task.abort_handle(), err_task.abort_handle()]);
 
         let mut timed_out = false;
         let status = match spec.timeout {
@@ -129,14 +155,14 @@ impl Io {
                 Ok(status) => status,
                 Err(_) => {
                     timed_out = true;
-                    kill_group(pid);
+                    group.kill();
                     child.wait().await
                 }
             },
             None => child.wait().await,
         };
         // Whatever the process left running in its group ends with it.
-        kill_group(pid);
+        group.kill();
         let status = status?;
         let grace = Duration::from_millis(500);
         for task in [out_task, err_task] {

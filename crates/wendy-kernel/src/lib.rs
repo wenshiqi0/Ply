@@ -5,18 +5,19 @@
 //!   is ([`PluginSpec`]: name = directory, description and input/output
 //!   types from `onHandle`), starts its realm, evaluates the module, and
 //!   then runs its `onLoad` in the background: one plugin's `onLoad` may
-//!   wait for another (`await tools.context.loaded`) whatever the order they
+//!   wait for another (`await plugins.context.loaded`) whatever the order they
 //!   were loaded in. [`Kernel::ready`] waits for every `onLoad`; after it,
 //!   waiting for a plugin that is not loaded fails at once.
 //! - What `onLoad` returns is mounted, flat, on the global `ctx` in every
 //!   realm: plain members as a copy, functions as calls into the realm of
 //!   the plugin that mounted them. When two plugins mount the same name, the
 //!   one whose `onLoad` returned last wins: overriding is deliberate.
-//!   `tools.<name>.loaded` resolves when that plugin's `onLoad` has
+//!   `plugins.<name>.loaded` resolves when that plugin's `onLoad` has
 //!   returned.
-//! - A fiber is one run of a plugin's `onHandle`, started by the host
+//! - A fiber is one run of a plugin's `onHandle` or an event callback.
+//!   An onHandle call is started by the host
 //!   ([`Kernel::call`], or [`Kernel::wake`] without waiting) or by plugin
-//!   code awaiting `tools.<name>(input)`, which makes it a child of the
+//!   code awaiting `plugins.<name>(input)`, which makes it a child of the
 //!   fiber that awaited. Fibers of one plugin share its realm and its
 //!   closures; fibers of different plugins run in parallel. Nesting is
 //!   bounded.
@@ -27,8 +28,11 @@
 //! - The default plugins are plain plugins shipped inside the binary.
 
 mod signature;
+mod events;
+mod commands;
+pub use commands::CommandSpec;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -39,22 +43,26 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::watch;
-use wendy_jsc::{Caller, HostBridge, JsRuntime, ModuleSource, RealmConfig, RealmId};
+use wendy_jsc::{FailureKind, Caller, HostBridge, JsRuntime, ModuleSource, RealmConfig, RealmId};
 
-pub use wendy_core::{Exit, Fiber, FiberEvent, FiberHook, Field, Mounts, Payload, PluginSpec, ToolSchema, Type};
+pub use wendy_core::{CleanupStatus, BudgetResource, Exit, Fiber, FiberEvent, FiberHook, Field, Mounts, Payload, PluginSpec, ToolSchema, Type};
 pub use wendy_jsc::{
     DiskStorage, Io, JsError, Limits, MemoryStorage, MountInfo, MountMode, Output, SqliteStorage, Storage, StorageInfo,
     StorageSpec,
 };
 
-/// The plugins every wendy ships: (name, entry source).
-const DEFAULT_PLUGINS: [(&str, &str); 8] = [
+/// The plugins every wendy ships: (name, entry source). MiMo is opt-in.
+const BUILTIN_PLUGINS: [(&str, &str); 12] = [
     ("agent", include_str!("../../../plugins/agent/main.ts")),
     ("bash", include_str!("../../../plugins/bash/main.ts")),
     ("context", include_str!("../../../plugins/context/main.ts")),
     ("create", include_str!("../../../plugins/create/main.ts")),
     ("deepseek", include_str!("../../../plugins/deepseek/main.ts")),
     ("edit", include_str!("../../../plugins/edit/main.ts")),
+    ("mimo", include_str!("../../../plugins/mimo/main.ts")),
+    ("jev", include_str!("../../../plugins/jev/main.ts")),
+    ("approval", include_str!("../../../plugins/approval/main.ts")),
+    ("tui", include_str!("../../../plugins/tui/main.ts")),
     ("read", include_str!("../../../plugins/read/main.ts")),
     ("remove", include_str!("../../../plugins/remove/main.ts")),
 ];
@@ -90,7 +98,19 @@ pub enum PluginSource {
 impl PluginSource {
     /// agent, bash, context, create, deepseek, edit, read, remove.
     pub fn defaults() -> Vec<PluginSource> {
-        DEFAULT_PLUGINS.iter().map(|(name, source)| PluginSource::Embedded { name: (*name).into(), source: (*source).into() }).collect()
+        BUILTIN_PLUGINS
+            .iter()
+            .filter(|(name, _)| !matches!(*name, "mimo" | "jev" | "approval" | "tui"))
+            .map(|(name, source)| PluginSource::Embedded { name: (*name).into(), source: (*source).into() })
+            .collect()
+    }
+
+    /// An explicitly selected built-in plugin, including opt-in integrations.
+    pub fn builtin(name: &str) -> Option<PluginSource> {
+        BUILTIN_PLUGINS.iter().find(|(entry, _)| *entry == name).map(|(name, source)| PluginSource::Embedded {
+            name: (*name).into(),
+            source: (*source).into(),
+        })
     }
 }
 
@@ -102,14 +122,19 @@ pub enum KernelError {
     /// terminated.
     Fiber(String),
     TooDeep(usize),
+    ChildLimit { plugin: String, limit: u64, started: u64 },
+    Cancelled(String),
+    BudgetExceeded { resource: BudgetResource, error: String },
 }
 
 impl std::fmt::Display for KernelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             KernelError::UnknownPlugin(name) => write!(f, "no plugin named `{name}`"),
-            KernelError::Load(message) | KernelError::Fiber(message) => f.write_str(message),
+            KernelError::Load(message) | KernelError::Fiber(message) | KernelError::Cancelled(message) => f.write_str(message),
+            KernelError::BudgetExceeded { error, .. } => f.write_str(error),
             KernelError::TooDeep(depth) => write!(f, "fibers nested deeper than {depth}"),
+            KernelError::ChildLimit { plugin, limit, started } => write!(f, "child limit reached for {plugin}: {started} started, limit {limit}; replacements and resumes also consume this budget"),
         }
     }
 }
@@ -139,7 +164,7 @@ struct Loaded {
     mounted: u64,
 }
 
-/// One plugin as every realm's `tools` and `ctx` see it.
+/// One plugin as every realm's imported directory and `ctx` see it.
 #[derive(Serialize)]
 struct DirectoryEntry<'a> {
     name: &'a str,
@@ -150,9 +175,22 @@ struct DirectoryEntry<'a> {
     state: &'static str,
 }
 
+enum FiberInvocation { Tool, Event { callback: u64, name: String }, Command { callback: u64, name: String } }
+
 struct ActiveFiber {
     depth: usize,
     parent: Option<String>,
+    cancel: watch::Sender<bool>,
+    child_budgets: HashMap<String, ChildBudget>,
+}
+
+#[derive(Clone, Copy)]
+struct ChildBudget { limit: u64, started: u64 }
+
+impl ChildBudget {
+    fn value(self) -> Value {
+        serde_json::json!({ "limit": self.limit, "started": self.started, "remaining": self.limit.saturating_sub(self.started) })
+    }
 }
 
 struct Inner {
@@ -171,8 +209,11 @@ struct Inner {
     /// Orders mounts on `ctx`.
     next_mount: AtomicU64,
     /// Every realm this kernel started (plugins and scripts).
-    realms: Mutex<Vec<RealmId>>,
+    realms: Mutex<HashSet<RealmId>>,
     hooks: RwLock<Vec<Arc<dyn FiberHook>>>,
+    events: Mutex<events::Events>,
+    commands: Mutex<commands::Commands>,
+    next_event: AtomicU64,
     /// Active fibers and their ancestry, for depth checks and fiber.info().
     fibers: Mutex<HashMap<String, ActiveFiber>>,
     /// Fiber ids are `<run>-<n>`, so records of many runs do not collide.
@@ -186,6 +227,55 @@ pub struct Kernel {
     inner: Arc<Inner>,
 }
 
+/// Owns an unpublished/plugin or script realm until ownership is handed
+/// to the plugin registry, including when its load/run future is cancelled.
+struct TemporaryRealm {
+    kernel: Kernel,
+    realm: Option<RealmId>,
+}
+
+/// Paired Spawn/Exit accounting also when the awaiting host op is aborted
+/// as its script realm is retired.
+struct RunningFiber {
+    kernel: Kernel,
+    id: Option<String>,
+    started: Instant,
+}
+
+impl RunningFiber {
+    fn finish(&mut self, exit: Exit) {
+        if let Some(id) = self.id.take() {
+            self.kernel.inner.fibers.lock().expect("fiber table poisoned").remove(&id);
+            self.kernel.emit(&FiberEvent::Exit { at_ms: now_ms(), id, exit, ms: self.started.elapsed().as_millis() as u64 });
+        }
+    }
+}
+
+impl Drop for RunningFiber {
+    fn drop(&mut self) {
+        self.finish(Exit::Cancelled { reason: "the awaiting fiber call was cancelled".into() });
+    }
+}
+
+impl TemporaryRealm {
+    fn retire(&mut self) -> Option<tokio::task::JoinHandle<Result<(), JsError>>> {
+        let realm = self.realm.take()?;
+        self.kernel.inner.realms.lock().expect("realm list poisoned").remove(&realm);
+        Some(self.kernel.inner.js.close_realm(realm))
+    }
+
+    async fn close(mut self) -> Result<(), JsError> {
+        if let Some(job) = self.retire() {
+            job.await.map_err(|_| JsError { message: "realm cleanup task was cancelled".into(), ..JsError::default() })??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryRealm {
+    fn drop(&mut self) { drop(self.retire()); }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
@@ -193,6 +283,7 @@ fn now_ms() -> u64 {
 impl Kernel {
     /// Must be called inside a tokio runtime.
     pub fn new(config: KernelConfig) -> Kernel {
+        static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
         Kernel {
             inner: Arc::new(Inner {
                 js: JsRuntime::start(),
@@ -206,10 +297,13 @@ impl Kernel {
                 generation: watch::channel(0).0,
                 sealed: AtomicBool::new(false),
                 next_mount: AtomicU64::new(0),
-                realms: Mutex::new(Vec::new()),
+                realms: Mutex::new(HashSet::new()),
                 hooks: RwLock::new(Vec::new()),
+                events: Mutex::new(events::Events::default()),
+                commands: Mutex::new(commands::Commands::default()),
+                next_event: AtomicU64::new(0),
                 fibers: Mutex::new(HashMap::new()),
-                run: format!("{:x}", now_ms()),
+                run: format!("{:x}-{:x}-{:x}", now_ms(), std::process::id(), NEXT_RUN.fetch_add(1, Ordering::Relaxed)),
                 next_fiber: AtomicU64::new(0),
             }),
         }
@@ -245,6 +339,7 @@ impl Kernel {
         };
 
         let realm = self.realm(&name, &root, vec![entry.clone()]).await?;
+        let mut unpublished = TemporaryRealm { kernel: self.clone(), realm: Some(realm) };
         inner.js.run_main(realm, &entry).await.map_err(|e| KernelError::Load(e.message))?;
         {
             let mut plugins = inner.plugins.write().expect("plugin table poisoned");
@@ -254,6 +349,7 @@ impl Kernel {
             let state = watch::channel(LoadState::Loading).0;
             plugins.push(Loaded { spec: spec.clone(), realm, entry: entry.clone(), state, mounts: Mounts::default(), mounted: 0 });
         }
+        unpublished.realm = None;
         self.changed();
         if signature.loads {
             // It may wait for plugins that load after it.
@@ -274,19 +370,28 @@ impl Kernel {
     fn finish_load(&self, name: &str, mounts: Result<Mounts, String>) {
         {
             let mut plugins = self.inner.plugins.write().expect("plugin table poisoned");
-            let Some(plugin) = plugins.iter_mut().find(|p| p.spec.name == name) else { return };
-            match mounts {
+            let Some(index) = plugins.iter().position(|p| p.spec.name == name) else { return };
+            let state = match mounts {
                 Ok(mounts) => {
+                    let plugin = &mut plugins[index];
                     plugin.mounts = mounts;
                     plugin.mounted = self.inner.next_mount.fetch_add(1, Ordering::SeqCst) + 1;
-                    plugin.state.send_replace(LoadState::Loaded);
+                    LoadState::Loaded
                 }
                 Err(e) => {
-                    plugin.state.send_replace(LoadState::Failed(format!("{name}: onLoad failed: {e}")));
-                }
-            }
+                    self.inner.events.lock().expect("event table poisoned").remove_plugin(name);
+                    self.inner.commands.lock().expect("command table poisoned").remove_plugin(name);
+                    LoadState::Failed(format!("{name}: onLoad failed: {e}"))
+                },
+            };
+            // Queue the mounted ctx members before waking `plugins.x.loaded`.
+            // Hold the plugin table until publication completes, so another
+            // publisher cannot later overwrite this with an older snapshot.
+            let directory = Self::directory_entries(&plugins, Some((name, &state)));
+            self.send_directory(directory);
+            plugins[index].state.send_replace(state);
         }
-        self.changed();
+        self.inner.generation.send_modify(|g| *g += 1);
     }
 
     /// Wait until every loaded plugin has finished its `onLoad`. From here
@@ -333,8 +438,8 @@ impl Kernel {
     }
 
     fn changed(&self) {
-        self.inner.generation.send_modify(|g| *g += 1);
         self.publish_directory();
+        self.inner.generation.send_modify(|g| *g += 1);
     }
 
     fn find(&self, plugin: &str) -> Option<LoadedRef> {
@@ -348,21 +453,24 @@ impl Kernel {
         })
     }
 
-    fn directory(&self) -> Value {
-        let plugins = self.inner.plugins.read().expect("plugin table poisoned");
+    fn directory_entries(plugins: &[Loaded], state_override: Option<(&str, &LoadState)>) -> Value {
         let mut entries: Vec<DirectoryEntry> = plugins
             .iter()
-            .map(|p| DirectoryEntry {
-                name: &p.spec.name,
-                description: &p.spec.description,
-                tool: p.spec.tool_schema(),
-                mounts: &p.mounts,
-                mounted: p.mounted,
-                state: match &*p.state.borrow() {
-                    LoadState::Loading => "loading",
-                    LoadState::Loaded => "loaded",
-                    LoadState::Failed(_) => "failed",
-                },
+            .map(|p| {
+                let current = p.state.borrow();
+                let state = state_override.filter(|(name, _)| *name == p.spec.name).map(|(_, state)| state).unwrap_or(&current);
+                DirectoryEntry {
+                    name: &p.spec.name,
+                    description: &p.spec.description,
+                    tool: p.spec.tool_schema(),
+                    mounts: &p.mounts,
+                    mounted: p.mounted,
+                    state: match state {
+                        LoadState::Loading => "loading",
+                        LoadState::Loaded => "loaded",
+                        LoadState::Failed(_) => "failed",
+                    },
+                }
             })
             .collect();
         entries.sort_by(|a, b| a.name.cmp(b.name));
@@ -370,7 +478,11 @@ impl Kernel {
     }
 
     fn publish_directory(&self) {
-        let directory = self.directory();
+        let plugins = self.inner.plugins.read().expect("plugin table poisoned");
+        self.send_directory(Self::directory_entries(&plugins, None));
+    }
+
+    fn send_directory(&self, directory: Value) {
         for realm in self.inner.realms.lock().expect("realm list poisoned").iter() {
             self.inner.js.set_directory(*realm, directory.clone());
         }
@@ -393,8 +505,10 @@ impl Kernel {
             })
             .await
             .map_err(|e| KernelError::Load(e.message))?;
-        inner.realms.lock().expect("realm list poisoned").push(realm);
-        inner.js.set_directory(realm, self.directory());
+        let plugins = inner.plugins.read().expect("plugin table poisoned");
+        let mut realms = inner.realms.lock().expect("realm list poisoned");
+        realms.insert(realm);
+        inner.js.set_directory(realm, Self::directory_entries(&plugins, None));
         Ok(realm)
     }
 
@@ -452,6 +566,13 @@ impl Kernel {
         self.run(plugin, input, None, false).await
     }
 
+    /// Request cancellation of an active fiber. Its awaited children and
+    /// host resources are cancelled as their owning futures are dropped.
+    pub fn cancel_fiber(&self, id: &str) -> bool {
+        let fibers = self.inner.fibers.lock().expect("fiber table poisoned");
+        if let Some(fiber) = fibers.get(id) { fiber.cancel.send_replace(true); true } else { false }
+    }
+
     /// Start a plugin as a top-level fiber nobody awaits; returns its id.
     pub fn wake(&self, plugin: &str, input: Value) -> Result<String, KernelError> {
         if self.find(plugin).is_none() {
@@ -498,7 +619,7 @@ impl Kernel {
     }
 
     /// Run a TS/JS file like node would (its directory is the root it may
-    /// import from), with `tools` available, until nothing is scheduled.
+    /// import from), with wendy:plugins available, until nothing is scheduled.
     pub async fn run_script(&self, file: &Path, args: Vec<String>) -> Result<ScriptOutcome, KernelError> {
         let file = std::fs::canonicalize(file).map_err(|e| KernelError::Load(format!("{}: {e}", file.display())))?;
         let dir = file.parent().ok_or_else(|| KernelError::Load("the script has no directory".into()))?;
@@ -506,13 +627,16 @@ impl Kernel {
         let entry = file.display().to_string();
         let name = file.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "script".into());
         let realm = self.realm(&name, &root, std::iter::once(entry.clone()).chain(args).collect()).await?;
+        let temporary = TemporaryRealm { kernel: self.clone(), realm: Some(realm) };
         let js = &self.inner.js;
         let result = js.run_main(realm, &entry).await.map(|_| ());
         // Like node: stay until nothing is scheduled (unless it already failed).
         if result.is_ok() {
             js.idle(realm).await;
         }
-        Ok(ScriptOutcome { result, output: js.take_output(realm).await })
+        let output = js.take_output(realm).await;
+        let cleanup = temporary.close().await;
+        Ok(ScriptOutcome { result: result.and(cleanup), output })
     }
 
     fn next_fiber_id(&self) -> String {
@@ -525,36 +649,81 @@ impl Kernel {
     }
 
     async fn start(&self, plugin: &str, input: Value, parent: Option<String>, detached: bool, id: String) -> Result<Value, KernelError> {
+        self.start_invocation(plugin, input, parent, detached, id, FiberInvocation::Tool).await
+    }
+
+    async fn start_invocation(&self, plugin: &str, input: Value, parent: Option<String>, detached: bool, id: String, invocation: FiberInvocation) -> Result<Value, KernelError> {
+        let is_tool = matches!(invocation, FiberInvocation::Tool);
         let inner = &self.inner;
         self.wait_loaded(plugin).await?;
         let target = self.find(plugin).ok_or_else(|| KernelError::UnknownPlugin(plugin.into()))?;
-        if !target.callable {
+        if is_tool && !target.callable {
             return Err(KernelError::Fiber(format!("{plugin} has no onHandle; it cannot be called")));
         }
+        let (cancel, mut cancelled) = watch::channel(false);
         {
             let mut fibers = inner.fibers.lock().expect("fiber table poisoned");
-            let depth = parent.as_ref().and_then(|p| fibers.get(p)).map_or(0, |f| f.depth + 1);
+            let depth = match &parent {
+                Some(parent) => fibers.get(parent).ok_or_else(|| KernelError::Fiber("the parent fiber has finished".into()))?.depth + 1,
+                None => 0,
+            };
             if depth > inner.max_depth {
                 return Err(KernelError::TooDeep(inner.max_depth));
             }
-            fibers.insert(id.clone(), ActiveFiber { depth, parent: parent.clone() });
+            // Admission and reservation share the fiber-table lock. A
+            // concurrent third call is refused before Spawn or plugin JS.
+            if is_tool && let Some(parent) = &parent
+                && let Some(budget) = fibers.get_mut(parent).and_then(|f| f.child_budgets.get_mut(plugin))
+            {
+                if budget.started >= budget.limit {
+                    return Err(KernelError::ChildLimit { plugin: plugin.into(), limit: budget.limit, started: budget.started });
+                }
+                budget.started += 1;
+            }
+            fibers.insert(id.clone(), ActiveFiber { depth, parent: parent.clone(), cancel, child_budgets: HashMap::new() });
         }
-        let fiber = Fiber { id: id.clone(), parent, plugin: plugin.to_string(), detached, input };
+        let event = match &invocation { FiberInvocation::Tool => None, FiberInvocation::Event { name, .. } => Some(name.clone()), FiberInvocation::Command { name, .. } => Some(format!("command:{name}")) };
+        let fiber = Fiber { id: id.clone(), parent, plugin: plugin.to_string(), detached, input, event };
         self.emit(&FiberEvent::Spawn { at_ms: now_ms(), fiber: fiber.clone() });
-        let started = Instant::now();
-        let result = inner.js.run_fiber(target.realm, &target.entry, &fiber.input, &id).await;
-        inner.fibers.lock().expect("fiber table poisoned").remove(&id);
+        let mut running = RunningFiber { kernel: self.clone(), id: Some(id.clone()), started: Instant::now() };
+        let invoke = async {
+            match invocation {
+                FiberInvocation::Tool => inner.js.run_fiber(target.realm, &target.entry, &fiber.input, &id).await,
+                FiberInvocation::Event { callback, .. } => inner.js.call_event(target.realm, callback, &fiber.input, &id).await,
+                FiberInvocation::Command { callback, .. } => inner.js.call_command(target.realm, callback, &fiber.input, &id).await,
+            }
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancelled.wait_for(|value| *value) => Err(JsError { kind: FailureKind::Cancelled, message: "fiber cancelled by host".into(), ..JsError::default() }),
+            result = invoke => result,
+        };
         let exit = match &result {
             Ok(output) => Exit::Done { output: output.clone() },
-            Err(e) => Exit::Failed { error: e.message.clone(), stack: e.stack.clone() },
+            Err(e) => match e.kind {
+                FailureKind::Failed => Exit::Failed { error: e.message.clone(), stack: e.stack.clone() },
+                FailureKind::Cancelled => Exit::Cancelled { reason: e.message.clone() },
+                FailureKind::CpuLimit | FailureKind::MemoryLimit => Exit::BudgetExceeded {
+                    resource: if e.kind == FailureKind::CpuLimit { BudgetResource::Cpu } else { BudgetResource::Memory }, error: e.message.clone(),
+                },
+            },
         };
-        self.emit(&FiberEvent::Exit { at_ms: now_ms(), id, exit, ms: started.elapsed().as_millis() as u64 });
-        result.map_err(|e| KernelError::Fiber(e.message))
+        running.finish(exit);
+        result.map_err(|e| match e.kind {
+            FailureKind::Failed => KernelError::Fiber(e.message),
+            FailureKind::Cancelled => KernelError::Cancelled(e.message),
+            FailureKind::CpuLimit | FailureKind::MemoryLimit => KernelError::BudgetExceeded {
+                resource: if e.kind == FailureKind::CpuLimit { BudgetResource::Cpu } else { BudgetResource::Memory }, error: e.message,
+            },
+        })
     }
 
     fn emit(&self, event: &FiberEvent) {
-        for hook in self.inner.hooks.read().expect("hooks poisoned").iter() {
-            hook.on_event(event);
+        let hooks = self.inner.hooks.read().expect("hooks poisoned").clone();
+        for hook in hooks {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook.on_event(event))).is_err() {
+                eprintln!("wendy: a fiber event hook panicked; other hooks will still receive this event");
+            }
         }
     }
 }
@@ -568,15 +737,21 @@ struct LoadedRef {
     state: watch::Sender<LoadState>,
 }
 
-/// `kernel.*` ops from plugin code: `tools.<name>(input)` awaited,
-/// `ctx.<method>(...)` (owned by `plugin`), `tools.<name>.loaded`, and
+/// `kernel.*` ops from plugin code: `plugins.<name>(input)` awaited,
+/// `ctx.<method>(...)` (owned by `plugin`), `plugins.<name>.loaded`, and
 /// the current fiber's info and structured records.
 struct Bridge(Weak<Inner>);
 
 #[async_trait::async_trait]
 impl HostBridge for Bridge {
+    fn on_event(&self, event: FiberEvent) {
+        if let Some(inner) = self.0.upgrade() { Kernel { inner }.emit(&event); }
+    }
+
     async fn call(&self, caller: Caller, op: &str, args: Value) -> Result<Value, String> {
         let kernel = Kernel { inner: self.0.upgrade().ok_or("the kernel has stopped")? };
+        if op.starts_with("kernel.event_") { return kernel.event_op(caller, op, args).await; }
+        if op.starts_with("kernel.command_") { return kernel.command_op(caller, op, args).await; }
         if op == "kernel.fiber_info" {
             let id = caller.fiber.as_deref().ok_or("fiber.info() requires a running fiber")?;
             let fibers = kernel.inner.fibers.lock().expect("fiber table poisoned");
@@ -601,6 +776,25 @@ impl HostBridge for Bridge {
         }
         let plugin = args.get("plugin").and_then(Value::as_str).ok_or("missing plugin name")?;
         match op {
+            "kernel.limit_children" => {
+                let id = caller.fiber.as_deref().ok_or("child budgets require a running fiber")?;
+                let limit = args.get("limit").and_then(Value::as_u64).filter(|n| *n <= 9_007_199_254_740_991).ok_or("limit must be a nonnegative safe integer")?;
+                let restored = args.get("started").and_then(Value::as_u64).filter(|n| *n <= 9_007_199_254_740_991).ok_or("started must be a nonnegative safe integer")?;
+                if kernel.find(plugin).is_none() { return Err(format!("no plugin named {plugin}")); }
+                let mut fibers = kernel.inner.fibers.lock().expect("fiber table poisoned");
+                let active = fibers.get_mut(id).ok_or("the fiber has finished")?;
+                let budget = active.child_budgets.entry(plugin.into()).or_insert(ChildBudget { limit, started: restored });
+                if limit > budget.limit { return Err("a child budget cannot be increased".into()); }
+                budget.limit = limit;
+                budget.started = budget.started.max(restored);
+                Ok(budget.value())
+            }
+            "kernel.child_budget" => {
+                let id = caller.fiber.as_deref().ok_or("child budgets require a running fiber")?;
+                let fibers = kernel.inner.fibers.lock().expect("fiber table poisoned");
+                let active = fibers.get(id).ok_or("the fiber has finished")?;
+                Ok(active.child_budgets.get(plugin).map(|budget| budget.value()).unwrap_or(Value::Null))
+            }
             "kernel.spawn" => {
                 let input = args.get("input").cloned().unwrap_or(Value::Null);
                 kernel.run(plugin, input, caller.fiber, false).await.map_err(|e| e.to_string())
@@ -638,5 +832,19 @@ impl FiberHook for JsonlRecorder {
         let Ok(mut writer) = self.writer.lock() else { return };
         // A record sink must never take a run down; a failed write is dropped.
         let _ = writeln!(writer, "{line}").and_then(|_| writer.flush());
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[tokio::test]
+    async fn kernels_created_together_never_share_fiber_ids() {
+        let mut ids = HashSet::new();
+        for _ in 0..100 {
+            let kernel = Kernel::new(KernelConfig::new(Io::new(), "/"));
+            assert!(ids.insert(kernel.next_fiber_id()));
+            assert!(ids.insert(kernel.next_fiber_id()));
+        }
     }
 }

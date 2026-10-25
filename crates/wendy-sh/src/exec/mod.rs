@@ -21,11 +21,9 @@ pub(crate) mod simple;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use serde_json::json;
-use wendy_io::{Actor, Io, Runtime as IoRuntime};
-use wendy_trace::{Scope, Verdict};
+use wendy_io::Io;
 
 use crate::expand::arith;
 use crate::syntax::{AndOr, CaseEnd, Command, Compound, Connector, Pipeline, Script, parse};
@@ -56,11 +54,12 @@ pub(crate) type Status = Result<i32, Ctrl>;
 pub struct Limits {
     pub max_commands: u64,
     pub max_function_depth: usize,
+    pub max_buffer_bytes: Option<usize>,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_commands: 1_000_000, max_function_depth: 200 }
+        Limits { max_commands: 1_000_000, max_function_depth: 200, max_buffer_bytes: None }
     }
 }
 
@@ -70,6 +69,7 @@ pub(crate) struct Runtime {
     pub limits: Limits,
     pub commands: AtomicU64,
     pub session: String,
+    pub output_truncated: Arc<AtomicBool>,
 }
 
 /// What one `exec` produced.
@@ -78,6 +78,7 @@ pub struct ExecOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub status: i32,
+    pub truncated: bool,
 }
 
 impl ExecOutput {
@@ -106,8 +107,12 @@ impl Shell {
     }
 
     pub fn with_registry(io: &Io, utils: Registry) -> Shell {
+        Self::with_limits(io, utils, Limits::default())
+    }
+
+    pub fn with_limits(io: &Io, utils: Registry, limits: Limits) -> Shell {
         let session = format!("sh-{}", SESSIONS.fetch_add(1, Ordering::SeqCst));
-        let io = io.as_actor(Actor { runtime: IoRuntime::Sh, session: session.clone(), label: "sh".into() });
+        let io = io.clone();
         let mut st = State { arg0: "bash".into(), cwd: "/".into(), random: 0x5eed, ..State::default() };
         for (name, value) in [
             ("HOME", "/"),
@@ -128,9 +133,10 @@ impl Shell {
             rt: Arc::new(Runtime {
                 io,
                 utils,
-                limits: Limits::default(),
+                limits,
                 commands: AtomicU64::new(0),
                 session,
+                output_truncated: Arc::default(),
             }),
         }
     }
@@ -169,12 +175,17 @@ impl Shell {
         self.exec_with_stdin(script, Vec::new()).await
     }
 
+    pub fn capture(&self, stdin: Vec<u8>) -> Fds {
+        Fds { stdin: Input::new(stdin), out: self.new_sink(), err: self.new_sink() }
+    }
+
     pub async fn exec_with_stdin(&mut self, script: &str, stdin: Vec<u8>) -> ExecOutput {
-        let fds = Fds { stdin: Input::new(stdin), out: Sink::new(), err: Sink::new() };
+        self.exec_with_fds(script, self.capture(stdin)).await
+    }
+
+    pub async fn exec_with_fds(&mut self, script: &str, fds: Fds) -> ExecOutput {
+        self.rt.output_truncated.store(false, Ordering::Relaxed);
         self.rt.commands.store(0, Ordering::SeqCst);
-        let tracer = self.rt.io.tracer().clone();
-        tracer.emit(Scope::Exec, "exec.start", Verdict::Info, json!({ "session": self.rt.session, "script": script }));
-        let started = std::time::Instant::now();
 
         let status = match parse(script) {
             Err(e) => {
@@ -195,19 +206,7 @@ impl Shell {
         let status = self.run_exit_trap(&fds, status).await;
         self.st.last_status = status;
 
-        let out = ExecOutput { stdout: fds.out.take(), stderr: fds.err.take(), status };
-        tracer.emit(
-            Scope::Exec,
-            "exec.end",
-            Verdict::Info,
-            json!({
-                "session": self.rt.session,
-                "status": status,
-                "stdout_bytes": out.stdout.len(),
-                "stderr_bytes": out.stderr.len(),
-                "duration_ms": started.elapsed().as_millis() as u64,
-            }),
-        );
+        let out = ExecOutput { stdout: fds.out.take(), stderr: fds.err.take(), status, truncated: self.rt.output_truncated.load(Ordering::Relaxed) };
         out
     }
 
@@ -233,7 +232,15 @@ impl Shell {
         fds.err.write_str(&format!("{}: line {}: {msg}\n", self.st.arg0, self.st.line));
     }
 
+    pub(crate) fn new_sink(&self) -> Sink {
+        match self.rt.limits.max_buffer_bytes {
+            Some(limit) => Sink::bounded(limit, self.rt.output_truncated.clone()),
+            None => Sink::new(),
+        }
+    }
+
     pub(crate) fn count_command(&self, fds: &Fds) -> Result<(), Ctrl> {
+        if self.rt.output_truncated.load(Ordering::Relaxed) { return Err(Ctrl::Exit(1)); }
         let n = self.rt.commands.fetch_add(1, Ordering::SeqCst) + 1;
         if n > self.rt.limits.max_commands {
             if n == self.rt.limits.max_commands + 1 {
@@ -246,6 +253,9 @@ impl Shell {
 
     pub(crate) fn exec_script<'a>(&'a mut self, script: &'a Script, fds: &'a Fds) -> BoxFut<'a, Status> {
         Box::pin(async move {
+            // Even an empty loop body yields, so host cancellation and
+            // wall-clock deadlines can retire the interpreter future.
+            tokio::task::yield_now().await;
             let mut status = 0;
             for item in &script.0 {
                 if item.background {
@@ -317,7 +327,7 @@ impl Shell {
         let mut statuses = Vec::with_capacity(pipeline.commands.len());
         for (i, command) in pipeline.commands.iter().enumerate() {
             let last = i + 1 == pipeline.commands.len();
-            let out = if last { fds.out.clone() } else { Sink::new() };
+            let out = if last { fds.out.clone() } else { self.new_sink() };
             let stage = Fds { stdin: input.clone(), out: out.clone(), err: fds.err.clone() };
             let mut child = self.fork();
             let result = child.exec_command(command, &stage).await;
@@ -339,6 +349,7 @@ impl Shell {
     pub(crate) fn exec_command<'a>(&'a mut self, command: &'a Command, fds: &'a Fds) -> BoxFut<'a, Status> {
         Box::pin(async move {
             self.count_command(fds)?;
+            if self.rt.commands.load(Ordering::Relaxed) % 64 == 0 { tokio::task::yield_now().await; }
             let result = match command {
                 Command::Simple(simple) => self.exec_simple(simple, fds).await,
                 Command::Compound { body, redirects } if redirects.is_empty() => self.exec_compound(body, fds).await,

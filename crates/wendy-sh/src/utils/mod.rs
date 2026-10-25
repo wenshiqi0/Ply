@@ -1,7 +1,7 @@
 //! Utilities: the commands a system would normally provide as programs
 //! (`cat`, `grep`, `sed` ...). Here each one is a Rust implementation that
-//! gets its streams and an [`Fs`] bound to its own name, so every file it
-//! touches is gated and traced as "this utility did that".
+//! gets its streams and an [`Fs`] over the mounted namespace. File access
+//! and read-only behavior are shared with the other Wendy runtimes.
 //!
 //! Hosts can add their own with [`Registry::insert`].
 
@@ -26,6 +26,7 @@ pub struct UtilCtx<'a> {
     pub fds: &'a Fds,
     pub fs: &'a Fs,
     pub env: &'a BTreeMap<String, String>,
+    pub output_truncated: &'a std::sync::atomic::AtomicBool,
 }
 
 impl UtilCtx<'_> {

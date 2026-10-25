@@ -12,7 +12,7 @@ mod param;
 
 use wendy_libc::glob;
 
-use crate::exec::state::{Fds, Sink};
+use crate::exec::state::Fds;
 use crate::exec::{BoxFut, Ctrl, Shell, ctrl_status};
 use crate::syntax::{Part, Script, Word};
 
@@ -154,7 +154,7 @@ impl Shell {
     pub(crate) fn command_subst<'a>(&'a mut self, script: &'a Script, fds: &'a Fds) -> BoxFut<'a, Result<String, Ctrl>> {
         Box::pin(async move {
             let mut child = self.fork();
-            let sub = Fds { stdin: fds.stdin.clone(), out: Sink::new(), err: fds.err.clone() };
+            let sub = Fds { stdin: fds.stdin.clone(), out: self.new_sink(), err: fds.err.clone() };
             let result = child.exec_script(script, &sub).await;
             let status = ctrl_status(result, &child);
             self.st.last_subst_status = Some(status);
@@ -185,7 +185,7 @@ impl Shell {
         if !glob::has_meta(&pattern) {
             return Ok(vec![literal]);
         }
-        let fs = wendy_libc::Fs::new(self.rt.io.labeled("glob"), self.st.cwd.clone());
+        let fs = wendy_libc::Fs::new(self.rt.io.clone(), self.st.cwd.clone());
         let matches = glob::expand_with(&fs, &pattern, self.st.opts.dotglob).await;
         if matches.is_empty() {
             if self.st.opts.nullglob {

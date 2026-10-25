@@ -50,6 +50,17 @@ struct World {
     root: String,
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_scripts_retire_their_realm_and_cancel_its_timers() {
+    let w = world_with(vec![]).await;
+    let script = w.work.path().join("temporary.ts");
+    std::fs::write(&script, "import fs from 'node:fs'; setTimeout(() => fs.writeFileSync('late.txt', 'leaked'), 100); throw new Error('stop');").unwrap();
+    let outcome = w.kernel.run_script(&script, vec![]).await.unwrap();
+    assert!(outcome.result.is_err());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!w.work.path().join("late.txt").exists());
+}
+
 /// A kernel over a temp workspace, with `plugins` loaded (not yet ready).
 async fn world_with(plugins: Vec<PluginSource>) -> World {
     let work = tempfile::tempdir().unwrap();
@@ -135,7 +146,7 @@ async fn default_plugins_describe_themselves_and_work_on_the_workspace() {
     let bash = w.kernel.call("bash", json!({ "command": "echo made > made.txt; cat made.txt; echo oops >&2; exit 2" })).await.unwrap();
     assert_eq!(bash, json!({ "exit_code": 2, "signal": null, "timed_out": false, "stdout": "made\n", "stderr": "oops\n" }));
     let slow = w.kernel.call("bash", json!({ "command": "sleep 5", "timeout_ms": 200 })).await.unwrap();
-    assert_eq!((slow["timed_out"].clone(), slow["signal"].clone()), (json!(true), json!("SIGKILL")));
+    assert_eq!((slow["timed_out"].clone(), slow["signal"].clone()), (json!(true), Value::Null));
 
     assert_eq!(w.kernel.call("remove", json!({})).await.unwrap_err().to_string(), "Error: 'path' must be a non-empty string");
     let err = w.kernel.call("agent", json!({ "prompt": " " })).await.unwrap_err();
@@ -185,10 +196,11 @@ async fn onload_mounts_on_ctx_waits_on_others_and_later_mounts_win() {
     let w = world_with(vec![]).await;
     let early = w.plugin(
         "early",
-        r#"
+        r#"import plugins from "wendy:plugins";
+
 let seen: string[] = [];
 export async function onLoad() {
-  await tools.late.loaded;
+  await plugins.late.loaded;
   seen = await ctx.greet("early");
   return { seen: () => seen, shared: "from early" };
 }
@@ -222,7 +234,7 @@ export async function onHandle(input: null): Promise<{ shared: string; version: 
     assert_eq!(r, json!({ "shared": "from early", "version": 2, "seen": ["early"], "bumps": [1, 2] }));
 
     // After ready, waiting for a plugin that is not there fails at once.
-    let lonely = w.plugin("lonely", "export async function onLoad() { await tools.ghost.loaded; }\n");
+    let lonely = w.plugin("lonely", "import plugins from \"wendy:plugins\";\nexport async function onLoad() { await plugins.ghost.loaded; }\n");
     w.kernel.load(lonely).await.unwrap();
     let err = tokio::time::timeout(Duration::from_secs(5), w.kernel.ready()).await.expect("ready hung").unwrap_err();
     assert!(err.to_string().contains("lonely: onLoad failed") && err.to_string().contains("no plugin named `ghost`"), "{err}");
@@ -234,12 +246,13 @@ async fn awaiting_a_plugin_is_a_child_fiber_and_every_fiber_is_recorded() {
     w.kernel
         .load(w.plugin(
             "count_lines",
-            r#"
+            r#"import plugins from "wendy:plugins";
+
 /** Count lines of a file two ways. */
 export async function onHandle(input: { path: string }): Promise<{ lines: number; betas: number }> {
   const [wc, grep] = await Promise.all([
-    tools.bash({ command: `wc -l < ${input.path}` }),
-    tools.bash({ command: `grep -c beta ${input.path}` }),
+    plugins.bash({ command: `wc -l < ${input.path}` }),
+    plugins.bash({ command: `grep -c beta ${input.path}` }),
   ]);
   return { lines: Number(wc.stdout.trim()), betas: Number(grep.stdout.trim()) };
 }
@@ -279,6 +292,30 @@ export async function onHandle(input: { path: string }): Promise<{ lines: number
     assert_eq!(std::fs::read_to_string(w.work.path().join("woken.txt")).unwrap(), "later");
     let detached = w.events.all().into_iter().any(|e| matches!(e, FiberEvent::Spawn { fiber, .. } if fiber.id == woken && fiber.detached));
     assert!(detached);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loaded_publishes_ctx_before_waking_dependants() {
+    let w = world_with(vec![]).await;
+    for n in 0..12 {
+        w.kernel
+            .load(w.plugin(
+                &format!("waiter_{n}"),
+                &format!(
+                    "import plugins from \"wendy:plugins\";\nexport async function onLoad() {{ await plugins.owner.loaded; const value = await ctx.identify({n}); return {{ seen_{n}: () => value }}; }}\n"
+                ),
+            ))
+            .await
+            .unwrap();
+    }
+    w.kernel
+        .load(w.plugin("owner", "export async function onLoad() { await new Promise(r => setTimeout(r, 20)); return { identify: (n: number) => n + 100 }; }\n"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), w.kernel.ready()).await.expect("onLoad waiters stalled").unwrap();
+    for n in 0..12 {
+        assert_eq!(w.kernel.call_ctx(&format!("seen_{n}"), vec![]).await.unwrap(), json!(n + 100));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -337,7 +374,7 @@ async fn plugins_that_collide_or_are_not_plugins_do_not_load() {
     w.kernel
         .load(w.plugin(
             "lister",
-            "/** List tools. */\nexport const onHandle = (name: string) => ({ names: Object.keys(tools), has: name in tools, description: tools[name].description, wraps: tools.lister.wrapsInput, params: tools.lister.parameters, contextParams: tools.context.parameters ?? null });\n",
+            "import plugins from \"wendy:plugins\";\n/** List tools. */\nexport const onHandle = (name: string) => ({ names: Object.keys(plugins), has: name in plugins, description: plugins[name].description, wraps: plugins.lister.wrapsInput, params: plugins.lister.parameters, contextParams: plugins.context.parameters ?? null });\n",
         ))
         .await
         .unwrap();
@@ -349,7 +386,7 @@ async fn plugins_that_collide_or_are_not_plugins_do_not_load() {
     assert_eq!(listed["params"], json!({ "type": "object", "properties": { "input": { "type": "string" } }, "required": ["input"] }));
     assert_eq!(listed["contextParams"], Value::Null);
 
-    w.kernel.load(w.plugin("forever", "export const onHandle = (): Promise<unknown> => tools.forever({});\n")).await.unwrap();
+    w.kernel.load(w.plugin("forever", "import plugins from \"wendy:plugins\";\nexport const onHandle = (): Promise<unknown> => plugins.forever({});\n")).await.unwrap();
     let err = w.kernel.call("forever", json!({})).await.unwrap_err();
     assert!(err.to_string().contains("nested deeper than 16"), "{err}");
 }
@@ -365,7 +402,7 @@ async fn structured_records_use_the_calling_fibers_identity_and_ancestry() {
         .await
         .unwrap();
     w.kernel
-        .load(w.plugin("parent", "export async function onHandle() { return await tools.noter({}); }\n"))
+        .load(w.plugin("parent", "import plugins from \"wendy:plugins\";\nexport async function onHandle() { return await plugins.noter({}); }\n"))
         .await
         .unwrap();
     w.kernel.ready().await.unwrap();
@@ -402,10 +439,357 @@ async fn records_are_the_events_as_json_lines_and_scripts_can_await_plugins() {
     let script = w.plugins.path().join("script.ts");
     std::fs::write(
         &script,
-        "const r = await tools.bash({ command: `wc -l < ${process.argv[2]}` });\nconst model = await ctx.currentModel();\nsetTimeout(() => console.log('lines', r.stdout.trim(), model.provider), 20);\n",
+        "import plugins from \"wendy:plugins\";\nconst r = await plugins.bash({ command: `wc -l < ${process.argv[2]}` });\nconst model = await ctx.currentModel();\nsetTimeout(() => console.log('lines', r.stdout.trim(), model.provider), 20);\n",
     )
     .unwrap();
     let outcome = w.kernel.run_script(&script, vec!["notes.txt".into()]).await.unwrap();
     assert!(outcome.result.is_ok(), "{:?}", outcome.result);
     assert_eq!(outcome.output.stdout, "lines 4 deepseek\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancellation_propagates_to_children_without_stopping_siblings() {
+    let w = world_with(vec![]).await;
+    w.kernel.load(w.plugin("parent", "import plugins from \"wendy:plugins\";\nexport async function onHandle(input) { return await plugins.worker(input); }")).await.unwrap();
+    w.kernel.load(w.plugin("worker", r#"
+import fs from "node:fs";
+export async function onHandle(input) {
+  await new Promise(resolve => setTimeout(resolve, 180));
+  fs.writeFileSync(input.path, "completed");
+  return input.path;
+}
+"#)).await.unwrap();
+    w.kernel.ready().await.unwrap();
+    let root = w.kernel.wake("parent", json!({ "path": "cancelled.txt" })).unwrap();
+    let child = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some((id, _, _, _)) = w.events.spawns().into_iter().find(|(_, parent, plugin, _)| parent.as_deref() == Some(&root) && plugin == "worker") { break id; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(w.kernel.cancel_fiber(&root));
+    let sibling = w.kernel.call("worker", json!({ "path": "sibling.txt" })).await.unwrap();
+    assert_eq!(sibling, json!("sibling.txt"));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while w.events.exit_of(&child).is_none() { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    assert!(matches!(w.events.exit_of(&root), Some(Exit::Cancelled { .. })));
+    assert!(matches!(w.events.exit_of(&child), Some(Exit::Cancelled { .. })));
+    assert!(!w.work.path().join("cancelled.txt").exists());
+    assert!(w.work.path().join("sibling.txt").exists());
+    for id in [&root, &child] {
+        assert_eq!(w.events.all().iter().filter(|e| matches!(e, FiberEvent::Exit { id: actual, .. } if actual == id)).count(), 1);
+    }
+    assert!(!w.kernel.cancel_fiber(&root));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn event_hook_panics_are_isolated_and_budget_exits_are_typed() {
+    struct BrokenHook;
+    impl FiberHook for BrokenHook { fn on_event(&self, _: &FiberEvent) { panic!("intentional broken hook"); } }
+    let mut config = KernelConfig::new(Io::new(), "/");
+    config.limits.turn_cpu = Duration::from_millis(100);
+    let kernel = Kernel::new(config);
+    let events = Arc::new(Events::default());
+    kernel.add_hook(Arc::new(BrokenHook)); kernel.add_hook(events.clone());
+    kernel.load(PluginSource::Embedded { name: "cpu".into(), source: "export async function onHandle(input) { await null; if (input.spin) while(true) {} return 'ok'; }".into() }).await.unwrap();
+    kernel.ready().await.unwrap();
+    let error = kernel.call("cpu", json!({ "spin": true })).await.unwrap_err();
+    assert!(matches!(error, KernelError::BudgetExceeded { resource: wendy_kernel::BudgetResource::Cpu, .. }));
+    assert_eq!(kernel.call("cpu", json!({})).await.unwrap(), json!("ok"));
+    let spawns = events.spawns(); assert_eq!(spawns.len(), 2);
+    assert!(matches!(events.exit_of(&spawns[0].0), Some(Exit::BudgetExceeded { resource: wendy_kernel::BudgetResource::Cpu, .. })));
+    assert!(matches!(events.exit_of(&spawns[1].0), Some(Exit::Done { .. })));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cumulative_child_limit_is_atomic_and_rejects_before_spawn() {
+    let w = world_with(vec![]).await;
+    w.kernel.load(w.plugin("quota_parent", r#"import plugins from "wendy:plugins";
+
+export async function onHandle() {
+  await fiber.limitChildren("quota_worker", 2);
+  const results = await Promise.allSettled([plugins.quota_worker({}), plugins.quota_worker({}), plugins.quota_worker({})]);
+  let widened = false;
+  try { await fiber.limitChildren("quota_worker", 3); widened = true; } catch {}
+  const budget = await fiber.limitChildren("quota_worker", 2, 0);
+  return { results: results.map(result => result.status), widened, budget };
+}
+"#)).await.unwrap();
+    w.kernel.load(w.plugin("quota_worker", "export async function onHandle() { await new Promise(resolve => setTimeout(resolve, 10)); return 'ok'; }")).await.unwrap();
+    w.kernel.ready().await.unwrap();
+    let result = w.kernel.call("quota_parent", json!({})).await.unwrap();
+    let results = result["results"].as_array().unwrap();
+    assert_eq!(results.iter().filter(|status| **status == "fulfilled").count(), 2);
+    assert_eq!(results.iter().filter(|status| **status == "rejected").count(), 1);
+    assert_eq!(result["widened"], false);
+    assert_eq!(result["budget"], json!({ "limit": 2, "started": 2, "remaining": 0 }));
+    assert_eq!(w.events.spawns().iter().filter(|(_, _, plugin, _)| plugin == "quota_worker").count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bash_runs_wendy_sh_over_virtual_storage_and_has_no_system_shell_fallback() {
+    let w = world().await;
+    w.kernel.io().mount("/virtual", Arc::new(wendy_kernel::MemoryStorage::empty()), MountMode::ReadWrite).unwrap();
+    let output = w.kernel.call("bash", json!({ "command": "mkdir -p /virtual/sub; printf 'beta\nalpha\n' > /virtual/sub/data; cat /virtual/sub/data | sort; echo $SHELL" })).await.unwrap();
+    assert_eq!(output["stdout"], "alpha\nbeta\nwendy-sh\n");
+    assert_eq!(output["exit_code"], 0);
+    let denied = w.kernel.call("bash", json!({ "command": "/bin/sh -c 'echo external > external-marker'" })).await.unwrap();
+    assert_eq!(denied["exit_code"], 127);
+    assert!(!w.work.path().join("external-marker").exists());
+    let timed = w.kernel.call("bash", json!({ "command": "echo entered; while :; do :; done; echo late > late-marker", "timeout_ms": 80 })).await.unwrap();
+    assert_eq!(timed["timed_out"], true);
+    assert_eq!(timed["stdout"], "entered\n");
+    assert_eq!(timed["signal"], Value::Null);
+    assert!(!w.work.path().join("late-marker").exists());
+    let bounded = w.kernel.call("bash", json!({ "command": "seq 1 10000000", "timeout_ms": 10000 })).await.unwrap();
+    assert_eq!(bounded["exit_code"], 1);
+    assert!(bounded["stdout"].as_str().unwrap().len() <= 1 << 20);
+    assert!(bounded["stderr"].as_str().unwrap().contains("buffer limit"));
+    let root = w.kernel.wake("bash", json!({ "command": "echo started > native-entered; while :; do :; done; echo bad > native-late" })).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !w.work.path().join("native-entered").exists() { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    assert!(w.kernel.cancel_fiber(&root));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(matches!(w.events.exit_of(&root), Some(Exit::Cancelled { .. })));
+    assert!(!w.work.path().join("native-late").exists());
+    assert_eq!(w.kernel.call("bash", json!({ "command": "echo alive" })).await.unwrap()["stdout"], "alive\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bash_before_hook_is_awaited_can_veto_and_has_its_own_fiber() {
+    let w = world_with(PluginSource::defaults()).await;
+    w.kernel.load(w.plugin("guard", r#"import plugins from "wendy:plugins";
+
+import * as events from "wendy:events";
+import fs from "node:fs";
+export async function onLoad() {
+  await plugins.bash.loaded;
+  await events.on("bash.beforeExecute", async event => {
+    const mine = await fiber.info();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await fiber.record({ type: "before_seen", mine: mine.id, parent: mine.parent, source: event.source.fiber, command: event.data.command });
+    setTimeout(() => fs.writeFileSync("late-success-hook", "bad"), 100);
+    return { allow: !event.data.command.includes("deny"), reason: "guard rule" };
+  });
+}
+"#)).await.unwrap();
+    w.kernel.ready().await.unwrap();
+    let (a, b) = tokio::join!(
+        w.kernel.call("bash", json!({ "command": "echo alpha > alpha" })),
+        w.kernel.call("bash", json!({ "command": "echo beta > beta" }))
+    );
+    a.unwrap(); b.unwrap();
+    assert_eq!(std::fs::read_to_string(w.work.path().join("alpha")).unwrap(), "alpha\n");
+    assert_eq!(std::fs::read_to_string(w.work.path().join("beta")).unwrap(), "beta\n");
+    let error = w.kernel.call("bash", json!({ "command": "echo deny > denied" })).await.unwrap_err();
+    assert!(error.to_string().contains("guard rule"), "{error}");
+    assert!(!w.work.path().join("denied").exists(), "veto must happen before redirection");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!w.work.path().join("late-success-hook").exists());
+    let events = w.events.all();
+    let callbacks: Vec<_> = events.iter().filter_map(|event| match event {
+        FiberEvent::Spawn { fiber, .. } if fiber.event.as_deref() == Some("bash.beforeExecute") => Some(fiber),
+        _ => None,
+    }).collect();
+    assert_eq!(callbacks.len(), 3);
+    for callback in callbacks {
+        assert_eq!(callback.plugin, "guard");
+        let record = events.iter().find_map(|event| match event {
+            FiberEvent::Record { id, data, .. } if id == &callback.id && data["type"] == "before_seen" => Some(data),
+            _ => None,
+        }).unwrap();
+        assert_eq!(record["mine"], callback.id);
+        assert_eq!(record["parent"], json!(callback.parent));
+        assert_eq!(record["source"], record["parent"]);
+        assert_eq!(callback.input["data"]["command"], record["command"]);
+        assert!(matches!(w.events.exit_of(&callback.id), Some(Exit::Done { .. })));
+    }
+    assert_eq!(events.iter().filter(|e| matches!(e, FiberEvent::Plugin { name, .. } if name == "bash.beforeExecute")).count(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hook_errors_deadlines_and_cancellation_prevent_command_side_effects() {
+    let w = world_with(PluginSource::defaults()).await;
+    w.kernel.load(w.plugin("policy", r#"import plugins from "wendy:plugins";
+
+import fs from "node:fs";
+import * as events from "wendy:events";
+export async function onLoad() {
+  await plugins.bash.loaded;
+  await events.on("bash.beforeExecute", async event => {
+    if (event.data.command.includes("throw")) throw new Error("policy failed");
+    if (event.data.command.includes("slow")) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      fs.writeFileSync("late-hook", "bad");
+    }
+  });
+}
+"#)).await.unwrap();
+    w.kernel.ready().await.unwrap();
+    let error = w.kernel.call("bash", json!({ "command": "echo throw > throw-marker" })).await.unwrap_err();
+    assert!(error.to_string().contains("policy failed"));
+    let error = w.kernel.call("bash", json!({ "command": "echo slow > timeout-marker", "timeout_ms": 80 })).await.unwrap_err();
+    assert!(error.to_string().contains("deadline"), "{error}");
+    let root = w.kernel.wake("bash", json!({ "command": "echo slow > cancel-marker" })).unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(w.kernel.cancel_fiber(&root));
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    for name in ["throw-marker", "timeout-marker", "cancel-marker", "late-hook"] { assert!(!w.work.path().join(name).exists(), "{name}"); }
+    assert!(matches!(w.events.exit_of(&root), Some(Exit::Cancelled { .. })));
+    assert_eq!(w.kernel.call("bash", json!({ "command": "echo healthy" })).await.unwrap()["stdout"], "healthy\n");
+    for event in w.events.all() {
+        if let FiberEvent::Spawn { fiber, .. } = event {
+            assert!(w.events.exit_of(&fiber.id).is_some(), "missing exit for {}", fiber.id);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn custom_events_are_owned_registered_in_onload_and_can_unsubscribe() {
+    let w = world_with(vec![]).await;
+    w.kernel.load(w.plugin("signals", r#"
+import * as events from "wendy:events";
+let tick;
+export async function onLoad() { tick = await events.define("tick"); return { eventList: () => events.list() }; }
+export async function onHandle(input) {
+  if (input.late) return await events.define("late");
+  return await events.emit(tick, input);
+}
+"#)).await.unwrap();
+    w.kernel.load(w.plugin("watcher", r#"import plugins from "wendy:plugins";
+
+import * as events from "wendy:events";
+export async function onLoad() {
+  await plugins.signals.loaded;
+  const id = await events.on("signals.tick", async event => { await null; return event.data.value + 1; });
+  return { stopWatching: () => events.off(id) };
+}
+"#)).await.unwrap();
+    w.kernel.load(w.plugin("intruder", r#"
+import * as events from "wendy:events";
+export async function onHandle() { return await events.emit("signals.tick", { value: 99 }); }
+"#)).await.unwrap();
+    w.kernel.ready().await.unwrap();
+    assert_eq!(w.kernel.call("signals", json!({ "value": 1 })).await.unwrap(), json!([2]));
+    assert!(w.kernel.call("signals", json!({ "late": true })).await.unwrap_err().to_string().contains("onLoad"));
+    assert!(w.kernel.call("intruder", json!({})).await.unwrap_err().to_string().contains("owning plugin"));
+    assert_eq!(w.kernel.call_ctx("stopWatching", vec![]).await.unwrap(), true);
+    assert_eq!(w.kernel.call("signals", json!({ "value": 2 })).await.unwrap(), json!([]));
+    assert_eq!(w.kernel.call_ctx("eventList", vec![]).await.unwrap(), json!([{ "name": "signals.tick", "plugin": "signals", "subscribers": 0 }]));
+    let script = w.work.path().join("signals.ts");
+    std::fs::write(&script, "import {emit} from 'wendy:events'; await emit('signals.tick', {});").unwrap();
+    assert!(w.kernel.run_script(&script, vec![]).await.unwrap().result.is_err(), "a matching realm label cannot impersonate a plugin");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_onload_removes_event_declarations_and_subscriptions() {
+    let w = world_with(PluginSource::defaults()).await;
+    w.kernel.load(w.plugin("broken", r#"import plugins from "wendy:plugins";
+
+import * as events from "wendy:events";
+export async function onLoad() {
+  await plugins.bash.loaded;
+  await events.define("local");
+  await events.on("bash.beforeExecute", () => { throw new Error("stale listener"); });
+  throw new Error("bad setup");
+}
+"#)).await.unwrap();
+    assert!(w.kernel.ready().await.is_err());
+    assert_eq!(w.kernel.call("bash", json!({ "command": "echo available" })).await.unwrap()["stdout"], "available\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_coordination_is_environment_neutral_and_resumes_only_the_original_command() {
+    let w = world_with(PluginSource::defaults()).await;
+    w.kernel.load(PluginSource::builtin("approval").unwrap()).await.unwrap();
+    w.kernel.load(w.plugin("risk", r#"import plugins from "wendy:plugins";
+
+import * as events from "wendy:events";
+export async function onLoad() {
+  await plugins.bash.loaded;
+  await events.on("bash.beforeExecute", () => ({ allow: false, requires_approval: true, reason: "review needed" }));
+}
+"#)).await.unwrap();
+    w.kernel.ready().await.unwrap();
+    let pending = w.kernel.call("bash", json!({ "command": "echo original > approved-file", "approved": true, "approval": { "status": "approved" } })).await.unwrap();
+    assert_eq!(pending["status"], "approval_required");
+    assert_eq!(pending["approval"]["reason"], "approval_provider_missing");
+    assert!(!w.work.path().join("approved-file").exists());
+    w.kernel.load(w.plugin("environment", r#"import plugins from "wendy:plugins";
+
+import * as events from "wendy:events";
+export async function onLoad() {
+  await plugins.approval.loaded;
+  await events.on("approval.request", async event => {
+    await new Promise(resolve => setTimeout(resolve, 150));
+    // Approval binds to this exact request. Mutating our JSON copy must
+    // never rewrite the script the bash tool eventually executes.
+    event.data.command = "echo substituted > wrong-file";
+    return { request_id: event.data.id, decision: "approved", approver: "test-user", reference: "test-approval-1" };
+  });
+}
+"#)).await.unwrap();
+    w.kernel.ready().await.unwrap();
+    let start = std::time::Instant::now();
+    let approved = w.kernel.call("bash", json!({ "command": "echo original > approved-file", "timeout_ms": 100 })).await.unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(150));
+    assert_eq!(approved["exit_code"], 0);
+    assert_eq!(approved["approval"]["status"], "approved");
+    assert_eq!(std::fs::read_to_string(w.work.path().join("approved-file")).unwrap(), "original\n");
+    assert!(!w.work.path().join("wrong-file").exists());
+    assert!(!w.kernel.catalog().iter().any(|tool| tool.name == "approval" || tool.name == "environment"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_needs_a_matching_explicit_decision_and_honors_rejection_and_cancel() {
+    let w = world_with(PluginSource::defaults()).await;
+    w.kernel.load(PluginSource::builtin("approval").unwrap()).await.unwrap();
+    w.kernel.load(w.plugin("gate", r#"import plugins from "wendy:plugins";
+
+import * as events from "wendy:events";
+export async function onLoad() {
+  await plugins.bash.loaded;
+  await events.on("bash.beforeExecute", () => ({ allow: false, requires_approval: true }));
+}
+"#)).await.unwrap();
+    w.kernel.load(w.plugin("approver", r#"import plugins from "wendy:plugins";
+
+import fs from "node:fs";
+import * as events from "wendy:events";
+export async function onLoad() {
+  await plugins.approval.loaded;
+  await events.on("approval.request", async event => {
+    const command = event.data.command;
+    if (command.includes("cancel")) {
+      fs.writeFileSync("approval-entered", "yes");
+      await new Promise(resolve => setTimeout(resolve, 500));
+      fs.writeFileSync("late-approval", "bad");
+    }
+    if (command.includes("provider_error")) throw new Error("approval service unavailable");
+    if (command.includes("mismatch")) return { request_id: "wrong-request", decision: "approved" };
+    if (command.includes("reject")) return { request_id: event.data.id, decision: "rejected", reason: "user declined" };
+    return { request_id: event.data.id, decision: "pending", reference: "external-ticket" };
+  });
+}
+"#)).await.unwrap();
+    w.kernel.ready().await.unwrap();
+    for name in ["pending", "mismatch", "provider_error"] {
+        let pending = w.kernel.call("bash", json!({ "command": format!("echo {name} > {name}-approval") })).await.unwrap();
+        assert_eq!(pending["status"], "approval_required");
+        assert!(!w.work.path().join(format!("{name}-approval")).exists());
+    }
+    let rejected = w.kernel.call("bash", json!({ "command": "echo reject > rejected-approval" })).await.unwrap_err();
+    assert!(rejected.to_string().contains("approval rejected"));
+    assert!(!w.work.path().join("rejected-approval").exists());
+    let root = w.kernel.wake("bash", json!({ "command": "echo cancel > cancelled-approval" })).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !w.work.path().join("approval-entered").exists() { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    assert!(w.kernel.cancel_fiber(&root));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(matches!(w.events.exit_of(&root), Some(Exit::Cancelled { .. })));
+    assert!(!w.work.path().join("cancelled-approval").exists());
+    assert!(!w.work.path().join("late-approval").exists());
 }

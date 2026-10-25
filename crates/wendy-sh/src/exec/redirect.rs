@@ -22,8 +22,8 @@ enum Slot {
 }
 
 impl Shell {
-    fn redirect_fs(&self, label: &str) -> Fs {
-        Fs::new(self.rt.io.labeled(label), self.st.cwd.clone())
+    fn redirect_fs(&self, _label: &str) -> Fs {
+        Fs::new(self.rt.io.clone(), self.st.cwd.clone())
     }
 
     pub(crate) async fn open_redirects(&mut self, redirects: &[Redirect], base: &Fds) -> Result<(Fds, Vec<Pending>), Ctrl> {
@@ -68,7 +68,7 @@ impl Shell {
                         let s = fds.err.clone();
                         set_out(&mut fds, slot, s);
                     }
-                    "-" => set_out(&mut fds, slot, Sink::new()),
+                    "-" => set_out(&mut fds, slot, self.new_sink()),
                     file if r.fd.is_none() && !file.chars().all(|c| c.is_ascii_digit()) => {
                         // `>&file` is `&>file`.
                         let sink = self.open_output(file, false, &fds, &mut pending, base).await?;
@@ -125,7 +125,7 @@ impl Shell {
 
     async fn open_output(&mut self, path: &str, append: bool, fds: &Fds, pending: &mut Vec<Pending>, base: &Fds) -> Result<Sink, Ctrl> {
         match path {
-            "/dev/null" => return Ok(Sink::new()),
+            "/dev/null" => return Ok(self.new_sink()),
             "/dev/stdout" => return Ok(fds.out.clone()),
             "/dev/stderr" => return Ok(fds.err.clone()),
             _ => {}
@@ -140,7 +140,7 @@ impl Shell {
             self.report(base, &format!("{path}: {e}"));
             return Err(Ctrl::Abort);
         }
-        let sink = Sink::new();
+        let sink = self.new_sink();
         pending.push(Pending { sink: sink.clone(), path: path.to_string() });
         Ok(sink)
     }

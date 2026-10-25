@@ -7,7 +7,8 @@
 //! - It owns no storage and spawns no processes. Every file operation —
 //!   redirections, globbing, `test -f`, `cd`, each utility's reads and
 //!   writes — goes through [`wendy_io::Io`] (via `wendy-libc`), so the IO
-//!   layer gates and traces all of it with the command that caused it.
+//!   namespace and read-only mounts apply to it. Plugin-level execution
+//!   events are handled by the kernel, not by this library.
 //! - Builtins (need shell state) live in `builtins`; utilities (only need
 //!   files and streams) implement [`Utility`] and can be added by hosts.
 

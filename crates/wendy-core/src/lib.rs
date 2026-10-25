@@ -8,11 +8,13 @@
 //!   input and output is `onHandle`'s TypeScript signature, read as a
 //!   [`Type`]. Plugins declare nothing else; checking input is the
 //!   plugin's own business.
-//! - Every execution of `onHandle` is a [`Fiber`]. A plugin reaches another
-//!   only by awaiting it (`await tools.bash(...)`): `then` is the call, and
+//! - Every execution of `onHandle` or a subscribed event callback is a
+//!   [`Fiber`]. Event callbacks carry their event name and emitting parent.
+//!   A plugin reaches another
+//!   only by awaiting it (`await plugins.bash(...)`): `then` is the call, and
 //!   the awaited execution is a child fiber.
 //! - What `onLoad` returns is mounted, flat, on the global `ctx` every
-//!   plugin sees ([`Mounts`]); `tools.<name>.loaded` resolves when that
+//!   plugin sees ([`Mounts`]); `plugins.<name>.loaded` resolves when that
 //!   plugin's `onLoad` has returned, so plugins can build on each other
 //!   (register into a context, say).
 //! - What is recorded is fibers: their input, their structured records,
@@ -25,7 +27,7 @@ pub mod fiber;
 pub mod plugin;
 pub mod types;
 
-pub use fiber::{Exit, Fiber, FiberEvent, FiberHook};
+pub use fiber::{BudgetResource, CleanupStatus, Exit, Fiber, FiberEvent, FiberHook};
 pub use plugin::{Mounts, PluginSpec, ToolSchema};
 pub use types::{Field, Type};
 

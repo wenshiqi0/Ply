@@ -63,6 +63,7 @@ struct Parser {
     pos: usize,
     line: usize,
     heredoc_end: Option<usize>,
+    nesting: usize,
 }
 
 fn is_name_start(c: char) -> bool {
@@ -80,7 +81,7 @@ pub fn is_name(s: &str) -> bool {
 
 impl Parser {
     fn new(src: &str) -> Self {
-        Parser { chars: src.chars().collect(), pos: 0, line: 1, heredoc_end: None }
+        Parser { chars: src.chars().collect(), pos: 0, line: 1, heredoc_end: None, nesting: 0 }
     }
 
     // ---------- character helpers ----------
@@ -336,6 +337,14 @@ impl Parser {
     }
 
     fn parse_command(&mut self) -> PResult<Command> {
+        if self.nesting >= 64 { return self.err("maximum shell syntax nesting exceeded (64)"); }
+        self.nesting += 1;
+        let result = self.parse_command_inner();
+        self.nesting -= 1;
+        result
+    }
+
+    fn parse_command_inner(&mut self) -> PResult<Command> {
         self.skip_blanks();
         let compound = if self.at_keyword("{") {
             self.bump();
@@ -941,6 +950,14 @@ impl Parser {
 
     /// Parse word parts until an unquoted character from `stops`.
     fn parse_word_until(&mut self, stops: &[char]) -> PResult<Word> {
+        if self.nesting >= 64 { return self.err("maximum shell syntax nesting exceeded (64)"); }
+        self.nesting += 1;
+        let result = self.parse_word_until_inner(stops);
+        self.nesting -= 1;
+        result
+    }
+
+    fn parse_word_until_inner(&mut self, stops: &[char]) -> PResult<Word> {
         let mut parts = Vec::new();
         while self.parse_word_piece(&mut parts, stops)? {}
         Ok(Word(parts))
@@ -1004,6 +1021,14 @@ impl Parser {
     /// Body of a double-quoted region (or of here-doc / arithmetic text when
     /// `close` is `None`).
     fn parse_dq_parts(&mut self, close: Option<char>, drop_dquotes: bool) -> PResult<Vec<Part>> {
+        if self.nesting >= 64 { return self.err("maximum shell syntax nesting exceeded (64)"); }
+        self.nesting += 1;
+        let result = self.parse_dq_parts_inner(close, drop_dquotes);
+        self.nesting -= 1;
+        result
+    }
+
+    fn parse_dq_parts_inner(&mut self, close: Option<char>, drop_dquotes: bool) -> PResult<Vec<Part>> {
         let mut parts = Vec::new();
         loop {
             let Some(c) = self.peek() else {

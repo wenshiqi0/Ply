@@ -10,9 +10,7 @@
 mod common;
 
 use std::process::Command;
-use std::sync::Arc;
 
-use wendy_io::AllowAll;
 
 const CASES: &[(&str, &str)] = &[
     ("quoting", r#"echo "a  b" 'c  d' e\ \ f; echo "$(echo "inner \"q\"")"; echo '$HOME' "\$x" \\"#),
@@ -98,7 +96,7 @@ async fn behaves_like_bash() {
         let theirs_err = String::from_utf8_lossy(&output.stderr).into_owned();
 
         let ours_dir = common::fixture_dir();
-        let (mut sh, _io, _hook) = common::shell_in(ours_dir.path(), Arc::new(AllowAll));
+        let (mut sh, _io) = common::shell_in(ours_dir.path());
         let ours = sh.exec(script).await;
 
         let mut problems = Vec::new();

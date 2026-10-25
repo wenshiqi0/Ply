@@ -10,9 +10,12 @@ async-trait.workspace = true
 libc.workspace = true
 oxc.workspace = true
 oxc_ecmascript.workspace = true
+reqwest.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 wendy-libc.workspace = true
+wendy-sh.workspace = true
+wendy-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

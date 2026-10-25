@@ -15,3 +15,7 @@ clap.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 wendy-kernel.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+tempfile.workspace = true

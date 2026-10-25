@@ -3,9 +3,7 @@
 
 use std::sync::Arc;
 
-use serde_json::json;
 use wendy_libc::Fs;
-use wendy_trace::{Scope, Verdict};
 
 use super::state::{Fds, Value, Var};
 use super::{Ctrl, Shell, Status};
@@ -118,42 +116,19 @@ impl Shell {
     /// Run `argv` as a function, builtin or utility (in that order).
     pub(crate) async fn dispatch(&mut self, argv: &[String], fds: &Fds) -> Status {
         let name = argv[0].as_str();
-        let tracer = self.rt.io.tracer().clone();
-        let kind;
         let result = if let Some(body) = self.st.functions.get(name).cloned() {
-            kind = "function";
             self.call_function(body, argv, fds).await
         } else if builtins::is_builtin(name) {
-            kind = "builtin";
             builtins::run(self, argv, fds).await
         } else if let Some(util) = self.rt.utils.get(name) {
-            kind = "utility";
             let env = self.st.vars.exported();
-            let fs = Fs::new(self.rt.io.labeled(name), self.st.cwd.clone());
-            let ctx = UtilCtx { name, args: &argv[1..], fds, fs: &fs, env: &env };
+            let fs = Fs::new(self.rt.io.clone(), self.st.cwd.clone());
+            let ctx = UtilCtx { name, args: &argv[1..], fds, fs: &fs, env: &env, output_truncated: &self.rt.output_truncated };
             Ok(util.run(ctx).await)
         } else {
-            kind = "missing";
             self.report(fds, &format!("{name}: command not found"));
             Ok(127)
         };
-        let status = match &result {
-            Ok(s) => Some(*s),
-            Err(Ctrl::Exit(n)) | Err(Ctrl::Return(n)) => Some(*n),
-            _ => None,
-        };
-        tracer.emit(
-            Scope::Command,
-            "cmd.run",
-            if kind == "missing" { Verdict::Error } else { Verdict::Info },
-            json!({
-                "session": self.rt.session,
-                "argv": argv.iter().take(32).map(|a| a.chars().take(256).collect::<String>()).collect::<Vec<_>>(),
-                "kind": kind,
-                "status": status,
-                "line": self.st.line,
-            }),
-        );
         result
     }
 
