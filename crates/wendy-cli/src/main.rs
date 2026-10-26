@@ -133,6 +133,9 @@ struct RunArgs {
 struct TuiArgs {
     #[command(flatten)]
     setup: Setup,
+    /// Skip manual approvals; tool grants, mounts and hard hook denials still apply.
+    #[arg(long)]
+    bypass: bool,
     /// Optional first task (otherwise enter a task interactively).
     prompt: Option<String>,
 }
@@ -198,7 +201,11 @@ fn context_policy(setup: &Setup) -> Result<Option<String>> {
     Ok(Some(serde_json::to_string(&value)?))
 }
 
-async fn kernel(setup: &Setup, tui: bool) -> Result<Kernel> {
+#[derive(Clone, Copy)]
+enum UiMode { Disabled, Ask, Bypass }
+
+async fn kernel(setup: &Setup, ui: UiMode) -> Result<Kernel> {
+    let tui = !matches!(ui, UiMode::Disabled);
     let integration = match setup.model.as_deref() {
         None => "deepseek",
         Some(model) if model.starts_with("deepseek-") => "deepseek",
@@ -231,7 +238,7 @@ async fn kernel(setup: &Setup, tui: bool) -> Result<Kernel> {
     let mut config = KernelConfig::new(io, cwd);
     // The host selects the approval policy. The TUI only presents requests;
     // agent tool visibility and delegation remain agent-owned defaults.
-    if tui { config.env.insert("WENDY_APPROVAL_MODE".into(), "ask".into()); }
+    if tui { config.env.insert("WENDY_APPROVAL_MODE".into(), if matches!(ui, UiMode::Bypass) { "bypass" } else { "ask" }.into()); }
     if let Some(model) = &setup.model {
         config.env.insert("WENDY_MODEL".into(), model.clone());
     }
@@ -286,7 +293,7 @@ async fn kernel(setup: &Setup, tui: bool) -> Result<Kernel> {
 }
 
 async fn describe(setup: Setup) -> Result<i32> {
-    let kernel = kernel(&setup, false).await?;
+    let kernel = kernel(&setup, UiMode::Disabled).await?;
     println!("{}", serde_json::to_string_pretty(&kernel.plugins())?);
     Ok(0)
 }
@@ -295,7 +302,7 @@ async fn describe_commands(setup: Setup) -> Result<i32> {
     // Discover the bundled TUI by default; --no-default-plugins lists only
     // explicitly selected providers without requiring agent/UI dependencies.
     let include_tui = !setup.no_default_plugins;
-    let kernel = kernel(&setup, include_tui).await?;
+    let kernel = kernel(&setup, if include_tui { UiMode::Ask } else { UiMode::Disabled }).await?;
     println!("{}", serde_json::to_string_pretty(&kernel.commands())?);
     Ok(0)
 }
@@ -313,7 +320,7 @@ async fn registered(args: Vec<String>) -> Result<i32> {
     };
     let Cmd::Call(args) = parsed.command else { unreachable!() };
     let input = args.input.as_deref().map(serde_json::from_str).transpose().context("command input must be JSON")?.unwrap_or_else(|| json!({}));
-    let kernel = kernel(&args.setup, false).await?;
+    let kernel = kernel(&args.setup, UiMode::Disabled).await?;
     let result = kernel.run_command(&args.plugin, input).await;
     for plugin in kernel.plugins() {
         if let Some(out) = kernel.take_output(&plugin.name).await { eprint!("{}{}", out.stdout, out.stderr); }
@@ -329,7 +336,7 @@ async fn call(args: CallArgs) -> Result<i32> {
         Some(text) => serde_json::from_str(text).context("input must be JSON")?,
         None => json!({}),
     };
-    let kernel = kernel(&args.setup, false).await?;
+    let kernel = kernel(&args.setup, UiMode::Disabled).await?;
     let result = kernel.call(&args.plugin, input).await;
     for plugin in kernel.plugins() {
         if let Some(out) = kernel.take_output(&plugin.name).await {
@@ -348,7 +355,7 @@ async fn call(args: CallArgs) -> Result<i32> {
 }
 
 async fn run(args: RunArgs) -> Result<i32> {
-    let kernel = kernel(&args.setup, false).await?;
+    let kernel = kernel(&args.setup, UiMode::Disabled).await?;
     let outcome = kernel.run_script(&args.file, args.args).await?;
     std::io::stdout().write_all(outcome.output.stdout.as_bytes())?;
     std::io::stderr().write_all(outcome.output.stderr.as_bytes())?;
@@ -372,7 +379,7 @@ async fn run(args: RunArgs) -> Result<i32> {
 /// One JSON-RPC message per line on stdin/stdout. Requests are handled
 /// concurrently; stdout carries nothing but protocol messages.
 async fn serve_mcp(setup: Setup) -> Result<i32> {
-    let kernel = kernel(&setup, false).await?;
+    let kernel = kernel(&setup, UiMode::Disabled).await?;
     let out = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     let mut tasks = tokio::task::JoinSet::new();
@@ -485,7 +492,7 @@ async fn main() -> Result<()> {
         Cmd::Mcp(setup) => serve_mcp(setup).await?,
         Cmd::Run(args) => run(args).await?,
         Cmd::Tui(args) => {
-            let kernel = kernel(&args.setup, true).await?;
+            let kernel = kernel(&args.setup, if args.bypass { UiMode::Bypass } else { UiMode::Ask }).await?;
             let input = args.prompt.map_or_else(|| json!({}), |prompt| json!({ "prompt": prompt }));
             match kernel.run_command("tui", input).await {
                 Ok(_) => 0,
@@ -508,12 +515,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn tui_bypass_is_an_explicit_host_option_and_default_remains_ask() {
+        for (flags,expected) in [(vec!["wendy","tui"],"ask"),(vec!["wendy","tui","--bypass"],"bypass")] {
+            let Cli {command:Cmd::Tui(args)}=Cli::try_parse_from(flags).unwrap() else {unreachable!()};
+            let k=kernel(&args.setup,if args.bypass {UiMode::Bypass}else{UiMode::Ask}).await.unwrap();
+            let status=k.call_ctx("approvalStatus",vec![]).await.unwrap();
+            assert_eq!(status["mode"],expected);assert_eq!(status["bypassed"],0);
+        }
+        assert!(Cli::try_parse_from(["wendy","call","--bypass","agent"]).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn model_selection_loads_one_integration_and_keeps_keys_on_the_host() {
-        let deepseek = kernel(&tools_setup(&[]), false).await.unwrap();
+        let deepseek = kernel(&tools_setup(&[]), UiMode::Disabled).await.unwrap();
         assert_eq!(deepseek.call_ctx("currentModel", vec![]).await.unwrap()["provider"], "deepseek");
 
         for model in ["mimo-v2.6-pro", "mimo-v2.6-flash"] {
-            let mimo = kernel(&tools_setup(&["--model", model]), false).await.unwrap();
+            let mimo = kernel(&tools_setup(&["--model", model]), UiMode::Disabled).await.unwrap();
             let profile = mimo.call_ctx("currentModel", vec![]).await.unwrap();
             assert_eq!(profile["provider"], "xiaomi-token-plan-cn");
             assert_eq!(profile["model"], model);
@@ -527,7 +545,7 @@ mod tests {
             assert!(!mimo.catalog().iter().any(|tool| tool.name == "mimo"));
         }
 
-        let public = kernel(&tools_setup(&["--model", "mimo-v2.6-pro-ultraspeed", "--mimo-provider", "xiaomi"]), false).await.unwrap();
+        let public = kernel(&tools_setup(&["--model", "mimo-v2.6-pro-ultraspeed", "--mimo-provider", "xiaomi"]), UiMode::Disabled).await.unwrap();
         let profile = public.call_ctx("currentModel", vec![]).await.unwrap();
         assert_eq!(profile["definition"]["baseUrl"], "https://api.xiaomimimo.com/v1");
         assert_eq!(profile["definition"]["id"], "mimo-v2.6-pro-ultraspeed");
@@ -542,7 +560,7 @@ mod tests {
             vec!["--model", "mimo-v2.6-pro-ultraspeed"],
             vec!["--plugin", "plugins/mimo"],
         ] {
-            assert!(kernel(&tools_setup(&args), false).await.is_err(), "{args:?}");
+            assert!(kernel(&tools_setup(&args), UiMode::Disabled).await.is_err(), "{args:?}");
         }
     }
 
@@ -556,7 +574,7 @@ mod tests {
         }).to_string()).unwrap();
         let configured = kernel(&tools_setup(&[
             "--context-config", path.to_str().unwrap(), "--max-context-tokens", "32768", "--context-compact-trigger", "0.75",
-        ]), false).await.unwrap();
+        ]), UiMode::Disabled).await.unwrap();
         let policy = configured.call_ctx("contextConfig", vec![]).await.unwrap();
         assert_eq!(policy["max_context_tokens"], 32768);
         assert_eq!(policy["compaction"]["trigger_ratio"], 0.75);
@@ -570,7 +588,7 @@ mod tests {
         assert_eq!(prepared["budget"]["input_budget_tokens"], 20480);
         assert_eq!(prepared["budget"]["trigger_tokens"], 15360);
 
-        let disabled = kernel(&tools_setup(&["--context-compaction", "off"]), false).await.unwrap();
+        let disabled = kernel(&tools_setup(&["--context-compaction", "off"]), UiMode::Disabled).await.unwrap();
         assert_eq!(disabled.call_ctx("contextConfig", vec![]).await.unwrap()["compaction"]["enabled"], false);
     }
 
@@ -580,7 +598,7 @@ mod tests {
             vec!["--max-context-tokens", "100"],
             vec!["--context-compact-trigger", "0.5", "--context-compact-target", "0.7"],
         ] {
-            assert!(kernel(&tools_setup(&args), false).await.is_err(), "{args:?}");
+            assert!(kernel(&tools_setup(&args), UiMode::Disabled).await.is_err(), "{args:?}");
         }
         for ratio in ["NaN", "inf", "0", "1", "-0.5"] {
             assert!(parse_context_ratio(ratio).is_err(), "{ratio}");
@@ -596,7 +614,7 @@ mod tests {
             json!({ "compaction": { "summary_max_tokens": 999999 } }),
         ] {
             std::fs::write(&path, invalid.to_string()).unwrap();
-            assert!(kernel(&tools_setup(&["--context-config", path.to_str().unwrap()]), false).await.is_err(), "{invalid}");
+            assert!(kernel(&tools_setup(&["--context-config", path.to_str().unwrap()]), UiMode::Disabled).await.is_err(), "{invalid}");
         }
     }
 }

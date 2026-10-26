@@ -122,11 +122,34 @@ declare module "wendy:lifecycle" {
 declare module "wendy:terminal" {
   export interface Size { columns: number; rows: number }
   export function open(): Size & { id: number };
-  /** Full frame of plain text lines. Host escapes terminal control characters. */
-  export function render(id: number, lines: string[]): Size;
+  export type Style = "normal" | "muted" | "accent" | "title" | "warning" | "error" | "code";
+  export interface Span { text: string; style?: Style; bold?: boolean; italic?: boolean; underline?: boolean; strike?: boolean }
+  export type Line = string | Span | { spans: Span[]; style?: Style };
+  /** Plain text with host-owned styles. Only changed rows are painted; controls are escaped. */
+  export function render(id: number, lines: Line[], options?: { cursor?: { row: number; column: number } | null; clear?: boolean }): Size;
   export function flush(id: number): void;
   export function read(id: number, timeout_ms?: number): Promise<Size & { data: string }>;
   export function close(id: number): void;
+}
+
+/** Bounded CommonMark parser returning data only. HTML and URLs are never executed/fetched. */
+declare module "wendy:markdown" {
+  export interface Node {
+    type: string;
+    children?: Node[];
+    text?: string;
+    level?: number;
+    language?: string;
+    start?: number | null;
+    url?: string;
+    title?: string;
+    label?: string;
+    checked?: boolean;
+    alignments?: ("left" | "center" | "right" | "none")[];
+  }
+  export function parse(source: string): Node;
+  /** Width is 8..240 cells; code content stays literal and links are displayed as text. */
+  export function render(source: string | Node, options?: { columns?: number }): import("wendy:terminal").Line[];
 }
 
 

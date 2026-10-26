@@ -29,6 +29,84 @@ struct Session {
     active: AtomicBool,
     reader: tokio::sync::Mutex<()>,
     utf8: Mutex<Vec<u8>>,
+    frame: Mutex<Frame>,
+}
+
+#[derive(Default)]
+struct Frame {
+    lines: Vec<String>,
+    columns: u64,
+    rows: u64,
+}
+
+fn style_code(value: &Value) -> Result<&'static str, OpResult> {
+    match value
+        .get("style")
+        .and_then(Value::as_str)
+        .unwrap_or("normal")
+    {
+        "normal" => Ok(""),
+        "muted" => Ok("\x1b[90m"),
+        "accent" => Ok("\x1b[36m"),
+        "title" => Ok("\x1b[1;36m"),
+        "warning" => Ok("\x1b[33m"),
+        "error" => Ok("\x1b[31m"),
+        "code" => Ok("\x1b[37;48;5;236m"),
+        _ => Err(failure("unknown terminal text style")),
+    }
+}
+
+fn styled_span(value: &Value, base: &str) -> Result<String, OpResult> {
+    let text = value
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|s| s.len() <= 8192)
+        .ok_or_else(|| failure("span text must be a string of at most 8192 bytes"))?;
+    let mut out = format!("\x1b[0m{base}{}", style_code(value)?);
+    for (key, code) in [("bold", 1), ("italic", 3), ("underline", 4), ("strike", 9)] {
+        match value.get(key) {
+            None | Some(Value::Bool(false)) => {}
+            Some(Value::Bool(true)) => out.push_str(&format!("\x1b[{code}m")),
+            _ => return Err(failure("span emphasis flags must be booleans")),
+        }
+    }
+    out.push_str(&visible(text));
+    out.push_str("\x1b[0m");
+    Ok(out)
+}
+
+fn styled_line(value: &Value) -> Result<String, OpResult> {
+    if let Some(text) = value.as_str() {
+        if text.len() > 8192 {
+            return Err(failure("terminal line is too large"));
+        }
+        return Ok(visible(text));
+    }
+    let base = style_code(value)?;
+    if let Some(spans) = value.get("spans") {
+        if value.get("text").is_some() {
+            return Err(failure("use text or spans, not both"));
+        }
+        let spans = spans
+            .as_array()
+            .filter(|s| s.len() <= 4096)
+            .ok_or_else(|| failure("spans must be an array of at most 4096 runs"))?;
+        let mut bytes = 0;
+        let mut out = String::new();
+        for span in spans {
+            bytes += span
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::len)
+                .unwrap_or(8193);
+            if bytes > 8192 {
+                return Err(failure("terminal line is too large"));
+            }
+            out.push_str(&styled_span(span, base)?);
+        }
+        return Ok(out);
+    }
+    styled_span(value, "")
 }
 
 impl Session {
@@ -72,7 +150,7 @@ impl Session {
 
     fn close(&self) {
         if self.active.swap(false, Ordering::AcqRel) {
-            let _ = self.write(b"\x1b[?2004l\x1b[?25h\x1b[?1049l");
+            let _ = self.write(b"\x1b[0m\x1b[?2004l\x1b[?25h\x1b[?1049l");
             unsafe {
                 libc::tcsetattr(self.file.as_raw_fd(), libc::TCSANOW, &self.original);
             }
@@ -176,6 +254,7 @@ impl Terminal {
                     active: AtomicBool::new(true),
                     reader: tokio::sync::Mutex::new(()),
                     utf8: Mutex::new(Vec::new()),
+                    frame: Mutex::new(Frame::default()),
                 })
             };
             return match open() {
@@ -215,23 +294,60 @@ impl Terminal {
                 let Some(lines) = args.get("lines").and_then(Value::as_array) else {
                     return failure("lines must be an array of strings");
                 };
-                if lines.len() > 100
-                    || lines
-                        .iter()
-                        .any(|s| s.as_str().is_none_or(|s| s.len() > 8192))
-                {
+                if lines.len() > 100 {
                     return failure("terminal frame is too large");
                 }
-                let mut frame = String::from("\x1b[H\x1b[2J");
-                let limit = session.size()["rows"].as_u64().unwrap() as usize;
-                for (i, line) in lines.iter().take(limit).enumerate() {
-                    if i > 0 {
-                        frame.push_str("\r\n");
+                let size = session.size();
+                let rows = size["rows"].as_u64().unwrap();
+                let columns = size["columns"].as_u64().unwrap();
+                let cursor = match args.get("options").and_then(|v| v.get("cursor")) {
+                    None | Some(Value::Null) => None,
+                    Some(value) => match (
+                        value.get("row").and_then(Value::as_u64),
+                        value.get("column").and_then(Value::as_u64),
+                    ) {
+                        (Some(row), Some(column)) if row < rows && column < columns => {
+                            Some((row, column))
+                        }
+                        _ => return failure("cursor must be a valid zero-based terminal cell"),
+                    },
+                };
+                let mut rendered = Vec::new();
+                for line in lines.iter().take(rows as usize) {
+                    match styled_line(line) {
+                        Ok(line) => rendered.push(line),
+                        Err(error) => return error,
                     }
-                    frame.push_str(&visible(line.as_str().unwrap()));
+                }
+                let mut previous = session.frame.lock().unwrap();
+                let clear = previous.lines.is_empty()
+                    || previous.columns != columns
+                    || previous.rows != rows
+                    || args
+                        .get("options")
+                        .and_then(|v| v.get("clear"))
+                        .and_then(Value::as_bool)
+                        == Some(true);
+                let mut frame = String::from("\x1b[?25l");
+                if clear {
+                    frame.push_str("\x1b[H\x1b[2J");
+                }
+                for row in 0..rendered.len().max(previous.lines.len()).min(rows as usize) {
+                    let line = rendered.get(row).map(String::as_str).unwrap_or("");
+                    if clear || previous.lines.get(row).map(String::as_str) != Some(line) {
+                        frame.push_str(&format!("\x1b[{};1H\x1b[2K{}\x1b[0m", row + 1, line));
+                    }
+                }
+                if let Some((row, column)) = cursor {
+                    frame.push_str(&format!("\x1b[{};{}H\x1b[?25h", row + 1, column + 1));
                 }
                 match session.write(frame.as_bytes()) {
-                    Ok(()) => OpResult::Json(session.size()),
+                    Ok(()) => {
+                        previous.lines = rendered;
+                        previous.rows = rows;
+                        previous.columns = columns;
+                        OpResult::Json(size)
+                    }
                     Err(error) => failure(error),
                 }
             }

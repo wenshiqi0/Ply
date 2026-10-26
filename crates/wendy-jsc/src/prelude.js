@@ -802,9 +802,9 @@
       } : name === "wendy:http" ? {
         hasCredentials: provider => op("http.auth_configured", { provider }),
         requestJson: request => opAsync("http.request_json", request),
-      } : name === "wendy:terminal" ? {
+      } : name === "wendy:markdown" ? compile(op("markdown.source"))({ parse: source => op("markdown.parse", { source }) }) : name === "wendy:terminal" ? {
         open: () => op("terminal.open", {}),
-        render: (id, lines) => op("terminal.render", { id, lines }),
+        render: (id, lines, options = {}) => op("terminal.render", { id, lines, options }),
         flush: id => op("terminal.flush", { id }),
         read: (id, timeout_ms = 100) => opAsync("terminal.read", { id, timeout_ms }),
         close: id => op("terminal.close", { id }),

@@ -1,4 +1,15 @@
 // Local model boundary for approval tests; used with the real agent loop.
+const fixtureMarkdownReply = [
+  "## 项目结论", "",
+  "这段包含 **加粗**、*斜体*、`inline()` 和 ~~旧方案~~。", "",
+  "### 执行步骤", "",
+  "- 检查模块", "  - 保留嵌套层级", "- [x] 完成解析", "",
+  "1. 先分析", "2. 再修改", "",
+  "> 注意边界：代码内容保持原样。", "",
+  "```ts", "const text = '**代码字面量**';", "  // 保留缩进", "```", "",
+  "| 模块 | 状态 |", "| :--- | ---: |", "| parser | ready |", "| 终端 | 完成 |", "",
+  "查看 [文档](https://example.com/wendy)。",
+].join("\n");
 function fixtureReply(content, stopReason) {
   return { role: "assistant", content, stopReason,
     usage: { input: 20, output: 10, cacheRead: 80, cacheWrite: 0, reasoning: 0, totalTokens: 110 } };
@@ -26,11 +37,17 @@ async function modelRequest(req) {
   } else if (prompt === "parallel") calls = ["one", "two"].map(name => ({ name: "bash", arguments: { command: "echo " + name + " > " + name } }));
   else if (prompt === "double-read") calls = ["first.txt", "second.txt"].map(path => ({ name: "read", arguments: { path } }));
   else if (prompt === "delegate") calls = [{ name: "agent", arguments: { prompt: "child" } }];
+  else if (prompt === "delegate-many") calls = [0,1,2].map(() => ({ name: "agent", arguments: { prompt: "child" } }));
   else if (prompt === "child") calls = [{ name: "read", arguments: { path: "secret.txt" } }];
   else if (prompt === "ansi") calls = [{ name: "bash", arguments: { command: "echo '\x1b]52;c;injected\x07\u202e' > ansi" } }];
   else if (prompt === "cancel") {
     await new Promise(resolve => setTimeout(resolve, 5000));
     calls = [{ name: "bash", arguments: { command: "echo late > late" } }];
+  } else if (prompt === "markdown-demo") {
+    return fixtureReply([{ type: "text", text: fixtureMarkdownReply + "\n[[WENDY_REPORT_COMPLETE]]" }], "stop");
+  } else if (prompt === "slow-chat") {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    return fixtureReply([{ type: "text", text: "agent-chat: slow-chat\n[[WENDY_REPORT_COMPLETE]]" }], "stop");
   } else return fixtureReply([{ type: "text", text: "agent-chat: " + prompt + "\n[[WENDY_REPORT_COMPLETE]]" }], "stop");
   return fixtureReply(calls.map((call, i) => ({ type: "toolCall", id: "call-" + i, ...call })), "toolUse");
 }

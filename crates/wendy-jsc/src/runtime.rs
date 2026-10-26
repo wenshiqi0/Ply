@@ -1114,6 +1114,8 @@ fn blocking<T>(future: impl std::future::Future<Output = T>) -> Result<T, OpResu
 fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
     let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     match op {
+        "markdown.parse" => crate::markdown::parse(args),
+        "markdown.source" => OpResult::Json(json!(include_str!("markdown.js"))),
         _ if op.starts_with("terminal.") => with(|e| {
             if op == "terminal.open" && e.current.is_none() { return invalid("terminal owner"); }
             let result = e.terminal.call(op, args);
@@ -1279,7 +1281,7 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
 // -------------------------------------------------------------- modules
 
 fn resolve_module(spec: &str, from: Option<&Value>) -> OpResult {
-    if matches!(spec, "wendy:models" | "wendy:checkpoints" | "wendy:lifecycle" | "wendy:sh" | "wendy:events" | "wendy:http" | "wendy:terminal" | "wendy:plugins" | "wendy:commands") || spec.strip_prefix("wendy:async/helpers/").is_some_and(|name|
+    if matches!(spec, "wendy:models" | "wendy:checkpoints" | "wendy:lifecycle" | "wendy:sh" | "wendy:events" | "wendy:http" | "wendy:terminal" | "wendy:plugins" | "wendy:commands" | "wendy:markdown") || spec.strip_prefix("wendy:async/helpers/").is_some_and(|name|
         ["asyncToGenerator", "wrapAsyncGenerator", "awaitAsyncGenerator", "asyncGeneratorDelegate", "asyncIterator"].contains(&name)) {
         return OpResult::Json(json!({ "builtin": spec }));
     }

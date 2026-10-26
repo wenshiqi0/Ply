@@ -3,7 +3,7 @@
 风险评估、执行决策和环境交互分三层：
 
 1. `jev` 评估风险，返回概率、建议及 `requires_approval`。高风险、待复核、密钥缺失或审查失败都需要确认，不代表用户已拒绝。
-2. `approval` 管理宿主选择的审批策略并协调请求与结果。`risk` 为默认值，只处理已有风险 hook 的请求；`ask` 要求模型工具调用逐次确认。它没有界面，不调用某个审批平台，也不会自己批准。
+2. `approval` 管理宿主选择的审批策略并协调请求与结果。`risk` 为默认值，只处理已有风险 hook 的请求；`ask` 要求模型工具调用逐次确认；`bypass` 是宿主显式选择的跳过人工确认策略。它没有界面，不调用某个审批平台，也不会伪造用户回答。
 3. 环境插件订阅审批事件，实现当前环境的用户确认或外部审批。终端已有 [TUI 插件](tui.md)；GUI、MCP 宿主、企业审批系统可采用各自适配器。TUI 只展示请求和提交决定，不设置模型的工具白名单。
 
 `--jev` 会自动加载协调插件。手动加载时使用 `--plugin ./plugins/approval --plugin ./plugins/jev`。仅加载 Jev 而没有协调插件也会返回 `approval_required`，不会把缺失环境当成批准或最终拒绝。
@@ -43,7 +43,9 @@ interface WendyToolApprovalRequest {
 
 read/create/edit/remove 与模型发起的 agent 委派均走该入口；read 获批前不读取文件，预览只使用已经提交的参数。默认子 agent 的工具集与委派限制继续由 agent 管理，不由审批界面删减。直接由用户启动主 agent 不重复审批。
 
-宿主通过 `KernelConfig.env["WENDY_APPROVAL_MODE"]` 选择 `risk` 或 `ask`；CLI 的 `tui` 入口选择 `ask`。ask 模式由 approval 插件订阅 bash.beforeExecute，在既有 Jev 检查结束后合并为一次 bash 审批，避免重复确认。没有命令白名单或 pwd 特例。普通 `--jev` 仍采用 risk 模式。
+宿主通过 `KernelConfig.env["WENDY_APPROVAL_MODE"]` 选择 risk、ask 或 bypass；CLI 的 `tui` 默认 ask，显式 `wendy tui --bypass` 选择 bypass。ask/bypass 模式均经过 bash.beforeExecute，在既有 Jev 检查结束后处理原始命令。bypass 直接写入授权记录，不向适配器发送审批请求。没有命令白名单或 pwd 特例。普通 `--jev` 仍采用 risk 模式。
+
+bypass 不跳过 agent 的工具授权与委派检查、内核子任务配额、挂载限制或普通 before hook 的硬拒绝。Jev 的风险建议仍可记录；需要审批的建议按宿主 bypass 策略继续执行。`approval_bypassed` 的 status 为 approved、reason 为 approval_bypassed、responses 为空，明确区别于人工批准；`approvalStatus().bypassed` 单独累计，requested/approved 仍统计实际审批请求与批准。CLI 不从模型工具参数或任意环境变量开启 bypass，选择发生在宿主启动阶段。
 
 通用入口覆盖 agent 向模型提供的工具调用；宿主直接 `Kernel.call("read", ...)`、CLI `call read` 或可信插件直接访问文件不经过 agent 的通用门禁，仍由相应宿主/插件控制。仅加载 TUI 不改变这些入口。
 
@@ -112,4 +114,4 @@ export async function onLoad() {
 
 不要将固定 approved 的测试桩作为生产适配器。审批插件/适配器都不注册模型工具；没有可由模型调用的“自我批准”工具或 approved 参数。
 
-运行轨迹记录 approval_requested、approval_result、tool_approved、command_approval_required、command_approved 和 agent_approval_required；每个适配器回调仍有自己的子 fiber 与取消生命周期。`ctx.approvalStatus()` 汇总协调结果、模式与期限，不代表存在可用环境。
+运行轨迹记录 approval_requested、approval_result、approval_bypassed、tool_approved、command_approval_required、command_approved 和 agent_approval_required；每个适配器回调仍有自己的子 fiber 与取消生命周期。`ctx.approvalStatus()` 汇总协调结果、bypassed 次数、模式与期限，不代表存在可用环境。

@@ -204,6 +204,8 @@ cargo build -p wendy-cli
 ./target/debug/wendy tui --record /tmp/wendy-tui.jsonl
 ```
 
+显式跳过人工确认可用 `wendy tui --bypass`；界面会显示 BYPASS，工具授权、子 agent 上限、挂载限制和普通 hook 的硬拒绝仍生效。
+
 TUI 将用户输入交给 agent，不直接调用 read/bash 等业务工具，也不额外传工具白名单。主 agent 默认支持六个工具，子 agent 按现有委派限制移除 agent。CLI 为 TUI 选择逐次审批策略，读取、写入、命令执行和模型委派均需确认；可加 `--jev` 显示 bash 风险评估。详见 [TUI 使用说明](docs/tui.md)。
 
 默认把当前目录以读写方式挂在它自己的路径上：

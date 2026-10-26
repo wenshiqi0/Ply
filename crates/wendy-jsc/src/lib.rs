@@ -26,6 +26,7 @@ mod http;
 mod runtime;
 mod sh;
 mod terminal;
+mod markdown;
 pub mod transpile;
 
 pub use wendy_core::{CleanupStatus, FiberEvent};

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 libc.workspace = true
+pulldown-cmark.workspace = true
 oxc.workspace = true
 oxc_ecmascript.workspace = true
 reqwest.workspace = true

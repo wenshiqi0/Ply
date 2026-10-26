@@ -187,6 +187,14 @@ impl Pty {
             0
         );
     }
+    fn cursor(&mut self) -> (usize, usize) {
+        self.wait("\x1b[?25h");
+        let text = String::from_utf8_lossy(&self.bytes);
+        let before = &text[..text.rfind("\x1b[?25h").unwrap()];
+        let position = before.rsplit("\x1b[").next().unwrap().trim_end_matches('H');
+        let (row, column) = position.split_once(';').unwrap();
+        (row.parse().unwrap(), column.parse().unwrap())
+    }
 }
 impl Drop for Pty {
     fn drop(&mut self) {
@@ -277,8 +285,14 @@ fn tui_approves_only_once_rejects_and_requires_viewing_long_commands() {
     std::thread::sleep(Duration::from_millis(150));
     assert!(!work.path().join("long").exists());
     for _ in 0..8 {
-        p.send(" ");
-        std::thread::sleep(Duration::from_millis(120));
+        // Inspect a fresh complete frame, rather than requiring an unchanged
+        // action row to be resent by the incremental renderer.
+        p.send(" \x0c");
+        p.wait("Ctrl+C 取消并退出");
+        p.drain();
+        if p.contains("[y]") {
+            break;
+        }
     }
     p.wait("[y]");
     p.send("y");
@@ -322,6 +336,144 @@ fn tui_approves_only_once_rejects_and_requires_viewing_long_commands() {
         offered["data"]["names"],
         json!(["agent", "bash", "create", "edit", "read", "remove"])
     );
+}
+
+#[test]
+fn composer_has_a_visible_cursor_and_edits_unicode_without_clearing_the_screen() {
+    let work = tempfile::tempdir().unwrap();
+    let record = work.path().join("composer.jsonl");
+    let mut c = tui_command(work.path());
+    c.arg("--record").arg(&record);
+    let mut p = Pty::spawn(c, 24);
+    p.wait("输入消息，按 Enter 发送…");
+    let initial = p.cursor();
+    assert!(initial.0 >= 18 && initial.0 < 24);
+    assert_eq!(initial.1, 5);
+    p.send("ac");
+    p.wait("ac");
+    let after = p.cursor();
+    assert_eq!(after.1, initial.1 + 2);
+    assert!(!p.contains("\x1b[2J"), "typing must not clear the screen");
+    p.send("\x1b[D");
+    assert_eq!(p.cursor().1, initial.1 + 1);
+    p.send("b");
+    p.wait("abc");
+    assert_eq!(p.cursor().1, initial.1 + 2);
+    p.send("\x1b[3~");
+    p.wait("ab");
+    p.send("\x01");
+    assert_eq!(p.cursor().1, initial.1);
+    p.send("你好");
+    assert_eq!(p.cursor().1, initial.1 + 4);
+    p.send("👩‍💻");
+    assert_eq!(p.cursor().1, initial.1 + 6);
+    p.send("\x7f");
+    assert_eq!(p.cursor().1, initial.1 + 4);
+    p.send("\x05");
+    assert_eq!(p.cursor().1, initial.1 + 6);
+    p.send("\r");
+    p.wait("就绪");
+    p.wait("agent-chat: 你好ab");
+    p.send("/quit\r");
+    p.exit(true);
+    let events: Vec<Value> = std::fs::read_to_string(record)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let prompts: Vec<_> = events
+        .iter()
+        .filter_map(|e| {
+            if e["event"] == "spawn" && e["fiber"]["plugin"] == "agent" {
+                Some(e["fiber"]["input"]["prompt"].clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(prompts, vec![json!("你好ab")]);
+}
+
+#[test]
+fn composer_preserves_multiline_paste_newlines_history_and_resize() {
+    let work = tempfile::tempdir().unwrap();
+    let record = work.path().join("multiline.jsonl");
+    let mut c = tui_command(work.path());
+    c.arg("--record").arg(&record);
+    let mut p = Pty::spawn(c, 24);
+    p.wait("输入消息，按 Enter 发送…");
+    let start = p.cursor();
+    p.send("\x1b[200~alpha\nbeta\x1b[201~");
+    p.wait("beta");
+    assert!(p.cursor().0 > start.0);
+    p.send("\x1b\rgamma\x1b[13;2udelta\ntail");
+    p.wait("tail");
+    let cursor = p.cursor();
+    assert!(cursor.0 < 24);
+    p.send("\r");
+    p.wait("就绪");
+    p.send("\x1b[A");
+    p.wait("输入消息 · 5/5 行");
+    p.wait("tail");
+    p.resize(10, 40);
+    let small = p.cursor();
+    assert!(small.0 <= 10 && small.1 <= 40);
+    p.resize(24, 100);
+    p.wait("输入消息 · 5/5 行");
+    p.send("\r");
+    p.wait("就绪");
+    p.send("/quit\r");
+    p.exit(true);
+    let events: Vec<Value> = std::fs::read_to_string(record)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let prompts: Vec<_> = events
+        .iter()
+        .filter_map(|e| {
+            if e["event"] == "spawn" && e["fiber"]["plugin"] == "agent" {
+                Some(e["fiber"]["input"]["prompt"].clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let expected = json!("alpha\nbeta\ngamma\ndelta\ntail");
+    assert_eq!(prompts, vec![expected.clone(), expected]);
+}
+
+#[test]
+fn composer_keeps_a_busy_draft_without_starting_another_agent() {
+    let work = tempfile::tempdir().unwrap();
+    let record = work.path().join("busy.jsonl");
+    let mut c = tui_command(work.path());
+    c.arg("--record").arg(&record);
+    let mut p = Pty::spawn(c, 24);
+    p.wait("/help");
+    p.send("slow-chat\r");
+    p.wait("执行中");
+    p.send("next draft\r");
+    p.wait("草稿已保留");
+    p.wait("就绪");
+    p.wait("next draft");
+    let events: Vec<Value> = std::fs::read_to_string(&record)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["event"] == "spawn" && e["fiber"]["plugin"] == "agent")
+            .count(),
+        1
+    );
+    p.send("\r");
+    p.wait("就绪");
+    p.wait("agent-chat: next draft");
+    p.send("/quit\r");
+    p.exit(true);
 }
 
 #[test]
@@ -549,5 +701,204 @@ fn tui_reads_and_writes_require_approval_without_restricting_agent_tools() {
     assert_eq!(
         child["data"]["names"],
         json!(["bash", "create", "edit", "read", "remove"])
+    );
+}
+
+#[test]
+fn tui_bypass_skips_manual_prompts_and_keeps_jev_assessments_and_audit() {
+    let work = tempfile::tempdir().unwrap();
+    let record = work.path().join("bypass.jsonl");
+    let mut c = tui_command(work.path());
+    c.args(["--bypass", "--jev", "--record"]).arg(&record);
+    let mut p = Pty::spawn(c, 40);
+    p.wait("BYPASS");
+    p.wait("/help");
+    for (name, input) in [
+        ("create", json!({"path":"file.txt","content":"before"})),
+        ("read", json!({"path":"file.txt"})),
+        (
+            "edit",
+            json!({"path":"file.txt","old_string":"before","new_string":"after"}),
+        ),
+        ("remove", json!({"path":"file.txt"})),
+    ] {
+        p.send(&tool_prompt(name, input));
+        p.wait("就绪");
+        p.wait("agent-done");
+        assert!(
+            !p.contains("需要你的确认"),
+            "bypass must not open the approval dialog"
+        );
+        if name == "create" {
+            assert_eq!(
+                std::fs::read_to_string(work.path().join("file.txt")).unwrap(),
+                "before"
+            );
+        }
+        if name == "edit" {
+            assert_eq!(
+                std::fs::read_to_string(work.path().join("file.txt")).unwrap(),
+                "after"
+            );
+        }
+    }
+    assert!(!work.path().join("file.txt").exists());
+    p.send("/bash echo bypass > shell.txt\r");
+    p.wait("就绪");
+    p.wait("agent-done");
+    assert_eq!(
+        std::fs::read_to_string(work.path().join("shell.txt")).unwrap(),
+        "bypass\n"
+    );
+    p.send("/quit\r");
+    p.exit(true);
+    let events: Vec<Value> = std::fs::read_to_string(record)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let bypassed: Vec<_> = events
+        .iter()
+        .filter(|e| e["data"]["type"] == "approval_bypassed")
+        .collect();
+    assert_eq!(bypassed.len(), 5);
+    assert!(
+        bypassed
+            .iter()
+            .all(|e| e["data"]["reason"] == "approval_bypassed"
+                && e["data"]["responses"] == json!([]))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["data"]["type"] == "approval_requested"
+                || e["data"]["type"] == "tui_approval")
+    );
+    assert!(events.iter().any(|e| {
+        e["data"]["type"] == "jev_check"
+            && e["data"]["result"]["reason_codes"]
+                .as_array()
+                .is_some_and(|codes| codes.contains(&json!("missing_credentials")))
+    }));
+}
+
+#[test]
+fn tui_bypass_keeps_read_only_mounts_delegation_caps_and_hard_hook_denials() {
+    let work = tempfile::tempdir().unwrap();
+    let mut c = tui_command(work.path());
+    c.args(["--bypass", "--mount", "disk:.:ro"]);
+    let mut p = Pty::spawn(c, 40);
+    p.wait("BYPASS");
+    p.wait("/help");
+    p.send(&tool_prompt(
+        "create",
+        json!({"path":"forbidden.txt","content":"no"}),
+    ));
+    p.wait("就绪");
+    p.wait("tool-rejected");
+    assert!(!work.path().join("forbidden.txt").exists());
+    p.send("/quit\r");
+    p.exit(true);
+
+    std::fs::write(work.path().join("secret.txt"), "child content").unwrap();
+    let record = work.path().join("limits.jsonl");
+    let mut c = tui_command(work.path());
+    c.args(["--bypass", "--agent-max-children", "1", "--record"])
+        .arg(&record);
+    let mut p = Pty::spawn(c, 40);
+    p.wait("/help");
+    p.send("delegate-many\r");
+    p.wait("就绪");
+    p.wait("tool-rejected");
+    p.send("/quit\r");
+    p.exit(true);
+    let events: Vec<Value> = std::fs::read_to_string(record)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["event"] == "spawn" && e["fiber"]["plugin"] == "agent")
+            .count(),
+        2,
+        "only one child is allowed"
+    );
+    let child = events
+        .iter()
+        .find(|e| e["data"]["type"] == "fixture_offered_tools" && e["data"]["prompt"] == "child")
+        .unwrap();
+    assert_eq!(
+        child["data"]["names"],
+        json!(["bash", "create", "edit", "read", "remove"])
+    );
+    assert!(events.iter().any(|e| {
+        e["data"]["type"] == "agent_tool_error"
+            && e["data"]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("child limit reached"))
+    }));
+
+    let guard = work.path().join("hard-guard");
+    std::fs::create_dir(&guard).unwrap();
+    std::fs::write(guard.join("main.ts"),r#"
+import plugins from "wendy:plugins";
+import * as events from "wendy:events";
+export async function onLoad(){await plugins.bash.loaded;await events.on("bash.beforeExecute",()=>({allow:false,reason:"hard denial"}));}
+"#).unwrap();
+    let mut c = tui_command(work.path());
+    c.args(["--bypass", "--plugin"]).arg(guard);
+    let mut p = Pty::spawn(c, 40);
+    p.wait("/help");
+    p.send("/bash echo denied > denied.txt\r");
+    p.wait("就绪");
+    p.wait("tool-rejected");
+    assert!(!work.path().join("denied.txt").exists());
+    p.send("/quit\r");
+    p.exit(true);
+}
+
+#[test]
+fn chat_renders_markdown_styles_and_code_boxes_without_changing_raw_reports() {
+    let work = tempfile::tempdir().unwrap();
+    let record = work.path().join("markdown.jsonl");
+    let mut c = tui_command(work.path());
+    c.arg("--record").arg(&record);
+    let mut p = Pty::spawn(c, 60);
+    p.wait("/help");
+    p.send("markdown-demo\r");
+    p.wait("就绪");
+    p.wait("项目结论");
+    p.wait("parser");
+    assert!(!p.contains("## 项目结论"));
+    assert!(!p.contains("**加粗**"));
+    assert!(!p.contains("*斜体*"));
+    assert!(!p.contains("~~旧方案~~"));
+    assert!(!p.contains("```ts"));
+    assert!(!p.contains("[文档](https"));
+    assert!(!p.contains("| :---"));
+    assert!(p.contains("\x1b[1m加粗"));
+    assert!(p.contains("\x1b[3m斜体"));
+    assert!(p.contains("\x1b[9m旧方案"));
+    assert!(p.contains("**代码字面量**"));
+    assert!(p.contains("  // 保留缩进"));
+    assert!(p.contains("╭─ ts"));
+    assert!(p.contains("☑"));
+    p.send("/quit\r");
+    p.exit(true);
+    let events: Vec<Value> = std::fs::read_to_string(record)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events.iter().any(|e| e["event"] == "exit"
+            && e["exit"]["output"]["text"]
+                .as_str()
+                .is_some_and(|s| s.contains("## 项目结论")
+                    && s.contains("```ts")
+                    && s.contains("**加粗**"))),
+        "raw reports must stay markdown in the journal"
     );
 }

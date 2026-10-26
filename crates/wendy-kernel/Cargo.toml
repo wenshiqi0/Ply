@@ -15,4 +15,5 @@ wendy-core.workspace = true
 wendy-jsc.workspace = true
 
 [dev-dependencies]
+unicode-width.workspace = true
 tempfile.workspace = true
