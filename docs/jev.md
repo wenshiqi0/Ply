@@ -14,7 +14,7 @@
 - 任一维度 >= `JEV_DENY_MIN_RISK`：高风险建议 deny，并设置 requires_approval:true；用户或审批系统仍可明确批准。
 - 其余：review，设置 requires_approval:true。
 
-这里的 decision 是风险建议，不是用户最终决定。bash 将需要确认的结果交给独立审批层；批准后继续原命令，明确拒绝或取消才终止。可用 `wendy tui --jev` 进行终端审批；没有环境适配器时返回 approval_required，而不是最终拒绝。
+这里的 decision 是风险建议，不是用户最终决定。bash 将需要确认的结果交给独立审批层；批准后继续原命令，明确拒绝或取消才终止。可用 `ply tui --jev` 进行终端审批；没有环境适配器时返回 approval_required，而不是最终拒绝。
 
 阈值默认 0.10 / 0.90 是本插件的保守初值，不代表厂商承诺或普适准确率。`reason_codes` 来自触发的维度，`reason` 是本地生成的说明，不冒充模型自然语言解释。Noul 没有单独的 confidence 字段，插件保留原始概率。
 
@@ -23,12 +23,12 @@
 模板在 [examples/jev.env.example](../examples/jev.env.example)。复制到挂载工作区之外，再填入密钥：
 
 ```bash
-mkdir -p "$HOME/.config/wendy"
-cp examples/jev.env.example "$HOME/.config/wendy/jev.env"
-chmod 600 "$HOME/.config/wendy/jev.env"
+mkdir -p "$HOME/.config/ply"
+cp examples/jev.env.example "$HOME/.config/ply/jev.env"
+chmod 600 "$HOME/.config/ply/jev.env"
 # 编辑上述文件，填入 TYPESAFE_API_KEY
 set -a
-source "$HOME/.config/wendy/jev.env"
+source "$HOME/.config/ply/jev.env"
 set +a
 ```
 
@@ -47,9 +47,9 @@ CLI 只转发这些非敏感 JEV 配置。Rust 嵌入时把它们写入 `KernelC
 ## 使用
 
 ```bash
-cargo build -p wendy-cli --locked
-./target/debug/wendy call --jev --record /tmp/wendy-jev.jsonl bash '{"command":"pwd; ls"}'
-./target/debug/wendy call --jev --record /tmp/wendy-agent-jev.jsonl agent '{"prompt":"只读查看项目目录", "allowed_tools":["bash"], "max_delegation_depth":0}'
+cargo build -p ply-cli --locked
+./target/debug/ply call --jev --record /tmp/ply-jev.jsonl bash '{"command":"pwd; ls"}'
+./target/debug/ply call --jev --record /tmp/ply-agent-jev.jsonl agent '{"prompt":"只读查看项目目录", "allowed_tools":["bash"], "max_delegation_depth":0}'
 ```
 
 没有 `--jev` 时保持原有行为。无效配置会启动失败；密钥缺失、接口异常、超时、无效或缺失答案、越界概率均转为 requires_approval，不静默放行，也不代替用户做最终拒绝。此版本不自动重试；限流或过载同样进入确认/审批，调用方也可按[官方错误规则](https://docs.typesafe.ai/api/errors)稍后重新发起审查。

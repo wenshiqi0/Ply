@@ -1,8 +1,8 @@
-import plugins from "wendy:plugins";
-import { request as modelRequest } from "wendy:models";
-import type { ModelProfile } from "wendy:models";
-import * as checkpoints from "wendy:checkpoints";
-import { onDispose } from "wendy:lifecycle";
+import plugins, { context } from "ply:plugins";
+import { request as modelRequest } from "ply:models";
+import type { ModelProfile } from "ply:models";
+import * as checkpoints from "ply:checkpoints";
+import { onDispose } from "ply:lifecycle";
 
 // The loop and pi-ai model calls run in this plugin's JSC realm. The host
 // supplies HTTP/TLS and streams; no external model process is started.
@@ -17,6 +17,7 @@ type Message = {
   approval_requests?: unknown[];
   timestamp: number;
 };
+type ToolOutcome = { id: string; name: string; output: unknown; isError: boolean; approval_requests?: unknown[] };
 type Context = { systemPrompt: string; messages: Message[]; tools: { name: string }[] };
 type Budget = { reserve_output_tokens: number; estimated_input_tokens: number; input_budget_tokens: number; [key: string]: unknown };
 type PreparedContext = {
@@ -89,7 +90,7 @@ type AgentInput = {
   max_turns?: number;
 };
 type Recovery = {
-  format: 2;
+  format: 4;
   phase: "ready" | "tools_pending";
   cwd: string;
   profile: ModelProfile;
@@ -108,7 +109,7 @@ function integer(value: unknown, name: string, minimum = 0): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum) throw new Error(name + " must be a safe integer >= " + minimum);
   return value;
 }
-const REPORT_END = "[[WENDY_REPORT_COMPLETE]]";
+const REPORT_END = "[[PLY_REPORT_COMPLETE]]";
 type ReportState = { required_sections: string[]; rejected_reports: number };
 
 function sectionNames(value: unknown, name: string): string[] {
@@ -118,7 +119,7 @@ function sectionNames(value: unknown, name: string): string[] {
   return [...new Set(value.map(section => (section as string).trim()))];
 }
 function reportFor(input: AgentInput, parent?: RunUsage, saved?: ReportState): ReportState {
-  const defaults = sectionNames(JSON.parse(process.env.WENDY_AGENT_REPORT_SECTIONS ?? "[]"), "default report sections");
+  const defaults = sectionNames(JSON.parse(process.env.PLY_AGENT_REPORT_SECTIONS ?? "[]"), "default report sections");
   const requested = input.report_sections === undefined ? (parent || saved ? [] : defaults) : sectionNames(input.report_sections, "report_sections");
   return { required_sections: sectionNames([...new Set([...(parent?.report.required_sections ?? []), ...(saved?.required_sections ?? []), ...requested])], "combined report sections"),
     rejected_reports: saved?.rejected_reports ?? 0 };
@@ -169,7 +170,7 @@ function validateReport(text: string, stop: string | undefined, report: ReportSt
 }
 
 function recovery(value: any): Recovery {
-  if (!value || value.format !== 2) throw new Error("unsupported recovery format: expected 2; older checkpoints cannot be resumed; start a new task");
+  if (!value || value.format !== 4) throw new Error("unsupported recovery format: expected 4; older checkpoints cannot be resumed; start a new task");
   if ( !["ready", "tools_pending"].includes(value.phase) || value.cwd !== process.cwd() ||
       !value.profile || typeof value.profile.provider !== "string" || typeof value.profile.model !== "string" ||
       !value.policy || !Array.isArray(value.policy.allowed_tools)) throw new Error("invalid recovery record or workspace mismatch");
@@ -200,7 +201,7 @@ function policyFor(input: AgentInput, available: string[], parent?: RunUsage, sa
     }
     names = [...new Set(input.allowed_tools)];
   }
-  const defaultChildren = integer(Number(process.env.WENDY_AGENT_MAX_CHILDREN ?? 2), "default max_children");
+  const defaultChildren = integer(Number(process.env.PLY_AGENT_MAX_CHILDREN ?? 2), "default max_children");
   const childCeiling = Math.min(parent ? parent.policy.max_children : (input.max_children ?? saved?.max_children ?? defaultChildren),
     saved?.max_children ?? Number.MAX_SAFE_INTEGER);
   const children = input.max_children === undefined ? childCeiling : integer(input.max_children, "max_children");
@@ -228,7 +229,7 @@ export async function onHandle(input: AgentInput): Promise<{
   if (input.max_children !== undefined) integer(input.max_children, "max_children");
   if (input.report_sections !== undefined) sectionNames(input.report_sections, "report_sections");
   if (input.max_delegation_depth !== undefined) integer(input.max_delegation_depth, "max_delegation_depth");
-  await plugins.context.loaded;
+  await context.loaded;
   const current = await fiber.info();
   let run: RunUsage | undefined;
   let id: string | undefined;
@@ -249,13 +250,13 @@ export async function onHandle(input: AgentInput): Promise<{
   const unwatch = onDispose(async () => {
     // A forced VM interruption cannot execute this generator's finally.
     activeUsage.delete(current.id);
-    try { if (id !== undefined) await ctx.closeConversation(id); }
+    try { await context.closeConversation(id ?? null); }
     finally { if (lease !== undefined) await checkpoints.finish(lease, false); }
   });
   const snapshot = async (): Promise<Recovery> => ({
-    format: 2, phase: "ready", cwd: process.cwd(), profile: profile!, policy: policy!,
+    format: 4, phase: "ready", cwd: process.cwd(), profile: profile!, policy: policy!,
     children_started: (await fiber.childBudget("agent"))!.started, report: { ...report, required_sections: [...report.required_sections] },
-    conversation: await ctx.exportConversation(id!), next_turn: nextTurn, tool_calls: toolCalls,
+    conversation: await context.exportConversation(id!), next_turn: nextTurn, tool_calls: toolCalls,
     previous_usage: combinedUsage(previousUsage, usageSummary(run!.own)), previous_total_usage: combinedUsage(previousTotalUsage, totalUsageSummary(run!)),
   });
   try {
@@ -272,28 +273,20 @@ export async function onHandle(input: AgentInput): Promise<{
       previousTotalUsage = saved.previous_total_usage;
     }
     const parent = current.ancestors.map(ancestor => activeUsage.get(ancestor)).find(value => value !== undefined);
-    policy = policyFor(input, await ctx.availableTools(), parent, saved?.policy);
+    policy = policyFor(input, await context.availableTools(), parent, saved?.policy);
     report = reportFor(input, parent, saved?.report);
-    const childBudget = await fiber.limitChildren("agent", policy.max_children, saved?.children_started ?? 0);
+    await fiber.limitChildren("agent", policy.max_children, saved?.children_started ?? 0);
     run = startUsage(current.id, current.ancestors, policy, report);
     await fiber.record({ type: "agent_policy", ...policy, resumed_from: checkpointId ?? null });
-    profile = saved?.profile ?? await ctx.currentModel();
+    profile = saved?.profile ?? (await context.currentModel()) ?? undefined;
     if (!profile) throw new Error("no model in the context: load a model integration such as deepseek or mimo");
     model = `${profile.provider}/${profile.model}`;
-    const system = `You are an agent working in the directory ${process.cwd()}. ` +
-      "Use only your offered tools. Prefer read for files. " +
-      (policy.max_delegation_depth > 0
-        ? `You may start at most ${policy.max_children} direct child agents cumulatively, including failed calls, replacements and resumes. ${childBudget.started} slots have already been spent; ${childBudget.remaining} remain. This is a hard kernel quota. Child permissions can only be narrowed. Repair reports within their existing agent, not by starting replacements. Include task background and constraints in each prompt. `
-        : "You are not allowed to delegate. Complete this task yourself using your offered tools. ") +
-      "When the task is done, answer with a complete report. " +
-      (report.required_sections.length ? "Use Markdown headings with exactly these names, each followed by substantive content: " + JSON.stringify(report.required_sections) + ". " : "") +
-      "Quote examples of protocol tokens in inline code or fenced code blocks; never emit control/protocol tokens as prose. Close all code fences. " +
-      `End every final answer with the exact standalone line ${REPORT_END} outside code fences. It is stripped before delivery. Do not emit that line while calling tools.`;
     const info = await modelRequest({ operation: "describe", profile });
-    const conversationId: string = saved ? await ctx.restoreConversation(saved.conversation, info, policy.allowed_tools, system)
-      : await ctx.openConversation(system, info, policy.allowed_tools);
-    id = conversationId;
-    if (!saved) await ctx.appendMessages(id, [{ role: "user", content: input.prompt, timestamp: Date.now() }]);
+    const request = { model: info, allowed_tools: policy.allowed_tools,
+      facts: { max_children: policy.max_children, max_delegation_depth: policy.max_delegation_depth,
+        report_sections: report.required_sections, completion_marker: REPORT_END } };
+    id = saved ? await context.restoreTask(saved.conversation, request)
+      : await context.openTask({ ...request, prompt: input.prompt! });
     let turns = 0;
     for (let turn = nextTurn; maxTurns === undefined || turns < maxTurns; turn++) {
       nextTurn = turn;
@@ -302,8 +295,8 @@ export async function onHandle(input: AgentInput): Promise<{
         await checkpoints.update(lease, lastReady);
       }
       const prepared = await prepareForTurn(id, profile, model, turn, run);
-      const context = prepared.context!;
-      const reply: Message = { ...(await completeTurn(profile, context, model, turn, run, "task", prepared.budget.reserve_output_tokens, prepared.budget)), timestamp: Date.now() };
+      const requestContext = prepared.context!;
+      const reply: Message = { ...(await completeTurn(profile, requestContext, model, turn, run, "task", prepared.budget.reserve_output_tokens, prepared.budget)), timestamp: Date.now() };
       turns++;
       if (reply.stopReason === "error" || reply.stopReason === "aborted") throw new Error(`${model}: ${reply.errorMessage ?? reply.stopReason}`);
       const blocks = (reply.content ?? []) as Block[];
@@ -320,17 +313,12 @@ export async function onHandle(input: AgentInput): Promise<{
             response_id: reply.responseId ?? null, reasons: checked.errors, preview: candidate.slice(-512), rejected_reports: report.rejected_reports });
           // Keep malformed protocol text out of the next provider context.
           // Regenerate in this same agent; no extra child or slot is created.
-          await ctx.appendMessages(id, [{ role: "user", timestamp: Date.now(), content:
-            "Your last final report was rejected: " + checked.errors.join(", ") + ". " +
-            "Regenerate the complete answer from the retained evidence in this same agent. Keep it concise enough to fit the output budget. Do not delegate a replacement. " +
-            (report.required_sections.length ? "Required Markdown headings: " + JSON.stringify(report.required_sections) + ". " : "") +
-            "Close code fences, omit protocol tokens from prose, and finish with the exact standalone line " + REPORT_END + "." }],
-            { expected_revision: prepared.revision });
+          await context.repairReport(id, checked.errors, prepared.revision);
           nextTurn = turn + 1;
           continue;
         }
         const observed = tokenUsage(reply.usage);
-        await ctx.appendMessages(id, [reply], { expected_revision: prepared.revision, tools_signature: prepared.tools_signature,
+        await context.appendMessages(id, [reply], { expected_revision: prepared.revision, tools_signature: prepared.tools_signature,
           ...(observed ? { context_tokens: observed.total_tokens } : {}) });
         await fiber.record({ type: "agent_report_validated", model, turn, call_index: run.own.calls,
           required_sections: report.required_sections, rejected_reports: report.rejected_reports });
@@ -341,14 +329,14 @@ export async function onHandle(input: AgentInput): Promise<{
           ...(input.resume_id ? { resumed_from: input.resume_id, previous_usage: previousUsage, previous_total_usage: previousTotalUsage } : {}) };
       }
       const observed = tokenUsage(reply.usage);
-      await ctx.appendMessages(id, [reply], { expected_revision: prepared.revision, tools_signature: prepared.tools_signature,
+      await context.appendMessages(id, [reply], { expected_revision: prepared.revision, tools_signature: prepared.tools_signature,
         ...(observed ? { context_tokens: observed.total_tokens } : {}) });
       safe = false;
       if (lease !== undefined) await checkpoints.update(lease, { ...lastReady!, phase: "tools_pending", pending_tools: calls });
       toolCalls += calls.length;
-      const offered = context.tools.map(tool => tool.name);
+      const offered = requestContext.tools.map(tool => tool.name);
       const results = await Promise.all(calls.map(call => runTool(call, offered, policy!)));
-      await ctx.appendMessages(id, results);
+      await context.appendToolResults(id, results);
       const approvals = results.flatMap(result => result.approval_requests ?? []);
       if (approvals.length) {
         approvalRequired = true;
@@ -388,7 +376,7 @@ export async function onHandle(input: AgentInput): Promise<{
       if (run) await fiber.record({ type: "agent_usage", model, status: approvalRequired ? "approval_required" : completed ? "completed" : "failed", usage: usageSummary(run.own), total_usage: totalUsageSummary(run) });
     } finally {
       activeUsage.delete(current.id);
-      try { if (id !== undefined) await ctx.closeConversation(id); }
+      try { await context.closeConversation(id ?? null); }
       finally {
         unwatch();
         if (lease !== undefined) {
@@ -575,8 +563,9 @@ async function completeTurn(
 }
 
 async function prepareForTurn(id: string, profile: ModelProfile, model: string, turn: number, run: RunUsage): Promise<PreparedContext> {
-  const recovery = (await ctx.contextConfig()).compaction;
-  let prepared: PreparedContext = await ctx.prepareContext(id, { defer_compaction: turn < run.compaction_retry_after });
+  const recovery = (await context.contextConfig()).compaction;
+  let prepared: PreparedContext = await context.prepareContext(id, {
+    defer_compaction: turn < run.compaction_retry_after, agent_state: (await fiber.childBudget("agent")) ?? undefined });
   while (prepared.compaction) {
     const started = Date.now();
     const plan = prepared.compaction;
@@ -593,8 +582,8 @@ async function prepareForTurn(id: string, profile: ModelProfile, model: string, 
         const text = blocks.filter(block => block.type === "text").map(block => block.text ?? "").join("");
         const usage = tokenUsage(reply.usage);
         result = usage && usage.output_tokens > 0
-          ? await ctx.commitCompaction(id, prepared.revision, text, usage.output_tokens)
-          : await ctx.commitCompaction(id, prepared.revision, text);
+          ? await context.commitCompaction(id, prepared.revision, text, usage.output_tokens)
+          : await context.commitCompaction(id, prepared.revision, text);
         break;
       } catch (error) {
         failure = error instanceof Error ? error.message : String(error);
@@ -607,9 +596,9 @@ async function prepareForTurn(id: string, profile: ModelProfile, model: string, 
       }
     }
     if (!result) {
-      await ctx.cancelCompaction(id, prepared.revision);
+      await context.cancelCompaction(id, prepared.revision);
       run.compaction_retry_after = turn + recovery.failure_cooldown_turns + 1;
-      const fallback: PreparedContext = await ctx.prepareContext(id, { defer_compaction: true });
+      const fallback: PreparedContext = await context.prepareContext(id, { defer_compaction: true });
       if (!fallback.context) throw new Error("context compaction failed above the hard input budget: " + failure);
       await fiber.record({ type: "context_compaction_deferred", model, turn, reason: failure,
         retry_after_turn: run.compaction_retry_after, estimated_input_tokens: fallback.budget.estimated_input_tokens,
@@ -619,14 +608,21 @@ async function prepareForTurn(id: string, profile: ModelProfile, model: string, 
     run.compaction_retry_after = 0;
     await fiber.record({ type: "context_compaction", status: "completed", model, turn,
       ...result, duration_ms: Date.now() - started, input_budget_tokens: prepared.budget.input_budget_tokens });
-    prepared = await ctx.prepareContext(id);
+    prepared = await context.prepareContext(id);
   }
   return prepared;
 }
 
-async function runTool(call: Block, offered: string[], policy: AgentPolicy): Promise<Message> {
+function sameJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object" || Array.isArray(a) !== Array.isArray(b)) return false;
+  const left = Object.keys(a).sort(), right = Object.keys(b).sort();
+  return left.length === right.length && left.every((key, index) => key === right[index] && sameJson((a as any)[key], (b as any)[key]));
+}
+
+async function runTool(call: Block, offered: string[], policy: AgentPolicy): Promise<ToolOutcome> {
   const name = call.name ?? "";
-  let text: string;
+  let output: unknown;
   let isError = false;
   let approvals: unknown[] | undefined;
   try {
@@ -646,30 +642,30 @@ async function runTool(call: Block, offered: string[], policy: AgentPolicy): Pro
         const matches = approval?.request?.schema_version === 1 && approval.request.source?.fiber === current.id
           && typeof approval.request.id === "string" && approval.request.id.startsWith(current.id + ":tool-approval:")
           && approval.request.tool === name && approval.request.cwd === cwd
-          && JSON.stringify(approval.request.input) === JSON.stringify(input ?? null);
+          && sameJson(approval.request.input, input ?? null);
         if (!matches || !["approved", "rejected", "pending"].includes(approval?.status)) throw new Error("invalid tool approval response");
         if (approval.status === "rejected") throw new Error("tool approval rejected by user or environment");
       }
     }
     if (approval?.status === "approved") await fiber.record({ type: "tool_approved", tool: name, approval });
-    const output = approval?.status === "pending" ? { status: "approval_required", approval } : await tool(input);
-    text = typeof output === "string" ? output : JSON.stringify(output);
-    if (output && typeof output === "object" && output.status === "approval_required") {
-      approvals = Array.isArray(output.approval_requests) && output.approval_requests.length ? output.approval_requests : [output.approval ?? { tool: name, reason: "approval_required" }];
+    output = approval?.status === "pending" ? { status: "approval_required", approval } : await tool(input);
+    if (output && typeof output === "object" && (output as any).status === "approval_required") {
+      const pending = output as any;
+      approvals = Array.isArray(pending.approval_requests) && pending.approval_requests.length ? pending.approval_requests : [pending.approval ?? { tool: name, reason: "approval_required" }];
     }
   } catch (e) {
     isError = true;
-    text = e instanceof Error ? e.message : String(e);
+    output = e instanceof Error ? e.message : String(e);
     if (name === "agent") {
-      try { await fiber.record({ type: "agent_tool_error", reason: text }); } catch { /* preserve the original tool error */ }
+      try { await fiber.record({ type: "agent_tool_error", reason: output }); } catch { /* preserve the original tool error */ }
     }
   }
-  return { role: "toolResult", toolCallId: call.id, toolName: name, content: [{ type: "text", text }], isError, timestamp: Date.now(), ...(approvals ? { approval_requests: approvals } : {}) } as Message;
+  return { id: call.id ?? "", name, output, isError, ...(approvals ? { approval_requests: approvals } : {}) };
 }
 
 /** Offer this plugin to the model so agents can start child agents. */
 export async function onLoad() {
-  await plugins.context.loaded;
-  await ctx.registerTool("agent");
+  await context.loaded;
+  await context.registerTool("agent");
   return { reportExternalModelCall };
 }

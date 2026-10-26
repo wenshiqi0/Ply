@@ -1895,6 +1895,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2242,6 +2255,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2388,7 +2407,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wendy-cli"
+name = "ply-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2397,11 +2416,11 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "wendy-kernel",
+ "ply-kernel",
 ]
 
 [[package]]
-name = "wendy-core"
+name = "ply-core"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -2409,7 +2428,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wendy-io"
+name = "ply-io"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -2417,11 +2436,11 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "wendy-storage",
+ "ply-storage",
 ]
 
 [[package]]
-name = "wendy-jsc"
+name = "ply-jsc"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -2430,16 +2449,18 @@ dependencies = [
  "oxc_ecmascript",
  "pulldown-cmark",
  "reqwest",
+ "serde",
  "serde_json",
+ "serde_yaml_ng",
  "tempfile",
  "tokio",
- "wendy-core",
- "wendy-libc",
- "wendy-sh",
+ "ply-core",
+ "ply-libc",
+ "ply-sh",
 ]
 
 [[package]]
-name = "wendy-kernel"
+name = "ply-kernel"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -2449,20 +2470,20 @@ dependencies = [
  "tempfile",
  "tokio",
  "unicode-width",
- "wendy-core",
- "wendy-jsc",
+ "ply-core",
+ "ply-jsc",
 ]
 
 [[package]]
-name = "wendy-libc"
+name = "ply-libc"
 version = "0.1.0"
 dependencies = [
  "tokio",
- "wendy-io",
+ "ply-io",
 ]
 
 [[package]]
-name = "wendy-sh"
+name = "ply-sh"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -2470,13 +2491,13 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "wendy-io",
- "wendy-libc",
- "wendy-storage",
+ "ply-io",
+ "ply-libc",
+ "ply-storage",
 ]
 
 [[package]]
-name = "wendy-storage"
+name = "ply-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",

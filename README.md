@@ -1,8 +1,10 @@
-# wendy
+# ply
 
-一个 agent harness。Rust 是主核心，插件用 TS 写。一个插件最多导出两个钩子：`onHandle(input)` 每次调用运行一次，每次运行是内核调度的一个 fiber；`onLoad()` 在加载时运行一次，返回的东西挂到全局的 `ctx` 上。通过 `import plugins from "wendy:plugins"` 获取插件目录；`await plugins.bash({ command })` 的那一刻就是调用。CLI 入口通过 `wendy:commands` 在 onLoad 注册，见 [命令与模块接口](docs/commands.md)。
+命令、模块和配置统一使用 ply，见 [改名说明](docs/rename.md)。
 
-wendy 记录的是 fiber：每个 fiber 的输入、运行中主动记录的数据、输出（或错误），以及谁等待了谁。文件 API 通过挂载访问存储，后端可以在磁盘、内存、数据库之间切换；系统进程保留宿主权限，挂载不等于 OS 沙箱。
+一个 agent harness。Rust 是主核心，插件用 TS 写。一个插件最多导出两个钩子：`onHandle(input)` 每次调用运行一次，每次运行是内核调度的一个 fiber；`onLoad()` 在加载时运行一次，返回的接口通过 `import { context } from "ply:plugins"` 这样的具名句柄访问。通过 `import plugins from "ply:plugins"` 获取动态插件目录；`await plugins.bash({ command })` 的那一刻就是调用。CLI 入口通过 `ply:commands` 在 onLoad 注册，见 [命令与模块接口](docs/commands.md)。
+
+ply 记录的是 fiber：每个 fiber 的输入、运行中主动记录的数据、输出（或错误），以及谁等待了谁。文件 API 通过挂载访问存储，后端可以在磁盘、内存、数据库之间切换；系统进程保留宿主权限，挂载不等于 OS 沙箱。
 
 设计细节见 [docs/design.md](docs/design.md)，当前能力及验收范围见 [docs/capabilities.md](docs/capabilities.md)，插件事件和 bash hook 见 [docs/plugin-events.md](docs/plugin-events.md)，Jev 安全订阅插件见 [docs/jev.md](docs/jev.md)，环境审批协议见 [docs/approval.md](docs/approval.md)。
 
@@ -11,7 +13,7 @@ wendy 记录的是 fiber：每个 fiber 的输入、运行中主动记录的数�
 一个目录就是一个插件，目录名就是插件名，`main.ts` 用具名导出提供钩子：
 
 ```ts
-import plugins from "wendy:plugins";
+import plugins, { context } from "ply:plugins";
 // todos/main.ts
 
 /** Count TODO lines in a file. */
@@ -26,19 +28,21 @@ export async function onHandle(input: { path: string }): Promise<{ todos: number
 
 /** Offer this plugin to the model as a tool. */
 export async function onLoad() {
-  await plugins.context.loaded;          // 等 context 插件加载完
-  await ctx.registerTool("todos");     // 调用它挂在 ctx 上的函数
+  await context.loaded;                  // 等 context 插件加载完
+  await context.registerTool("todos");     // 调用它挂在 ctx 上的函数
 }
 ```
 
-- **`onHandle`**：`plugins.todos(input)` 被 await 时运行。它上面的 JSDoc 是插件的描述，参数类型和返回类型就是输入和输出（wendy 加载时从签名里读出来）。参数校验由插件负责；agent 权限由插件收窄，fiber 归属与子任务配额由内核执行。
-- **`onLoad`**：加载时在后台运行。
-  - 返回的对象平铺挂到 `ctx` 上：数据是一份拷贝，函数在挂载它的插件里执行。
+- **`onHandle`**：`plugins.todos(input)` 被 await 时运行。它上面的 JSDoc 是插件的描述，参数类型和返回类型就是输入和输出（ply 加载时从签名里读出来）。参数校验由插件负责；agent 权限由插件收窄，fiber 归属与子任务配额由内核执行。
+- **`onLoad(options)`**：加载时在后台运行，接收宿主为该插件配置的 JSON，未指定时为 `{}`；参数由插件自己解释。
+  - 返回的接口通过对应插件句柄访问：数据是一份拷贝，函数在所属插件里执行；现有 ctx 平铺入口保留。
   - 同名的成员，后挂载的覆盖先挂载的。
   - 可以 `await plugins.xxx.loaded` 等别的插件加载完，不受加载顺序影响。
 - **共享闭包**：同一个插件的多次执行共享模块里的闭包，在 `await` 处交替执行。
 - **可以列举插件**：`Object.keys(plugins)` 列出已加载的插件；有 `onHandle` 的插件还带 `plugins.x.parameters`，即它作为工具时的参数 schema。
 - **node 模块照常用**（`fs`、`path`、`child_process` 等），类型声明见 [packages/sdk/globals.d.ts](packages/sdk/globals.d.ts)。
+
+上下文插件入口统一为 `import { context } from "ply:plugins"`。其他插件用 `context.set({type:context.Type.Extensions,key:"skills",content})` 提供内容，不指定数字 order，也不注册构建回调。类型控制顺序和更新策略，详见 [Context](docs/context.md)。
 
 ## 内置插件
 
@@ -47,50 +51,51 @@ export async function onLoad() {
 | 插件 | 钩子 | 做什么 |
 |---|---|---|
 | [agent](plugins/agent/main.ts) | onHandle、onLoad | 用语言模型完成一个任务，并把自己注册到 context，允许模型开启子 agent |
-| [context](plugins/context/main.ts) | onLoad | 管理模型看到的东西：注册进来的工具、要用的模型、进行中的对话（过长的工具输出会被截短） |
+| [context](plugins/context/main.ts) | onLoad | 按 Rules/Project/Extensions/State/Reference 管理上下文，冻结前缀并追加状态更新，负责工具快照、预算、压缩和恢复 |
 | [deepseek](plugins/deepseek/main.ts) | onLoad | 本机的 DeepSeek 接入：告诉 context 用 `deepseek-v4-flash`，key 在 `DEEPSEEK_API_KEY` |
 | [approval](plugins/approval/main.ts) | onLoad | 可选的审批策略与协调插件；通过 approval.request / toolRequest 对接环境适配器，不自行批准 |
 | [tui](plugins/tui/main.ts) | onHandle、onLoad | 可选的终端交互与工具审批界面；只调用 agent，工具集和委派由 agent 管理 |
 | [jev](plugins/jev/main.ts) | onLoad | 可选的 TypeSafe Jev 原生安全检查器，订阅 bash.beforeExecute；用 --jev 启用，密钥在宿主 TYPESAFE_API_KEY |
 | [mimo](plugins/mimo/main.ts) | onLoad | 可选的 MiMo V2.6 接入，key 在宿主的 `MIMO_API_KEY`，支持 Token Plan 和按量付费 API |
-| [bash](plugins/bash/main.ts) | onHandle、onLoad | 用内部 Wendy sh 执行脚本；执行前等待 bash.beforeExecute，并把自己注册到 context |
+| [bash](plugins/bash/main.ts) | onHandle、onLoad | 用内部 Ply sh 执行脚本；执行前等待 bash.beforeExecute，并把自己注册到 context |
 | [create](plugins/create/main.ts) | onHandle、onLoad | 新建文件，并把自己注册到 context |
 | [edit](plugins/edit/main.ts) | onHandle、onLoad | 精确替换文件里的一段文字，并把自己注册到 context |
 | [read](plugins/read/main.ts) | onHandle、onLoad | 从挂载存储读取 UTF-8 文本，支持按行分页，并把自己注册到 context |
 | [remove](plugins/remove/main.ts) | onHandle、onLoad | 删除文件或目录，并把自己注册到 context |
+| [skill](plugins/skill/main.ts) | onLoad | 接受插件参数，发现 SKILL.md 元数据并注入上下文，模型通过 read 加载指令；使用方式见 [Skills](docs/skills.md) |
 
 fiber 的归属由消费方的异步续体携带，共享 Promise 后也保持独立父子关系。异常、取消和 CPU 超限按所属调用隔离；Rust 可用 `Kernel::cancel_fiber(id)` 请求取消，父任务取消会传播到等待中的子任务。JSONL 的结束状态区分 `done`、`failed`、`cancelled` 和 `budget_exceeded`（CPU/内存）；独立的 `cleanup` 事件记录清理归属和结果。同插件仍共享闭包及线程，内存阈值仍是全进程水位。详见 [fiber 调度与隔离](docs/design.md#4-同一个插件的多个-fiber)。
 
 context、deepseek 和 mimo 没有 `onHandle`，不能被调用，也不会作为工具透出给模型或 MCP 客户端。
 
-模型可见的 `bash` 工具统一使用 **Wendy sh**。保留 `command` / `cwd` / `timeout_ms` 入参及原有输出字段；每次调用新建 shell，脚本内的状态和 cwd 独立。支持内部解释器的语法、builtin 和自带工具，未注册命令返回 127，不自动调用宿主程序或系统 shell。只读挂载、内存/SQLite 存储也对 shell 生效；其他插件的 `node:child_process` 仍按其自身接口工作。支持范围及缓冲管道限制见 [wendy-sh](crates/wendy-sh/README.md)。
+模型可见的 `bash` 工具统一使用 **Ply sh**。保留 `command` / `cwd` / `timeout_ms` 入参及原有输出字段；每次调用新建 shell，脚本内的状态和 cwd 独立。支持内部解释器的语法、builtin 和自带工具，未注册命令返回 127，不自动调用宿主程序或系统 shell。只读挂载、内存/SQLite 存储也对 shell 生效；其他插件的 `node:child_process` 仍按其自身接口工作。支持范围及缓冲管道限制见 [ply-sh](crates/ply-sh/README.md)。
 
-`bash.beforeExecute` 覆盖整个工具调用，所有监听器异步完成且未拒绝后才进入 sh，包含重定向和命令替换在内的脚本内容都尚未执行。普通 hook 返回 `false` / `{allow:false, reason}` 是硬拒绝；带 requires_approval:true 的风险结果进入环境审批。批准后继续，缺少适配器时返回 approval_required。`timeout_ms` 包含检查与执行时间，审批等待单独计时。Wendy sh 没有 shell 进程信号，因此 `signal` 为 null，超时仍通过 `timed_out` 表示。
+`bash.beforeExecute` 覆盖整个工具调用，所有监听器异步完成且未拒绝后才进入 sh，包含重定向和命令替换在内的脚本内容都尚未执行。普通 hook 返回 `false` / `{allow:false, reason}` 是硬拒绝；带 requires_approval:true 的风险结果进入环境审批。批准后继续，缺少适配器时返回 approval_required。`timeout_ms` 包含检查与执行时间，审批等待单独计时。Ply sh 没有 shell 进程信号，因此 `signal` 为 null，超时仍通过 `timed_out` 表示。
 
-可用 `--jev` 启用 [Jev 安全检查](docs/jev.md)，自动审查需在宿主环境配置 `TYPESAFE_API_KEY`。它独立调用 TypeSafe `/v1/systemone`，批量评估命令风险概率并按本地阈值生成放行/高风险/复核建议，不更换主 agent 模型。未配置密钥、失败、高风险或待复核会请求确认/审批；可用 [wendy tui](docs/tui.md) 进行真实终端确认，其他入口没有适配器时返回 approval_required。默认不加载 Jev；--jev 同时加载通用审批协调插件。环境模板见 [examples/jev.env.example](examples/jev.env.example)。
+可用 `--jev` 启用 [Jev 安全检查](docs/jev.md)，自动审查需在宿主环境配置 `TYPESAFE_API_KEY`。它独立调用 TypeSafe `/v1/systemone`，批量评估命令风险概率并按本地阈值生成放行/高风险/复核建议，不更换主 agent 模型。未配置密钥、失败、高风险或待复核会请求确认/审批；可用 [ply tui](docs/tui.md) 进行真实终端确认，其他入口没有适配器时返回 approval_required。默认不加载 Jev；--jev 同时加载通用审批协调插件。环境模板见 [examples/jev.env.example](examples/jev.env.example)。
 
 读取文件优先用 `read`：`path` 必填，`offset` 是从 1 开始的行号（默认 1），`limit` 是最多返回的行数（默认 200）。返回原始文本 `content`、本页起始行 `offset`、返回行数 `lines`、文件总行数 `total_lines` 和 `has_more`；下一页从 `offset + lines` 开始。空文件返回空文本和 0 行。分页限制返回内容，底层仍一次读取整个文件。
 
 agent 在自己的 JSC realm 内运行内嵌的 [pi-ai](https://github.com/earendil-works/pi/tree/main/packages/ai) 模型层，当前支持 DeepSeek 和 MiMo。运行时无需 Node、npm 或全局安装 Pi；配置宿主的 `DEEPSEEK_API_KEY` 即可使用默认 DeepSeek：
 
 ```bash
-./target/debug/wendy call --record fibers.jsonl agent '{"prompt": "把 app.py 的输出改成 hello, wendy，然后运行验证"}'
+./target/debug/ply call --record fibers.jsonl agent '{"prompt": "把 app.py 的输出改成 hello, ply，然后运行验证"}'
 ```
 
 MiMo 默认使用中国区 Token Plan（`xiaomi-token-plan-cn`，`https://token-plan-cn.xiaomimimo.com/v1`），密钥只从宿主的 `MIMO_API_KEY` 读取，不注入插件的 `process.env` 或日志。先在终端配置对应服务的密钥，再选择模型：
 
 ```bash
-./target/debug/wendy call --model mimo-v2.6-pro --record mimo-fibers.jsonl agent '{"prompt": "只读总结这个项目，不修改文件"}'
-./target/debug/wendy call --model mimo-v2.6-flash agent '{"prompt": "只读检查 README 中的命令是否与实现一致"}'
+./target/debug/ply call --model mimo-v2.6-pro --record mimo-fibers.jsonl agent '{"prompt": "只读总结这个项目，不修改文件"}'
+./target/debug/ply call --model mimo-v2.6-flash agent '{"prompt": "只读检查 README 中的命令是否与实现一致"}'
 ```
 
 `--mimo-provider` 可选 `xiaomi`（按量付费）、`xiaomi-token-plan-cn`、`xiaomi-token-plan-sgp`、`xiaomi-token-plan-ams`。每种服务都从 `MIMO_API_KEY` 取密钥，但按量密钥与 Token Plan 密钥不能互换。例如按量 API：
 
 ```bash
-./target/debug/wendy call --model mimo-v2.6-pro --mimo-provider xiaomi agent '{"prompt": "只读总结这个项目"}'
+./target/debug/ply call --model mimo-v2.6-pro --mimo-provider xiaomi agent '{"prompt": "只读总结这个项目"}'
 ```
 
-`mimo-v2.6-pro-ultraspeed` 仅在 `--mimo-provider xiaomi` 下开放。MiMo 默认开启思考，历史思考内容随工具调用一起透传；token、推理量和缓存命中率沿用 agent 的统一记录。Token Plan 的 SDK cost 元数据为占位值，不能解读为免费，也不能当作套餐扣减金额；Wendy 不把它输出为实际费用。
+`mimo-v2.6-pro-ultraspeed` 仅在 `--mimo-provider xiaomi` 下开放。MiMo 默认开启思考，历史思考内容随工具调用一起透传；token、推理量和缓存命中率沿用 agent 的统一记录。Token Plan 的 SDK cost 元数据为占位值，不能解读为免费，也不能当作套餐扣减金额；Ply 不把它输出为实际费用。
 
 MiMo 当前型号与协议依据 [官方型号说明](https://mimo.mi.com/docs/en-US/quick-start/model)、[API 文档](https://mimo.mi.com/docs/en-US/api/chat) 和 [套餐支持说明](https://mimo.mi.com/docs/en-US/quick-start/faq/token-plan/Plans%26Pricing)，定义核对日期为 2026-10-24。V2.5 模型 ID 已退役，不做旧型号替换。MiMo 插件提供显式 V2.6 模型定义。`--no-default-plugins` 下可通过 `--plugin ./plugins/mimo` 手动加载；不要同时加载 deepseek 和 mimo。
 
@@ -104,7 +109,7 @@ npm ci --ignore-scripts --registry=https://registry.npmjs.org
 npm run build
 ```
 
-依赖锁在 `packages/pi-ai/package-lock.json`，pi-ai 固定为 `0.82.1`；生成文件及第三方声明在 `crates/wendy-jsc/src/vendor/`。`WENDY_PI_AI` 和运行时外部 Node 桥已移除。OAuth、Bedrock 和其他 provider 未接入本轮运行时。
+依赖锁在 `packages/pi-ai/package-lock.json`，pi-ai 固定为 `0.82.1`；生成文件及第三方声明在 `crates/ply-jsc/src/vendor/`。`PLY_PI_AI` 和运行时外部 Node 桥已移除。OAuth、Bedrock 和其他 provider 未接入本轮运行时。
 
 agent 每次调用工具都是它的子 fiber，记录里能看到完整的过程。`agent` 本身也是模型可见的工具：模型调用 `agent({ prompt, allowed_tools?, max_delegation_depth?, max_children?, report_sections?, max_turns? })` 时，会运行一个子 agent，父 agent 等它完成，结果作为工具输出返回；同一轮发起的多个子 agent 按现有工具调度并发运行。
 
@@ -113,16 +118,16 @@ agent 每次调用工具都是它的子 fiber，记录里能看到完整的过�
 只读、仅允许一层子任务的例子（工具白名单仍需配合可信插件使用，不等于 OS 沙箱）：
 
 ```bash
-./target/debug/wendy call agent '{"prompt":"启动两个子 agent 只读评审项目，再汇总", "allowed_tools":["read","agent"], "max_delegation_depth":1, "max_children":2, "report_sections":["架构判断","发现","验证边界"]}'
+./target/debug/ply call agent '{"prompt":"启动两个子 agent 只读评审项目，再汇总", "allowed_tools":["read","agent"], "max_delegation_depth":1, "max_children":2, "report_sections":["架构判断","发现","验证边界"]}'
 ```
 
 `allowed_tools` 省略时取已注册工具的快照；子任务继承并与父权限取交集，显式请求父级没有的工具或更深委派会报错。`max_delegation_depth:0` 禁止委派，`2` 允许孙任务。使用提示词限制工作范围时，仍应同时设置这些结构化权限。
 
 `max_children` 是每个 agent 累计创建直属子 agent 的硬上限，主调用默认 **2**；不是并发数，也不限制读取文件等普通工具。内核在同一把锁下检查名额并预占，超额请求在创建子 fiber 前拒绝。已启动后失败、完成、取消以及替换/恢复调用都不退还名额；拒绝创建的请求不占新名额。`0` 会移除 `agent` 工具；子级继承父级的上限并只能收窄，和代数限制分别生效。返回值的 `delegation` 给出 `limit`、`started`、`remaining`。
 
-CLI 的 `--agent-max-children COUNT` 设置主调用默认值，主调用 JSON 中的 `max_children` 优先。Rust 宿主可通过 `KernelConfig.env["WENDY_AGENT_MAX_CHILDREN"]` 设置同一默认值。模型轮数仍默认不限。
+CLI 的 `--agent-max-children COUNT` 设置主调用默认值，主调用 JSON 中的 `max_children` 优先。Rust 宿主可通过 `KernelConfig.env["PLY_AGENT_MAX_CHILDREN"]` 设置同一默认值。模型轮数仍默认不限。
 
-最终报告必须正常停止、非空、代码围栏闭合，正文不得残留 DSML/工具控制标记；代码中的协议示例允许保留。内部使用独立结束标记 `[[WENDY_REPORT_COMPLETE]]`，返回前删除。`report_sections` 可要求指定 Markdown 标题及非空内容；省略时只检查通用完整性。标题要求自动传给子 agent，子级和恢复调用只能增加要求。CLI 可重复传 `--agent-report-section HEADING`，Rust 配置为 `KernelConfig.env["WENDY_AGENT_REPORT_SECTIONS"]` 的 JSON 字符串数组。
+最终报告必须正常停止、非空、代码围栏闭合，正文不得残留 DSML/工具控制标记；代码中的协议示例允许保留。内部使用独立结束标记 `[[PLY_REPORT_COMPLETE]]`，返回前删除。`report_sections` 可要求指定 Markdown 标题及非空内容；省略时只检查通用完整性。标题要求自动传给子 agent，子级和恢复调用只能增加要求。CLI 可重复传 `--agent-report-section HEADING`，Rust 配置为 `KernelConfig.env["PLY_AGENT_REPORT_SECTIONS"]` 的 JSON 字符串数组。
 
 校验失败写 `agent_report_rejected`，在原 agent 内继续生成完整报告，不创建替代 agent，不把有问题的原文放回模型历史；后续模型调用照常计入 usage。通过后写 `agent_report_validated`，返回 `report_validation`（要求的章节及累计拒绝次数）。这是格式和完成状态校验，不证明结论正确或证据充分；默认不限制修复轮数。带半截工具调用的 `length` 响应仍立即失败并保留可恢复状态，不执行部分参数。
 
@@ -147,16 +152,16 @@ agent 的返回结果同时带两份用量汇总：`usage` 只统计当前 agent
 
 `onDispose` 清理在执行第一条回调前就启动 **2 秒墙钟期限**，所有回调共享该期限。超时直接设置同一取消信号，CPU watchdog（约 100 ms 检查）和同步 fs/exec 等待可观察到取消，随后撤销所属定时器、HTTP、宿主等待和排队续体，阻止超时后的成功返回。清理调用排入下一次 realm 调度，避免嵌套在失败调用的 JS 栈中执行。回调先整批移出注册表；单条异常会继续执行后续回调并将整批标为失败，超时则停止剩余回调，禁止清理中再次注册清理。整批完成时同样撤销遗留的清理定时器、宿主等待及续体，未 await 的清理工作不能继续占用 realm；普通成功调用仍保留原有的 Node 风格定时器行为。
 
-`--record` 的 `event:"cleanup"` 包含清理调用 `id`、`realm`、所属 fiber `owner`、`status` 和可选 `error`；状态为 `started` 及一次 `done` / `failed` / `timed_out` / `cancelled`。它与 fiber 的 `exit` 独立，可能在其后出现。截止表示请求取消并收回 Wendy 的等待与续体，JSC 中断存在检查间隔；已经发生的写入和不能中止的 OS 系统调用不会回滚。
+`--record` 的 `event:"cleanup"` 包含清理调用 `id`、`realm`、所属 fiber `owner`、`status` 和可选 `error`；状态为 `started` 及一次 `done` / `failed` / `timed_out` / `cancelled`。它与 fiber 的 `exit` 独立，可能在其后出现。截止表示请求取消并收回 Ply 的等待与续体，JSC 中断存在检查间隔；已经发生的写入和不能中止的 OS 系统调用不会回滚。
 
 ## 上下文预算与压缩
 
 默认总窗口为 **131072 token**，其中预留 **16384 token** 给输出，可用输入预算为 **114688 token**。配置窗口还会受模型目录或显式模型定义的真实窗口约束；输出预留同时是每次任务回复的 `maxTokens`，不会超过模型的最大输出。窗口约束单次模型请求，不限制累计 token 或模型轮数；每个主、子 agent 会话独立应用同一配置。
 
 ```bash
-./target/debug/wendy call --context-config examples/context.json --record fibers.jsonl agent '{"prompt":"完整评审这个项目"}'
+./target/debug/ply call --context-config examples/context.json --record fibers.jsonl agent '{"prompt":"完整评审这个项目"}'
 
-./target/debug/wendy call --max-context-tokens 262144 --context-reserve-tokens 16384 --context-compact-trigger 0.8 --context-compact-target 0.5 agent '{"prompt":"继续长任务"}'
+./target/debug/ply call --max-context-tokens 262144 --context-reserve-tokens 16384 --context-compact-trigger 0.8 --context-compact-target 0.5 agent '{"prompt":"继续长任务"}'
 ```
 
 [examples/context.json](examples/context.json) 的字段：
@@ -174,7 +179,7 @@ agent 的返回结果同时带两份用量汇总：`usage` 只统计当前 agent
 | `compaction.retry_delay_ms` | 500 | 重试间隔，范围 0–60000 ms |
 | `compaction.failure_cooldown_turns` | 2 | 预算允许延后时，暂停软压缩的任务轮数，范围 0–100 |
 
-显式 CLI 参数覆盖 JSON 文件，未配置项使用默认值。`--context-compaction off` 关闭自动压缩。JSON 中未知字段、非正整数、无效比例及矛盾预算会报错；不自动读取当前目录中的配置文件。Rust 宿主可把同样的 JSON 写入 `KernelConfig.env["WENDY_CONTEXT_CONFIG"]`。
+显式 CLI 参数覆盖 JSON 文件，未配置项使用默认值。`--context-compaction off` 关闭自动压缩。JSON 中未知字段、非正整数、无效比例及矛盾预算会报错；不自动读取当前目录中的配置文件。Rust 宿主可把同样的 JSON 写入 `KernelConfig.env["PLY_CONTEXT_CONFIG"]`。
 
 每次模型调用前检查预算。第一次按 UTF-8 字节数/2 加消息与工具定义开销作保守估算；收到有效 usage 后，用该次实际输入+输出作为历史前缀锚点，只估算后续新增内容。**这是估算保护，不是供应商 tokenizer 的精确计数**；记录会标明估算来源、有效窗口、输入预算、触发值和目标值。
 
@@ -182,10 +187,10 @@ agent 的返回结果同时带两份用量汇总：`usage` 只统计当前 agent
 
 摘要生成、内容校验、上下文版本核对成功后才替换旧历史。空摘要、截断摘要、工具调用、失败响应都保留旧历史并有限重试。重试耗尽但仍在输入硬预算内时，延后软压缩并继续任务；冷却期内超过硬预算仍必须重新压缩，不发送超预算请求。
 
-无法继续时，在宿主私有目录 `$HOME/.local/state/wendy/checkpoints/` 保存原任务、已完成交互、摘要、模型配置、权限、已消耗的直属子 agent 名额、报告校验状态和下一轮位置，错误及 `agent_checkpoint` 事件会给出 `resume_id`。`WENDY_CHECKPOINT_DIR` 可指定其他绝对路径；目录权限 0700、文件 0600，写入采用临时文件 + fsync + 原子替换。快照可能含任务/文件内容，不包含宿主 API key；它不依赖工作区可写权限。
+无法继续时，在宿主私有目录 `$HOME/.local/state/ply/checkpoints/` 保存原任务、已完成交互、摘要、模型配置、权限、已消耗的直属子 agent 名额、报告校验状态和下一轮位置，错误及 `agent_checkpoint` 事件会给出 `resume_id`。`PLY_CHECKPOINT_DIR` 可指定其他绝对路径；目录权限 0700、文件 0600，写入采用临时文件 + fsync + 原子替换。快照可能含任务/文件内容，不包含宿主 API key；它不依赖工作区可写权限。
 
 ```bash
-./target/debug/wendy call agent '{"resume_id":"错误信息中的恢复 ID"}'
+./target/debug/ply call agent '{"resume_id":"错误信息中的恢复 ID"}'
 ```
 
 **快照格式已升级为 2；旧格式明确拒绝恢复，需发起新任务，不进行自动迁移。** 恢复时须使用相同工作目录，会重算当前窗口预算、重新检查工具权限，不能扩大原授权；已花费的子 agent 名额和报告校验状态保留，不能通过恢复重置。恢复记录有跨进程互斥锁，成功后删除快照；工具执行到一半的状态不自动重放。恢复过程在执行工具前标记 `tools_pending`，工具结果全部保存后才回到 `ready`，避免崩溃后重复有副作用的调用。原始模型轮数延续，但 `max_turns` 限制的是这次调用新增轮数；usage/call_index 按本次 fiber 重新记录，历史累计以 `previous_usage` / `previous_total_usage` 单列，不重复累加进祖先。持久化失败会明确报告。单个不可拆交互过大时，仍需减少工具输出或提高预算。
@@ -195,52 +200,55 @@ agent 的返回结果同时带两份用量汇总：`usage` 只统计当前 agent
 ## 试一下
 
 ```bash
-cargo build -p wendy-cli
+cargo build -p ply-cli
 ```
 
 交互任务与终端权限审批：
 
 ```bash
-./target/debug/wendy tui --record /tmp/wendy-tui.jsonl
+./target/debug/ply tui --record /tmp/ply-tui.jsonl
 ```
 
-显式跳过人工确认可用 `wendy tui --bypass`；界面会显示 BYPASS，工具授权、子 agent 上限、挂载限制和普通 hook 的硬拒绝仍生效。
+显式跳过人工确认可用 `ply tui --bypass`；界面会显示 BYPASS，工具授权、子 agent 上限、挂载限制和普通 hook 的硬拒绝仍生效。
 
-TUI 将用户输入交给 agent，不直接调用 read/bash 等业务工具，也不额外传工具白名单。主 agent 默认支持六个工具，子 agent 按现有委派限制移除 agent。CLI 为 TUI 选择逐次审批策略，读取、写入、命令执行和模型委派均需确认；可加 `--jev` 显示 bash 风险评估。详见 [TUI 使用说明](docs/tui.md)。
+TUI 将用户输入交给 agent，不直接调用 read/bash 等业务工具，也不额外传工具白名单。主 agent 默认支持 agent/bash/create/edit/read/remove 六个工具，子 agent 按现有委派限制移除 agent。CLI 为 TUI 选择逐次审批策略，读取、写入、命令执行和模型委派均需确认；可加 `--jev` 显示 bash 风险评估。详见 [TUI 使用说明](docs/tui.md)。
+
+内置 `skill` 从启动目录下的 `.agents/skills`、`skills` 和 `SKILL.md` 发现技能。插件自己的 `onLoad({ paths })` 接受额外路径；CLI 示例：`ply tui --plugin-options 'skill={"paths":["./examples/skills"]}'`。元数据写入 context 的 Extensions 模板，完整指令由 read 按需读取，详见 [Skills](docs/skills.md)。
 
 默认把当前目录以读写方式挂在它自己的路径上：
 
 ```bash
-./target/debug/wendy tools
+./target/debug/ply tools
 ```
 
 ```bash
-./target/debug/wendy call read '{"path": "README.md", "offset": 1, "limit": 80}'
+./target/debug/ply call read '{"path": "README.md", "offset": 1, "limit": 80}'
 ```
 
 ```bash
-./target/debug/wendy call --record fibers.jsonl edit '{"path": "src/main.rs", "old_string": "hi", "new_string": "hello"}'
+./target/debug/ply call --record fibers.jsonl edit '{"path": "src/main.rs", "old_string": "hi", "new_string": "hello"}'
 ```
 
 ```bash
-./target/debug/wendy call --plugin ./todos todos '{"path": "README.md"}'
+./target/debug/ply call --plugin ./todos todos '{"path": "README.md"}'
 ```
 
 作为 MCP server 给 agent 用（例如 Claude Code）：
 
 ```bash
-claude mcp add wendy -- /path/to/wendy/target/debug/wendy mcp --record /tmp/wendy-fibers.jsonl
+claude mcp add ply -- /path/to/ply/target/debug/ply mcp --record /tmp/ply-fibers.jsonl
 ```
 
-直接运行一个 TS 文件（像 node 一样，定时器跑完才退出；通过 `wendy:plugins` 导入插件目录）：
+直接运行一个 TS 文件（像 node 一样，定时器跑完才退出；通过 `ply:plugins` 导入插件目录）：
 
 ```bash
-./target/debug/wendy run ./script.ts -- arg1
+./target/debug/ply run ./script.ts -- arg1
 ```
 
 选项：
 - `--mount SPEC`：`AT=disk:PATH[:ro]`、`AT=sqlite:PATH[:ro]`、`AT=memory`，或者 `disk:PATH[:ro]`（挂在它自己的绝对路径上），可以重复多次。
 - `--plugin DIR`：加载一个插件目录，可以重复多次。
+- `--plugin-options NAME=JSON`：把 JSON 传给对应插件的 onLoad；不同插件可重复，参数由插件解释。
 - `--jev`：启用 Jev bash 安全订阅插件，配置见 docs/jev.md。
 - `--model MODEL`：选择 `deepseek-*` 或 `mimo-*` 模型；使用默认插件时自动选择对应接入，未指定则保持 DeepSeek。
 - `--mimo-provider PROVIDER`：MiMo 的服务/地区，需同时指定 `--model mimo-*`，默认中国区 Token Plan。
@@ -251,14 +259,14 @@ claude mcp add wendy -- /path/to/wendy/target/debug/wendy mcp --record /tmp/wend
 
 | crate | 内容 |
 |---|---|
-| `wendy-storage` | 磁盘 / 内存 / SQLite 后端，同一套行为测试同时跑三种 |
-| `wendy-io` | 挂载表（mount / unmount / swap，只有挂载的路径存在）；在磁盘挂载上启动真实进程 |
-| `wendy-libc` | errno / path / fs / glob / time |
-| `wendy-jsc` | 内嵌 JavaScriptCore，直接运行 TS；每个插件一个 realm、一个线程；Node 风格 API、wendy 模块和 ctx/fiber |
-| `wendy-core` | 描述层：插件、输入输出的类型、`onLoad` 的挂载、fiber、fiber 事件和 hook |
-| `wendy-kernel` | 加载插件（读出签名、后台运行 `onLoad`、`ready`）、调度 fiber、维护插件目录/ctx/命令注册表、发出 fiber 事件、默认插件 |
-| `wendy-cli` | tools/call/mcp/run、commands、插件注册的顶层命令，内置 wendy tui |
-| `wendy-sh` | 内部 shell 解释器及工具集，通过 Wendy IO 执行模型 bash tool 的脚本 |
+| `ply-storage` | 磁盘 / 内存 / SQLite 后端，同一套行为测试同时跑三种 |
+| `ply-io` | 挂载表（mount / unmount / swap，只有挂载的路径存在）；在磁盘挂载上启动真实进程 |
+| `ply-libc` | errno / path / fs / glob / time |
+| `ply-jsc` | 内嵌 JavaScriptCore，直接运行 TS；每个插件一个 realm、一个线程；Node 风格 API、ply 模块和 ctx/fiber |
+| `ply-core` | 描述层：插件、输入输出的类型、`onLoad` 的挂载、fiber、fiber 事件和 hook |
+| `ply-kernel` | 加载插件（读出签名、后台运行 `onLoad`、`ready`）、调度 fiber、维护插件目录/ctx/命令注册表、发出 fiber 事件、默认插件 |
+| `ply-cli` | tools/call/mcp/run、commands、插件注册的顶层命令，内置 ply tui |
+| `ply-sh` | 内部 shell 解释器及工具集，通过 Ply IO 执行模型 bash tool 的脚本 |
 
 ## 测试
 

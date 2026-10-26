@@ -1,12 +1,12 @@
 // Build-time Node only. The checked-in output is embedded by Rust's
-// include_str!; neither cargo builds nor Wendy executions invoke Node.
+// include_str!; neither cargo builds nor Ply executions invoke Node.
 import { build } from "esbuild";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const output = path.resolve(root, "../../crates/wendy-jsc/src/vendor/pi-ai.js");
+const output = path.resolve(root, "../../crates/ply-jsc/src/vendor/pi-ai.js");
 await mkdir(path.dirname(output), { recursive: true });
 const globals = "fetch, Headers, Response, Request, URL, URLSearchParams, AbortController, AbortSignal, ReadableStream, FormData";
 const result = await build({
@@ -16,12 +16,12 @@ const result = await build({
   bundle: true,
   platform: "browser",
   format: "iife",
-  globalName: "WendyPiAI",
+  globalName: "PlyPiAI",
   target: "es2022",
   minify: true,
   legalComments: "linked",
   metafile: true,
-  // Wendy exposes node-shaped globals to its plugins. This bundle uses the
+  // Ply exposes node-shaped globals to its plugins. This bundle uses the
   // browser paths, independently of those globals, in a private Web scope.
   define: { process: "undefined", "globalThis.process": "undefined" },
   plugins: [{
@@ -33,7 +33,7 @@ const result = await build({
     },
   }],
   banner: { js: `(function(host) {\nconst globalThis = Object.create((0, eval)("globalThis"));\nlet ${globals};` },
-  footer: { js: `\nconst web = WendyPiAI.createWeb(host);\n({ ${globals} } = web);\nObject.assign(globalThis, web);\nreturn Object.freeze({ request: WendyPiAI.createRuntime(host, web).request });\n})` },
+  footer: { js: `\nconst web = PlyPiAI.createWeb(host);\n({ ${globals} } = web);\nObject.assign(globalThis, web);\nreturn Object.freeze({ request: PlyPiAI.createRuntime(host, web).request });\n})` },
 });
 const external = Object.values(result.metafile.outputs).flatMap(output => output.imports).filter(item => item.external);
 if (external.length) throw new Error("embedded bundle has external imports: " + JSON.stringify(external));
@@ -48,7 +48,7 @@ for (const input of Object.keys(result.metafile.inputs)) {
   packages.set(info.name, { directory, ...info });
 }
 const dependencies = [];
-const notices = ["Third-party software included in Wendy's embedded model bundle.\n"];
+const notices = ["Third-party software included in Ply's embedded model bundle.\n"];
 for (const info of [...packages.values()].sort((a, b) => a.name.localeCompare(b.name, "en"))) {
   const files = (await readdir(info.directory, { withFileTypes: true })).filter(file => file.isFile() && /^(licen[cs]e|copying)/i.test(file.name));
   const licenseTexts = await Promise.all(files.map(file => readFile(path.join(info.directory, file.name), "utf8")));

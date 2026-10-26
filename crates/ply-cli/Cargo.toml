@@ -1,0 +1,21 @@
+[package]
+name = "ply-cli"
+description = "The ply command line"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ply"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+ply-kernel.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+tempfile.workspace = true

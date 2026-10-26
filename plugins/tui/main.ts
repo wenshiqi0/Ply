@@ -1,12 +1,12 @@
-import plugins from "wendy:plugins";
-import * as commands from "wendy:commands";
-import * as terminal from "wendy:terminal";
-import * as markdown from "wendy:markdown";
-import * as events from "wendy:events";
-import { onDispose } from "wendy:lifecycle";
+import plugins, { context } from "ply:plugins";
+import * as commands from "ply:commands";
+import * as terminal from "ply:terminal";
+import * as markdown from "ply:markdown";
+import * as events from "ply:events";
+import { onDispose } from "ply:lifecycle";
 
-type Decision = WendyApprovalResponse;
-type Review = { request: WendyApprovalRequest | WendyToolApprovalRequest; resolve: (decision: Decision) => void; cancelled: boolean; offset: number; seenEnd: boolean; lines?: string[]; columns?: number };
+type Decision = PlyApprovalResponse;
+type Review = { request: PlyApprovalRequest | PlyToolApprovalRequest; resolve: (decision: Decision) => void; cancelled: boolean; offset: number; seenEnd: boolean; lines?: string[]; columns?: number };
 type Outcome = { output?: any; error?: string };
 type HistoryEntry = { text: string; role: "user" | "assistant" | "system" | "error"; document?: markdown.Node };
 type InputRow = { text: string; start: number; end: number; cells: number };
@@ -151,7 +151,7 @@ function transcript(s: Session, columns: number): terminal.Line[] {
   }
   for (const entry of s.history) {
     if (lines.length) lines.push("");
-    if (entry.role === "user" || entry.role === "assistant") lines.push({ text: entry.role === "user" ? "你 ›" : "Wendy ›", style: entry.role === "user" ? "accent" : "title" });
+    if (entry.role === "user" || entry.role === "assistant") lines.push({ text: entry.role === "user" ? "你 ›" : "Ply ›", style: entry.role === "user" ? "accent" : "title" });
     if (entry.role === "assistant") {
       try {
         entry.document ??= markdown.parse(entry.text);
@@ -202,7 +202,7 @@ function paint(s: Session) {
     const height = s.rows - shown - 7, content = transcript(s, columns);
     s.bodyHeight = height;
     s.offset = Math.min(s.offset, Math.max(0, content.length - height));
-    lines.push({ text: oneLine("Wendy" + (s.approvalMode === "bypass" ? " · BYPASS" : "") + " · " + s.model, columns), style: s.approvalMode === "bypass" ? "warning" : "title" },
+    lines.push({ text: oneLine("Ply" + (s.approvalMode === "bypass" ? " · BYPASS" : "") + " · " + s.model, columns), style: s.approvalMode === "bypass" ? "warning" : "title" },
       { text: oneLine("工作目录 " + process.cwd(), columns), style: "muted" }, "");
     lines.push(...content.slice(s.offset, s.offset + height));
     while (lines.length < 3 + height) lines.push("");
@@ -276,12 +276,12 @@ function finish(s: Session) {
   usage(s, output?.total_usage);
 }
 
-/** Interactive terminal task console; use `wendy tui`. Not registered as a model tool. */
+/** Interactive terminal task console; use `ply tui`. Not registered as a model tool. */
 export async function onHandle(input: { prompt?: string }): Promise<{ tasks: number; approved: number; rejected: number; usage: unknown }> {
   if (active) throw new Error("a TUI session is already active");
   if (input?.prompt !== undefined && (typeof input.prompt !== "string" || !input.prompt.trim())) throw new Error("prompt must be a non-empty string");
   const current = await fiber.info();
-  const profile = typeof ctx.currentModel === "function" ? await ctx.currentModel() : null;
+  const profile = typeof context.currentModel === "function" ? await context.currentModel() : null;
   const approval = typeof ctx.approvalStatus === "function" ? await ctx.approvalStatus() : null;
   const opened = terminal.open();
   const s: Session = { ...opened, fiber: current.id, model: profile?.model ?? "未选择模型", dirty: true, reviews: [], history: [], input: "", caret: 0, inputView: 0, offset: 0, busy: false,
@@ -364,7 +364,7 @@ export async function onHandle(input: { prompt?: string }): Promise<{ tasks: num
 export async function onLoad() {
   await plugins.approval.loaded;
   await plugins.agent.loaded;
-  const review = async (event: events.Event<WendyApprovalRequest | WendyToolApprovalRequest>): Promise<Decision> => {
+  const review = async (event: events.Event<PlyApprovalRequest | PlyToolApprovalRequest>): Promise<Decision> => {
     const s = active;
     if (!s || !(await fiber.info()).ancestors.includes(s.fiber)) return { request_id: event.data.id, decision: "pending", reason: "no owning TUI session" };
     let review!: Review;

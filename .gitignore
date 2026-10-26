@@ -1,4 +1,6 @@
 /target
+.ply/
+# Legacy private state is retained in place.
 .wendy/
 out/
 .DS_Store

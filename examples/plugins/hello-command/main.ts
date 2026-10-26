@@ -1,4 +1,4 @@
-import * as commands from "wendy:commands";
+import * as commands from "ply:commands";
 
 /** A CLI command, independent of the model's tool catalog. */
 export async function onLoad() {
@@ -7,7 +7,7 @@ export async function onLoad() {
     description: "向指定名字问好",
     handler: (input: { name?: string }) => {
       if (input?.name !== undefined && typeof input.name !== "string") throw new Error("name must be a string");
-      return { message: `你好，${input?.name ?? "Wendy"}` };
+      return { message: `你好，${input?.name ?? "Ply"}` };
     },
   });
 }

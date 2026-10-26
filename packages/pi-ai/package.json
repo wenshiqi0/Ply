@@ -1,5 +1,5 @@
 {
-  "name": "wendy-embedded-pi-ai",
+  "name": "ply-embedded-pi-ai",
   "private": true,
   "type": "module",
   "scripts": { "build": "node build.mjs" },

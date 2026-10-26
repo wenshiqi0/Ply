@@ -1,0 +1,24 @@
+[package]
+name = "ply-jsc"
+description = "ply's JS outlet: embedded JavaScriptCore with node-aligned APIs over ply-libc"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+libc.workspace = true
+pulldown-cmark.workspace = true
+oxc.workspace = true
+oxc_ecmascript.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+serde_yaml_ng.workspace = true
+tokio.workspace = true
+ply-libc.workspace = true
+ply-sh.workspace = true
+ply-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

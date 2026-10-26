@@ -1,0 +1,10 @@
+[package]
+name = "ply-core"
+description = "Descriptive core of the ply agent harness: plugins, their types, fibers"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

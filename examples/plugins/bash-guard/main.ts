@@ -1,5 +1,5 @@
-import plugins from "wendy:plugins";
-import * as events from "wendy:events";
+import plugins from "ply:plugins";
+import * as events from "ply:events";
 
 type BashRequest = { command: string; cwd: string; timeout_ms: number };
 

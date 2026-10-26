@@ -1,11 +1,11 @@
 # 插件事件和 bash 执行前 hook
 
-模型可见的 `bash` 工具通过原生 `wendy:sh` 调用内部解释器。CLI/MCP 直接调用这个插件也走相同后端。`command`、`cwd`、`timeout_ms` 及输出字段保留，其他插件直接使用的 `node:child_process` 不受该工具后端选择影响。
+模型可见的 `bash` 工具通过原生 `ply:sh` 调用内部解释器。CLI/MCP 直接调用这个插件也走相同后端。`command`、`cwd`、`timeout_ms` 及输出字段保留，其他插件直接使用的 `node:child_process` 不受该工具后端选择影响。
 
 ## 在 onLoad 声明自定义事件
 
 ```ts
-import * as events from "wendy:events";
+import * as events from "ply:events";
 let changed: string;
 
 export async function onLoad() {
@@ -24,8 +24,8 @@ export async function onHandle(input: { value: string }) {
 完整可加载示例在 [examples/plugins/bash-guard/main.ts](../examples/plugins/bash-guard/main.ts)：
 
 ```ts
-import plugins from "wendy:plugins";
-import * as events from "wendy:events";
+import plugins from "ply:plugins";
+import * as events from "ply:events";
 
 type Request = { command: string; cwd: string; timeout_ms: number };
 export async function onLoad() {
@@ -51,9 +51,9 @@ export async function onLoad() {
 在仓库目录执行：
 
 ```bash
-cargo build -p wendy-cli --locked
-./target/debug/wendy call --plugin ./examples/plugins/bash-guard --record /tmp/wendy-hook.jsonl bash '{"command":"echo hello"}'
-./target/debug/wendy call --plugin ./examples/plugins/bash-guard bash '{"command":"echo __deny_demo__ > blocked-demo.txt"}'
+cargo build -p ply-cli --locked
+./target/debug/ply call --plugin ./examples/plugins/bash-guard --record /tmp/ply-hook.jsonl bash '{"command":"echo hello"}'
+./target/debug/ply call --plugin ./examples/plugins/bash-guard bash '{"command":"echo __deny_demo__ > blocked-demo.txt"}'
 ```
 
 第一条工具调用会放行；第二条报告 demo 拒绝，不创建 `blocked-demo.txt`。该示例插件不注册模型工具，模型仍只看到原来的 bash 工具。
@@ -62,4 +62,4 @@ cargo build -p wendy-cli --locked
 
 JSONL 中的 `event:"plugin"` 记录发布及真实来源，回调另有配对的 Spawn/Exit。回调不是插件 onHandle，也不作为 agent 工具调用消耗委派名额。`events.on` 返回订阅编号，所属插件可以用 `events.off(id)` 取消订阅。加载失败会回收该插件的事件定义和订阅。
 
-内部 sh 的语法、命令集和执行边界见 [wendy-sh README](../crates/wendy-sh/README.md)。当前仅执行内置命令和注册的 utility，未知宿主程序不会被自动透传或交给系统 shell。
+内部 sh 的语法、命令集和执行边界见 [ply-sh README](../crates/ply-sh/README.md)。当前仅执行内置命令和注册的 utility，未知宿主程序不会被自动透传或交给系统 shell。

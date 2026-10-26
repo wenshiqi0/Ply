@@ -1,0 +1,16 @@
+[package]
+name = "ply-io"
+description = "ply's IO layer: a namespace of mounted storage, and real processes started on it"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+tokio.workspace = true
+ply-storage.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

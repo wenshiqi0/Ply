@@ -1,0 +1,19 @@
+[package]
+name = "ply-sh"
+description = "ply's own shell, aligned with bash, doing all IO through ply-io"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+ply-io.workspace = true
+ply-libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+ply-storage.workspace = true

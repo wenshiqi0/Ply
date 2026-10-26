@@ -1,20 +1,20 @@
-import plugins from "wendy:plugins";
+import { context } from "ply:plugins";
 import path from "node:path";
-import { exec } from "wendy:sh";
-import * as events from "wendy:events";
+import { exec } from "ply:sh";
+import * as events from "ply:events";
 
 let beforeExecute: string;
 type Decision = boolean | null | { allow?: boolean; reason?: string; requires_approval?: boolean };
 
 /**
- * Run a script with Wendy sh in the mounted workspace. Supports its shell
+ * Run a script with Ply sh in the mounted workspace. Supports its shell
  * syntax, builtins and bundled utilities (cat, ls, grep, sed, find, sort,
  * head, tail, wc, du, etc.). Unsupported commands return 127; scripts are
  * never forwarded to a system shell. Awaits bash.beforeExecute listeners
  * before executing any part of the script.
  */
 export async function onHandle(input: {
-  /** The script interpreted by Wendy sh. */
+  /** The script interpreted by Ply sh. */
   command: string;
   /** Working directory (default: the workspace). */
   cwd?: string;
@@ -72,6 +72,6 @@ export async function onHandle(input: {
 /** Declare the tool's event and offer the tool to the model. */
 export async function onLoad() {
   beforeExecute = await events.define("beforeExecute");
-  await plugins.context.loaded;
-  await ctx.registerTool("bash");
+  await context.loaded;
+  await context.registerTool("bash");
 }

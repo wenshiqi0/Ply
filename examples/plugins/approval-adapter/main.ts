@@ -1,10 +1,10 @@
-import plugins from "wendy:plugins";
-import * as events from "wendy:events";
+import plugins from "ply:plugins";
+import * as events from "ply:events";
 
 /** Adapter template: replace this pending response with your environment's UI/service. */
 export async function onLoad() {
   await plugins.approval.loaded;
-  const pending = async (event: events.Event<WendyApprovalRequest | WendyToolApprovalRequest>): Promise<WendyApprovalResponse> => {
+  const pending = async (event: events.Event<PlyApprovalRequest | PlyToolApprovalRequest>): Promise<PlyApprovalResponse> => {
     await fiber.record({ type: "environment_approval_needed", request_id: event.data.id, tool: event.data.tool, cwd: event.data.cwd,
       ...("command" in event.data ? { command: event.data.command } : { input: event.data.input }) });
     // An actual adapter must await an authenticated user's/service's answer.

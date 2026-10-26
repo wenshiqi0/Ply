@@ -1,0 +1,12 @@
+[package]
+name = "ply-libc"
+description = "Shared system library for ply's runtimes, written over ply-io instead of the host's libc"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ply-io.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

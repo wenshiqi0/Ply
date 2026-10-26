@@ -1,5 +1,5 @@
-import plugins from "wendy:plugins";
-import * as events from "wendy:events";
+import plugins from "ply:plugins";
+import * as events from "ply:events";
 
 let requestEvent: string;
 let toolEvent: string;
@@ -47,10 +47,10 @@ async function requestDecision(event: string, request: { id: string; [key: strin
 
 /** Host-selected approval policy; environment plugins supply user/service decisions. */
 export async function onLoad() {
-  timeout = Number(process.env.WENDY_APPROVAL_TIMEOUT_MS ?? 300000);
-  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 86400000) throw new Error("WENDY_APPROVAL_TIMEOUT_MS must be an integer in 1..86400000");
-  const configured = process.env.WENDY_APPROVAL_MODE ?? "risk";
-  if (configured !== "risk" && configured !== "ask" && configured !== "bypass") throw new Error("WENDY_APPROVAL_MODE must be risk, ask or bypass");
+  timeout = Number(process.env.PLY_APPROVAL_TIMEOUT_MS ?? 300000);
+  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 86400000) throw new Error("PLY_APPROVAL_TIMEOUT_MS must be an integer in 1..86400000");
+  const configured = process.env.PLY_APPROVAL_MODE ?? "risk";
+  if (configured !== "risk" && configured !== "ask" && configured !== "bypass") throw new Error("PLY_APPROVAL_MODE must be risk, ask or bypass");
   mode = configured;
   requestEvent = await events.define("request");
   toolEvent = await events.define("toolRequest");

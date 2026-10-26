@@ -8,13 +8,13 @@ version = "0.1.0"
 license = "MIT"
 
 [workspace.dependencies]
-wendy-core = { path = "crates/wendy-core" }
-wendy-storage = { path = "crates/wendy-storage" }
-wendy-io = { path = "crates/wendy-io" }
-wendy-jsc = { path = "crates/wendy-jsc" }
-wendy-kernel = { path = "crates/wendy-kernel" }
-wendy-libc = { path = "crates/wendy-libc" }
-wendy-sh = { path = "crates/wendy-sh" }
+ply-core = { path = "crates/ply-core" }
+ply-storage = { path = "crates/ply-storage" }
+ply-io = { path = "crates/ply-io" }
+ply-jsc = { path = "crates/ply-jsc" }
+ply-kernel = { path = "crates/ply-kernel" }
+ply-libc = { path = "crates/ply-libc" }
+ply-sh = { path = "crates/ply-sh" }
 
 anyhow = "1"
 async-trait = "0.1"
@@ -28,6 +28,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 rusqlite = { version = "0.33", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml_ng = "=0.10.0"
 tempfile = "3"
 thiserror = "2"
 unicode-width = "0.2"

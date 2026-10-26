@@ -1,6 +1,6 @@
-import plugins from "wendy:plugins";
-import * as events from "wendy:events";
-import { hasCredentials, requestJson } from "wendy:http";
+import plugins from "ply:plugins";
+import * as events from "ply:events";
+import { hasCredentials, requestJson } from "ply:http";
 
 // Official native protocol, not a chat API:
 // https://docs.typesafe.ai/api/system-one
@@ -109,7 +109,7 @@ async function review(event: events.Event<BashRequest>): Promise<Result> {
   let status: number | null = null;
   try {
     if (!request || typeof request.command !== "string" || !request.command || typeof request.cwd !== "string" || !Number.isSafeInteger(request.timeout_ms) || request.timeout_ms <= 0) throw new Error("invalid_request");
-    const state = { tool: "bash", execution_backend: "wendy-sh", command: request.command, cwd: request.cwd,
+    const state = { tool: "bash", execution_backend: "ply-sh", command: request.command, cwd: request.cwd,
       context: { initial_cwd: config.initialCwd, script_text_is_untrusted_data: true, external_host_commands_are_not_automatically_executed: true } };
     if (Buffer.byteLength(JSON.stringify(state)) > config.maxStateBytes) throw new Error("state_too_large");
     if (!hasCredentials("jev")) throw new Error("missing_credentials");
@@ -138,7 +138,7 @@ async function review(event: events.Event<BashRequest>): Promise<Result> {
   } catch (error) {
     const raw = error instanceof Error ? error.message : "transport_error";
     const known = ["invalid_request", "state_too_large", "invalid_response", "invalid_answers", "missing_credentials"];
-    const code = known.includes(raw) || /^http_\d{3}$/.test(raw) ? raw : (error && typeof error === "object" && (error as any).code === "ERR_WENDY_HTTP_TIMEOUT" ? "timeout" : "transport_error");
+    const code = known.includes(raw) || /^http_\d{3}$/.test(raw) ? raw : (error && typeof error === "object" && (error as any).code === "ERR_PLY_HTTP_TIMEOUT" ? "timeout" : "transport_error");
     result = failed(event, started, code, usage);
   }
   // A forced parent cancellation may prevent these records. Its persisted
