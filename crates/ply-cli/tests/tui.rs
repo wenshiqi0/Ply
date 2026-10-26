@@ -339,6 +339,48 @@ fn tui_approves_only_once_rejects_and_requires_viewing_long_commands() {
 }
 
 #[test]
+fn composer_backspace_at_start_never_inserts_the_key_name() {
+    let work = tempfile::tempdir().unwrap();
+    let record = work.path().join("backspace.jsonl");
+    let mut c = tui_command(work.path());
+    c.arg("--record").arg(&record);
+    let mut p = Pty::spawn(c, 24);
+    p.wait("输入消息，按 Enter 发送…");
+    let initial = p.cursor();
+
+    // Both terminal encodings must be harmless when the input is empty.
+    p.send("\x7f\x08");
+    assert_eq!(p.cursor(), initial);
+    assert!(!p.contains("backspace"));
+
+    p.send("你好");
+    p.wait("你好");
+    p.send("\x01\x7f\x08");
+    assert_eq!(p.cursor(), initial);
+    assert!(!p.contains("backspace"));
+
+    // Deleting real text still works, including repeated backspace past empty.
+    p.send("\x05\x7f\x7f\x7f\x08");
+    assert_eq!(p.cursor(), initial);
+    p.wait("输入消息，按 Enter 发送…");
+    assert!(!p.contains("backspace"));
+
+    p.send("消息\x01\x7f\x08\x05\r");
+    p.wait("agent-chat: 消息");
+    p.send("/quit\r");
+    p.exit(true);
+
+    let prompts: Vec<Value> = std::fs::read_to_string(record)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["event"] == "spawn" && event["fiber"]["plugin"] == "agent")
+        .map(|event| event["fiber"]["input"]["prompt"].clone())
+        .collect();
+    assert_eq!(prompts, vec![json!("消息")]);
+}
+
+#[test]
 fn composer_has_a_visible_cursor_and_edits_unicode_without_clearing_the_screen() {
     let work = tempfile::tempdir().unwrap();
     let record = work.path().join("composer.jsonl");

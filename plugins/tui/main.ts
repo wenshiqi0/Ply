@@ -117,8 +117,9 @@ function edit(s: Session, key: string, paste?: boolean) {
   else if (key === "end" || key === "\x05") s.caret = lineBounds(s).end;
   else if (key === "up" || key === "\x10") { vertical(s, -1); return; }
   else if (key === "down" || key === "\x0e") { vertical(s, 1); return; }
-  else if (key === "backspace" && s.caret > 0) remove(s, s.caret - 1, s.caret);
-  else if (key === "delete" || key === "eof") remove(s, s.caret, Math.min(count, s.caret + 1));
+  else if (key === "backspace") {
+    if (s.caret > 0) remove(s, s.caret - 1, s.caret);
+  } else if (key === "delete" || key === "eof") remove(s, s.caret, Math.min(count, s.caret + 1));
   else if (key === "\x15") { remove(s, lineBounds(s).start, s.caret); s.inputTooLong = false; s.notice = ""; }
   else if (key === "\x0b") remove(s, s.caret, lineBounds(s).end);
   else if (key === "\x17") {
