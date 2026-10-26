@@ -122,9 +122,16 @@ impl Shell {
             builtins::run(self, argv, fds).await
         } else if let Some(util) = self.rt.utils.get(name) {
             let env = self.st.vars.exported();
+            let search_path = self.var("PATH").unwrap_or_default();
             let fs = Fs::new(self.rt.io.clone(), self.st.cwd.clone());
-            let ctx = UtilCtx { name, args: &argv[1..], fds, fs: &fs, env: &env, output_truncated: &self.rt.output_truncated };
+            let ctx = UtilCtx { name, args: &argv[1..], fds, fs: &fs, env: &env, search_path: &search_path, output_truncated: &self.rt.output_truncated };
             Ok(util.run(ctx).await)
+        } else if let Some(external) = self.rt.utils.external() {
+            let env = self.st.vars.exported();
+            let search_path = self.var("PATH").unwrap_or_default();
+            let fs = Fs::new(self.rt.io.clone(), self.st.cwd.clone());
+            let ctx = UtilCtx { name, args: &argv[1..], fds, fs: &fs, env: &env, search_path: &search_path, output_truncated: &self.rt.output_truncated };
+            Ok(external.run(ctx).await)
         } else {
             self.report(fds, &format!("{name}: command not found"));
             Ok(127)

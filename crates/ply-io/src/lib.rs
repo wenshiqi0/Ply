@@ -17,7 +17,7 @@ mod exec;
 mod handle;
 mod namespace;
 
-pub use exec::{ExecResult, ExecSpec};
+pub use exec::{ExecResult, ExecSink, ExecSpec};
 pub use handle::Io;
 pub use namespace::{MountInfo, MountMode};
 pub use ply_storage::{

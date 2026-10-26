@@ -26,6 +26,7 @@ pub struct UtilCtx<'a> {
     pub fds: &'a Fds,
     pub fs: &'a Fs,
     pub env: &'a BTreeMap<String, String>,
+    pub search_path: &'a str,
     pub output_truncated: &'a std::sync::atomic::AtomicBool,
 }
 
@@ -58,9 +59,17 @@ pub trait Utility: Send + Sync {
     async fn run(&self, ctx: UtilCtx<'_>) -> i32;
 }
 
+/// Optional host program bridge. The interpreter still owns parsing and IO.
+#[async_trait::async_trait]
+pub trait ExternalCommands: Send + Sync {
+    fn resolve(&self, name: &str, search_path: &str, cwd: &str) -> Option<String>;
+    async fn run(&self, ctx: UtilCtx<'_>) -> i32;
+}
+
 #[derive(Clone, Default)]
 pub struct Registry {
     map: HashMap<String, Arc<dyn Utility>>,
+    external: Option<Arc<dyn ExternalCommands>>,
 }
 
 macro_rules! utility {
@@ -83,6 +92,15 @@ macro_rules! utility {
 }
 
 impl Registry {
+    pub fn with_external(mut self, external: Arc<dyn ExternalCommands>) -> Self {
+        self.external = Some(external);
+        self
+    }
+
+    pub(crate) fn external(&self) -> Option<Arc<dyn ExternalCommands>> {
+        self.external.clone()
+    }
+
     pub fn empty() -> Self {
         Self::default()
     }

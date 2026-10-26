@@ -68,7 +68,7 @@ fiber 的归属由消费方的异步续体携带，共享 Promise 后也保持�
 
 context、deepseek 和 mimo 没有 `onHandle`，不能被调用，也不会作为工具透出给模型或 MCP 客户端。
 
-模型可见的 `bash` 工具统一使用 **Ply sh**。保留 `command` / `cwd` / `timeout_ms` 入参及原有输出字段；每次调用新建 shell，脚本内的状态和 cwd 独立。支持内部解释器的语法、builtin 和自带工具，未注册命令返回 127，不自动调用宿主程序或系统 shell。只读挂载、内存/SQLite 存储也对 shell 生效；其他插件的 `node:child_process` 仍按其自身接口工作。支持范围及缓冲管道限制见 [ply-sh](crates/ply-sh/README.md)。
+模型可见的 `bash` 工具统一使用 **Ply sh**。保留 `command` / `cwd` / `timeout_ms` 入参及原有输出字段；每次调用新建 shell，脚本内的状态和 cwd 独立。支持内部解释器的语法、builtin、自带工具，以及 PATH 中的宿主可执行文件；不存在的命令返回 127，无法执行返回 126。默认保留启动进程 PATH 的目录顺序，再补齐系统、Homebrew 和常见用户 bin 目录，不加载 bash/zsh 配置、alias、函数或全量环境变量。内部工具和重定向仍使用挂载 IO；宿主程序需要磁盘 cwd，其自身文件访问使用真实宿主文件系统，不受虚拟挂载权限隔离，参数中的虚拟绝对路径也不会自动重写。所有命令仍先经过 bash.beforeExecute 和审批；超时或 fiber 取消会回收宿主进程组。支持范围及缓冲管道限制见 [ply-sh](crates/ply-sh/README.md)。
 
 `bash.beforeExecute` 覆盖整个工具调用，所有监听器异步完成且未拒绝后才进入 sh，包含重定向和命令替换在内的脚本内容都尚未执行。普通 hook 返回 `false` / `{allow:false, reason}` 是硬拒绝；带 requires_approval:true 的风险结果进入环境审批。批准后继续，缺少适配器时返回 approval_required。`timeout_ms` 包含检查与执行时间，审批等待单独计时。Ply sh 没有 shell 进程信号，因此 `signal` 为 null，超时仍通过 `timed_out` 表示。
 

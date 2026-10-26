@@ -528,15 +528,19 @@ export async function onHandle() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn bash_runs_ply_sh_over_virtual_storage_and_has_no_system_shell_fallback() {
+async fn bash_runs_ply_sh_over_virtual_storage_and_resolves_host_programs() {
     let w = world().await;
     w.kernel.io().mount("/virtual", Arc::new(ply_kernel::MemoryStorage::empty()), MountMode::ReadWrite).unwrap();
     let output = w.kernel.call("bash", json!({ "command": "mkdir -p /virtual/sub; printf 'beta\nalpha\n' > /virtual/sub/data; cat /virtual/sub/data | sort; echo $SHELL" })).await.unwrap();
     assert_eq!(output["stdout"], "alpha\nbeta\nply-sh\n");
     assert_eq!(output["exit_code"], 0);
-    let denied = w.kernel.call("bash", json!({ "command": "/bin/sh -c 'echo external > external-marker'" })).await.unwrap();
+    let denied = w.kernel.call("bash", json!({ "command": "__ply_missing_host_command > external-marker" })).await.unwrap();
     assert_eq!(denied["exit_code"], 127);
-    assert!(!w.work.path().join("external-marker").exists());
+    assert!(std::fs::read_to_string(w.work.path().join("external-marker")).unwrap().is_empty());
+    let native = w.kernel.call("bash", json!({ "command": "/usr/bin/true" })).await.unwrap();
+    assert_eq!(native["exit_code"], 0);
+    let memory = w.kernel.call("bash", json!({ "command": "/usr/bin/true", "cwd": "/virtual" })).await.unwrap();
+    assert_eq!(memory["exit_code"], 126);
     let timed = w.kernel.call("bash", json!({ "command": "echo entered; while :; do :; done; echo late > late-marker", "timeout_ms": 80 })).await.unwrap();
     assert_eq!(timed["timed_out"], true);
     assert_eq!(timed["stdout"], "entered\n");
@@ -554,6 +558,14 @@ async fn bash_runs_ply_sh_over_virtual_storage_and_has_no_system_shell_fallback(
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(matches!(w.events.exit_of(&root), Some(Exit::Cancelled { .. })));
     assert!(!w.work.path().join("native-late").exists());
+    let host = w.kernel.wake("bash", json!({ "command": "/bin/sh -c 'echo started > host-entered; /bin/sleep 1; echo bad > host-late'" })).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !w.work.path().join("host-entered").exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
+    }).await.unwrap();
+    assert!(w.kernel.cancel_fiber(&host));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(matches!(w.events.exit_of(&host), Some(Exit::Cancelled { .. })));
+    assert!(!w.work.path().join("host-late").exists());
     assert_eq!(w.kernel.call("bash", json!({ "command": "echo alive" })).await.unwrap()["stdout"], "alive\n");
 }
 

@@ -1,7 +1,9 @@
-//! Ply sh for the model-visible bash plugin. No system shell fallback.
+//! Ply sh for the model-visible bash plugin, with direct host executable lookup.
+//! Parsing stays internal; no system shell fallback or startup-file loading.
 use crate::runtime::OpResult;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
+use std::sync::Arc;
 use ply_libc::{EntryKind, Fs};
 use ply_sh::{Limits, Registry, Shell};
 
@@ -46,15 +48,18 @@ pub(crate) async fn execute(fs: Fs, args: Value) -> OpResult {
             );
         }
     }
+    let initial_home = args.get("env").and_then(|env| env.get("HOME")).and_then(Value::as_str).map(str::to_string);
+    let commands = crate::host_commands::HostCommands::new(fs.io().clone(), initial_home);
     let mut shell = Shell::with_limits(
         fs.io(),
-        Registry::standard(),
+        Registry::standard().with_external(Arc::new(commands)),
         Limits {
             max_buffer_bytes: Some(1 << 20),
             ..Limits::default()
         },
     );
     shell.set_cwd(&cwd);
+    shell.set_var("PATH", &crate::host_commands::bin_path(), true);
     if let Some(env) = args.get("env").and_then(Value::as_object) {
         for (name, value) in env {
             if let Some(value) = value.as_str() {

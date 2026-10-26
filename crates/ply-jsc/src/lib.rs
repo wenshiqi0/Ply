@@ -25,6 +25,7 @@ mod checkpoints;
 mod http;
 mod runtime;
 mod sh;
+mod host_commands;
 mod terminal;
 mod markdown;
 mod skills;

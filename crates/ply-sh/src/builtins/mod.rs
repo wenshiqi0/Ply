@@ -259,6 +259,7 @@ enum Kind {
     Function,
     Builtin,
     Utility,
+    External(String),
     Missing,
 }
 
@@ -269,6 +270,8 @@ fn kind_of(sh: &Shell, name: &str) -> Kind {
         Kind::Builtin
     } else if sh.rt.utils.resolve(name).is_some() {
         Kind::Utility
+    } else if let Some(path) = sh.rt.utils.external().and_then(|external| external.resolve(name, sh.var("PATH").as_deref().unwrap_or(""), &sh.st.cwd)) {
+        Kind::External(path)
     } else {
         Kind::Missing
     }
@@ -287,6 +290,9 @@ fn type_builtin(sh: &mut Shell, args: &[String], fds: &Fds) -> i32 {
             (Kind::Builtin, false) if !path_only => Some(format!("{name} is a shell builtin")),
             (Kind::Utility, _) if path_only => Some(utility_path(name)),
             (Kind::Utility, false) => Some(format!("{name} is {}", utility_path(name))),
+            (Kind::External(_), true) => Some("file".to_string()),
+            (Kind::External(path), false) if path_only => Some(path),
+            (Kind::External(path), false) => Some(format!("{name} is {path}")),
             (Kind::Missing, _) => {
                 if !terse && !path_only {
                     sh.report(fds, &format!("type: {name}: not found"));
@@ -321,6 +327,8 @@ async fn command(sh: &mut Shell, args: &[String], fds: &Fds) -> Status {
                     Kind::Utility if verbose => format!("{name} is {}", utility_path(name)),
                     Kind::Function | Kind::Builtin => name.clone(),
                     Kind::Utility => utility_path(name),
+                    Kind::External(path) if verbose => format!("{name} is {path}"),
+                    Kind::External(path) => path,
                     Kind::Missing => {
                         if verbose {
                             sh.report(fds, &format!("command: {name}: not found"));

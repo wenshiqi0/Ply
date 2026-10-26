@@ -1,7 +1,7 @@
 //! Executing parsed scripts.
 //!
 //! Important decisions:
-//! - No processes. Subshells, pipeline stages and command substitutions run
+//! - Interpreter subshells, pipeline stages and command substitutions run
 //!   on a cloned [`State`] (`fork`), so they cannot change the parent's
 //!   variables or cwd, exactly like bash's forked children.
 //! - Pipeline stages run one after another; each stage's whole output becomes

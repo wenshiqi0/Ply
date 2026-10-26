@@ -1475,7 +1475,7 @@ fn exec_request(fs: &Fs, args: &Value, stdin: Option<Vec<u8>>) -> Result<ExecSpe
         .map(|ms| Duration::from_secs_f64(ms / 1000.0));
     let max_output = args.get("maxOutput").and_then(Value::as_u64).unwrap_or(0) as usize;
     let cwd = fs.resolve(args.get("cwd").and_then(Value::as_str).unwrap_or("."));
-    Ok(ExecSpec { argv, cwd, env, stdin, timeout, max_output })
+    Ok(ExecSpec { argv, cwd, env, clear_env: false, stdin, timeout, max_output })
 }
 
 async fn run_exec(fs: Fs, spec: ExecSpec) -> OpResult {

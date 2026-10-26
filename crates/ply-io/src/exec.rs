@@ -26,8 +26,10 @@ pub struct ExecSpec {
     pub argv: Vec<String>,
     /// Working directory in the namespace; must be on a disk mount.
     pub cwd: String,
-    /// Set on top of the inherited environment.
+    /// Environment overrides; the entire environment when `clear_env` is set.
     pub env: BTreeMap<String, String>,
+    /// Start with only `env`, rather than inheriting the host environment.
+    pub clear_env: bool,
     pub stdin: Option<Vec<u8>>,
     pub timeout: Option<Duration>,
     /// Bytes kept per output stream; 0 means 1 MiB.
@@ -54,6 +56,8 @@ pub struct ExecResult {
 
 const DEFAULT_MAX_OUTPUT: usize = 1 << 20;
 
+pub type ExecSink = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 struct ProcessGroup(i32);
 
 impl ProcessGroup {
@@ -77,6 +81,23 @@ impl Drop for ExecJobs {
 impl Io {
     /// Start a real process, wait for it, and return what it printed.
     pub async fn exec(&self, spec: ExecSpec) -> io::Result<ExecResult> {
+        self.exec_with_sinks(spec, None, None).await
+    }
+
+    /// Map a namespace path for a native process. Memory storage has no host path.
+    pub fn host_path(&self, path: &str) -> io::Result<std::path::PathBuf> {
+        let path = normalize(Path::new(path))?;
+        match self.ns.resolve(&path) {
+            Resolved::Mounted { mount, inner } => match mount.storage.host_root() {
+                Some(root) => Ok(root.join(inner.trim_start_matches('/'))),
+                None => Err(io::Error::new(io::ErrorKind::Unsupported, format!("{path}: processes require disk storage"))),
+            },
+            _ => Err(outside_mounts(&path)),
+        }
+    }
+
+    /// Stream output into the owning shell, including before cancellation.
+    pub async fn exec_with_sinks(&self, spec: ExecSpec, stdout: Option<ExecSink>, stderr: Option<ExecSink>) -> io::Result<ExecResult> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         if spec.argv.is_empty() || spec.argv[0].is_empty() {
@@ -100,6 +121,7 @@ impl Io {
         }
 
         let mut cmd = tokio::process::Command::new(&spec.argv[0]);
+        if spec.clear_env { cmd.env_clear(); }
         cmd.args(&spec.argv[1..])
             .current_dir(&host_cwd)
             .envs(&spec.env)
@@ -127,7 +149,7 @@ impl Io {
         // Readers fill a shared buffer, so what was read survives even if
         // the pipe never reaches EOF (another process may have inherited its
         // write end; macOS sets close-on-exec only after creating a pipe).
-        let read_capped = |stream: Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>| {
+        let read_capped = |stream: Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>, output_callback: Option<ExecSink>| {
             let buffer = Arc::new(Mutex::new((Vec::new(), false)));
             let sink = buffer.clone();
             let task = tokio::spawn(async move {
@@ -137,6 +159,7 @@ impl Io {
                     if n == 0 {
                         break;
                     }
+                    if let Some(callback) = &output_callback { callback(&chunk[..n]); }
                     let mut kept = sink.lock().expect("output buffer poisoned");
                     let room = cap.saturating_sub(kept.0.len());
                     kept.0.extend_from_slice(&chunk[..n.min(room)]);
@@ -145,8 +168,8 @@ impl Io {
             });
             (task, buffer)
         };
-        let (out_task, out) = read_capped(child.stdout.take().map(|s| Box::new(s) as _));
-        let (err_task, err) = read_capped(child.stderr.take().map(|s| Box::new(s) as _));
+        let (out_task, out) = read_capped(child.stdout.take().map(|s| Box::new(s) as _), stdout);
+        let (err_task, err) = read_capped(child.stderr.take().map(|s| Box::new(s) as _), stderr);
         jobs.0.extend([out_task.abort_handle(), err_task.abort_handle()]);
 
         let mut timed_out = false;

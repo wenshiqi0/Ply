@@ -9,8 +9,10 @@ type Decision = boolean | null | { allow?: boolean; reason?: string; requires_ap
 /**
  * Run a script with Ply sh in the mounted workspace. Supports its shell
  * syntax, builtins and bundled utilities (cat, ls, grep, sed, find, sort,
- * head, tail, wc, du, etc.). Unsupported commands return 127; scripts are
- * never forwarded to a system shell. Awaits bash.beforeExecute listeners
+ * head, tail, wc, du, etc.), then host executable files found through PATH.
+ * Host programs need a disk cwd and use the real host filesystem; internal
+ * utilities and redirections use mounted IO. Missing commands return 127.
+ * Scripts are never forwarded to a system shell. Awaits bash.beforeExecute listeners
  * before executing any part of the script.
  */
 export async function onHandle(input: {
