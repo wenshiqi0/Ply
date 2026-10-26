@@ -35,7 +35,7 @@ fn directory() -> Result<PathBuf, String> {
         None => PathBuf::from(
             std::env::var_os("HOME").ok_or("host HOME is unavailable for checkpoints")?,
         )
-        .join(".local/state/ply/checkpoints"),
+        .join(".ply/checkpoints"),
     };
     if !root.is_absolute() {
         return Err("PLY_CHECKPOINT_DIR must be absolute".into());
