@@ -23,6 +23,7 @@ struct Pty {
 fn command(work: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_ply"));
     c.current_dir(work);
+    c.env("HOME", work.join(".test-home"));
     let checkpoints = work.join(".checkpoints");
     std::fs::create_dir_all(&checkpoints).unwrap();
     c.env("PLY_CHECKPOINT_DIR", checkpoints);

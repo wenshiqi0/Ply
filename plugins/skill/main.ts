@@ -138,7 +138,8 @@ export async function onLoad(options: {
   if (options.directory !== undefined && (typeof options.directory !== "string" || !options.directory.trim())) throw new Error("skill directory must be a non-empty path");
   const directory = path.resolve(options.directory ?? process.env.PLY_LAUNCH_DIRECTORY ?? process.cwd());
   configured = { paths: paths(options.paths ?? [], "skill paths", directory),
-    auto: [path.join(directory, ".agents/skills"), path.join(directory, "skills"), path.join(directory, "SKILL.md")] };
+    auto: [...new Set([path.join(directory, ".agents/skills"), path.join(directory, "skills"), path.join(directory, "SKILL.md"),
+      ...(process.env.PLY_USER_SKILLS_DIRECTORY ? [process.env.PLY_USER_SKILLS_DIRECTORY] : [])])] };
   await context.loaded;
   const catalog = await discoverSkills();
   await context.set({ type: context.Type.Extensions, key: "skills", content: catalog.skills.length ? skillContext(catalog) : null });

@@ -31,7 +31,9 @@ ply tui --mount disk:. --mount /team=disk:/path/to/team-skills:ro \
   --plugin-options 'skill={"paths":["/team"]}'
 ```
 
-CLI 只转发通用插件参数与启动目录信息，不解析技能目录规则，也不自动增加挂载。`--cwd` 改变 agent 的工作目录；如果启动目录通过磁盘挂载映射到其他命名空间路径，宿主会向插件提供对应路径。自定义挂载没有开放启动目录时，该目录不可读，可通过插件的 `directory` 指定已挂载的位置。
+CLI 为 `~/.agents/skills` 建立默认只读挂载，并把可见路径通过 `PLY_USER_SKILLS_DIRECTORY` 交给 skill 插件；其中包含 SKILL.md 的直属目录符号链接会各自建立只读挂载，不开放链接目标的父目录。已有的显式挂载保留原来源与权限。其他额外目录仍需显式挂载，元数据解析、去重和上下文构建由插件负责。
+
+`--cwd` 改变 agent 的工作目录；如果启动目录通过磁盘挂载映射到其他命名空间路径，宿主会向插件提供对应路径。自定义挂载没有开放启动目录时，该目录不可读，可通过插件的 `directory` 指定已挂载的位置。未加载 skill 插件时不自动挂载用户 skills。
 
 Rust 嵌入方在 `KernelConfig` 配置同一个入口：
 
@@ -48,16 +50,17 @@ for plugin in PluginSource::defaults() {
 kernel.ready().await?;
 ```
 
-参数传递是所有插件通用的：`onLoad(options)` 获得该插件的 JSON；未指定时传 `{}`。原有无参 `onLoad()` 写法继续可用。skill 的参数由它自己解释，没有添加 agent 工具参数。
+参数传递是所有插件通用的：`onLoad(options)` 获得该插件的 JSON；未指定时传 `{}`。原有无参 `onLoad()` 写法继续可用。skill 的参数由它自己解释，没有添加 agent 工具参数。Rust 嵌入方如需用户级 skills，应自行建立只读挂载，并在 `config.env` 中设置可见的 `PLY_USER_SKILLS_DIRECTORY`；插件不会自行访问宿主文件系统。
 
 ## 自动发现与上下文
 
-默认从命令启动目录发现以下位置，不向父目录或用户主目录搜索：
+默认从命令启动目录发现以下位置，再读取 CLI 提供的用户 skills 目录；不向项目父目录搜索：
 
 ```text
 .agents/skills/<name>/SKILL.md
 skills/<name>/SKILL.md
 SKILL.md                         # 当前目录本身是一个 skill
+~/.agents/skills/<name>/SKILL.md  # 用户级 skills，目录不存在时跳过
 ```
 
 skill 在 onLoad 中发现元数据，随后直接向 context 写入 Extensions 模板：
@@ -78,7 +81,7 @@ agent 不调用 skill 的发现、渲染或校验方法。context 在新建对�
 
 模型仍使用原有 agent/bash/create/edit/read/remove 六个工具，默认子 agent 移除 agent，保留五个。skill 不注册模型工具。
 
-优先使用插件 paths 中的显式来源，再自动发现；同名保留第一个并记录诊断。无效的自动发现项或集合内技能产生诊断；显式文件无效、额外路径不存在时，onLoad 失败。可信宿主可通过 `import { skill } from "ply:plugins"`、等待 `skill.loaded`，读取 `skill.catalog` 查看元数据和诊断。
+优先使用插件 paths 中的显式来源，再使用项目自动发现项，最后使用用户级 skills；同名保留第一个并记录诊断。无效的自动发现项或集合内技能产生诊断；显式文件无效、额外路径不存在时，onLoad 失败。可信宿主可通过 `import { skill } from "ply:plugins"`、等待 `skill.loaded`，读取 `skill.catalog` 查看元数据和诊断。
 
 技能正文由模型通过 read 分页读取到 has_more 为 false，遇到截断时缩小行范围；读取和审批跟随现有工具流程。
 

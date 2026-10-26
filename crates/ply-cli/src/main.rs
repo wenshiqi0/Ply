@@ -10,8 +10,9 @@
 //! ```
 //!
 //! Everything runs over explicitly mounted storage (default: the current
-//! directory, read-write, at its own path, so the file plugins and Ply sh
-//! see the same paths). The default plugins (agent, bash,
+//! directory, read-write, at its own path, plus read-only user skills when
+//! the skill plugin is enabled). The file plugins and Ply sh see the same
+//! paths. The default plugins (agent, bash,
 //! context, create, deepseek, edit, read, remove, skill) are loaded unless
 //! `--no-default-plugins`; `--model mimo-v2.6-pro` replaces deepseek with
 //! mimo. `--plugin DIR` adds more. `--record FILE` appends every fiber event as a JSON line.
@@ -25,6 +26,8 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use ply_kernel::{Io, JsonlRecorder, Kernel, KernelConfig, KernelError, MountMode, PluginSource, StorageSpec};
+
+mod user_skills;
 
 #[derive(Parser)]
 #[command(name = "ply", version, about = "ply agent harness")]
@@ -56,7 +59,8 @@ enum Cmd {
 struct Setup {
     /// `AT=disk:PATH[:ro]`, `AT=sqlite:PATH[:ro]`, `AT=memory`, or
     /// `disk:PATH[:ro]` (mounted at its own absolute path). Repeatable.
-    /// Default: the current directory, read-write, at its own path.
+    /// Default: the current directory, read-write, at its own path;
+    /// ~/.agents/skills is also exposed read-only when the skill plugin is enabled.
     #[arg(long = "mount", value_name = "SPEC")]
     mounts: Vec<String>,
     /// Starting directory inside the namespace (default: first mount).
@@ -261,8 +265,16 @@ async fn kernel(setup: &Setup, ui: UiMode) -> Result<Kernel> {
     }
     let cwd = setup.cwd.clone().or(first_mount).unwrap_or_else(|| "/".into());
     let launch = launch_directory(&io, &base);
+    let user_skills_directory = if !setup.no_default_plugins
+        || setup.plugins.iter().any(|dir| dir.file_name().is_some_and(|name| name == "skill"))
+    {
+        user_skills::mount(&io, std::env::var_os("HOME").map(PathBuf::from))?
+    } else { None };
     let mut config = KernelConfig::new(io, cwd);
     config.env.insert("PLY_LAUNCH_DIRECTORY".into(), launch);
+    if let Some(directory) = user_skills_directory {
+        config.env.insert("PLY_USER_SKILLS_DIRECTORY".into(), directory);
+    }
     for (name, value) in &setup.plugin_options {
         if config.plugin_options.insert(name.clone(), value.clone()).is_some() {
             bail!("provide --plugin-options once per plugin: {name}");

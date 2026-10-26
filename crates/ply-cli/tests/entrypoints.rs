@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 fn command(work: &std::path::Path, mode: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ply"));
-    command.current_dir(work).arg(mode);
+    command.current_dir(work).env("HOME", work.join(".test-home")).arg(mode);
     command
 }
 fn call(work: &std::path::Path, tool: &str, input: Value) -> Output {
@@ -14,6 +14,95 @@ fn call(work: &std::path::Path, tool: &str, input: Value) -> Output {
 fn value(output: &Output) -> Value {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn default_user_skills_are_visible_readable_and_read_only_including_links() {
+    use std::os::unix::fs::symlink;
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let user_skills = home.path().join(".agents/skills");
+    let write_skill = |root: &std::path::Path, name: &str, source: &str| {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), format!("---\nname: {name}\ndescription: {source} instructions.\n---\nBODY_ONLY_{source}\n")).unwrap();
+        std::fs::write(dir.join("reference.txt"), source).unwrap();
+        dir.canonicalize().unwrap()
+    };
+    write_skill(&user_skills, "user-review", "user");
+    write_skill(&user_skills, "shared-review", "user");
+    let linked = write_skill(outside.path(), "linked-review", "linked");
+    symlink(&linked, user_skills.join("linked-review")).unwrap();
+    let project = write_skill(&work.path().join(".agents/skills"), "shared-review", "project");
+    let explicit = write_skill(&work.path().join("extra"), "shared-review", "explicit");
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, "not exposed by a linked skill").unwrap();
+    let probe = work.path().join("probe.ts");
+    std::fs::write(&probe, r#"import {skill,context,read} from "ply:plugins";
+await skill.loaded;
+const catalog=skill.catalog;
+const id=await context.openTask({prompt:"inspect skills",model:{contextWindow:131072,maxTokens:16384},allowed_tools:["read"],facts:{max_children:0,max_delegation_depth:0,report_sections:[],completion_marker:"[[DONE]]"}});
+try {
+const prepared=await context.prepareContext(id);
+const visible=catalog.skills.every(s=>prepared.context.systemPrompt.includes(s.path));
+const bodies=await Promise.all(catalog.skills.map(s=>read({path:s.path})));
+console.log(JSON.stringify({catalog,visible,eagerBody:prepared.context.systemPrompt.includes("BODY_ONLY_"),bodies,cwd:process.cwd()}));
+}finally{await context.closeConversation(id);}"#).unwrap();
+    let run = || {
+        let mut c = command(work.path(), "run");
+        c.env("HOME", home.path());
+        c
+    };
+    let report = value(&run().arg(&probe).output().unwrap());
+    let skills = report["catalog"]["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 3);
+    assert_eq!(report["visible"], true);
+    assert_eq!(report["eagerBody"], false);
+    assert_eq!(report["cwd"], work.path().canonicalize().unwrap().display().to_string());
+    assert_eq!(skills.iter().find(|s| s["name"] == "shared-review").unwrap()["path"], project.join("SKILL.md").display().to_string());
+    assert!(report["bodies"].to_string().contains("BODY_ONLY_linked"));
+    assert!(report["catalog"]["warnings"].to_string().contains("duplicate skill name"));
+
+    let selected = value(&run().arg("--plugin-options").arg(format!("skill={}", json!({"paths":[explicit]}))).arg(&probe).output().unwrap());
+    assert_eq!(selected["catalog"]["skills"][0]["description"], "explicit instructions.");
+    let mapped = value(&run().arg("--mount").arg(format!("/work=disk:{}", work.path().display())).args(["--cwd", "/work"]).arg(&probe).output().unwrap());
+    assert_eq!(mapped["cwd"], "/work");
+    assert_eq!(mapped["catalog"]["skills"].as_array().unwrap().len(), 3);
+
+    for name in ["user-review", "linked-review"] {
+        let output = command(work.path(), "call").env("HOME", home.path()).arg("create")
+            .arg(json!({"path":user_skills.join(name).join("forbidden.txt"),"content":"bad"}).to_string()).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("EROFS"), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    assert!(!user_skills.join("user-review/forbidden.txt").exists());
+    assert!(!linked.join("forbidden.txt").exists());
+    let denied = command(work.path(), "call").env("HOME", home.path()).arg("read")
+        .arg(json!({"path":secret}).to_string()).output().unwrap();
+    assert!(!denied.status.success());
+}
+
+#[test]
+fn disabled_skills_do_not_mount_user_files_and_explicit_mounts_keep_their_source() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join(".agents/skills");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("private.txt");
+    std::fs::write(&file, "user skill resource").unwrap();
+    let probe = work.path().join("probe.ts");
+    std::fs::write(&probe, format!(r#"import {{readFile}} from "node:fs/promises";
+let visible=false;try{{await readFile({},"utf8");visible=true;}}catch{{}}
+console.log(JSON.stringify({{visible,directory:process.env.PLY_USER_SKILLS_DIRECTORY??null}}));"#, json!(file))).unwrap();
+    let hidden = value(&command(work.path(), "run").env("HOME", home.path())
+        .arg("--no-default-plugins").arg(&probe).output().unwrap());
+    assert_eq!(hidden, json!({"visible":false,"directory":null}));
+    let overridden = value(&command(work.path(), "run").env("HOME", home.path())
+        .args(["--mount", "disk:."]).arg("--mount").arg(format!("{}=memory", root.display()))
+        .arg(&probe).output().unwrap());
+    assert_eq!(overridden["visible"], false);
+    assert_eq!(overridden["directory"], root.display().to_string());
 }
 
 #[test]

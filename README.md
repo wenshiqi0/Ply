@@ -213,7 +213,7 @@ cargo build -p ply-cli
 
 TUI 将用户输入交给 agent，不直接调用 read/bash 等业务工具，也不额外传工具白名单。主 agent 默认支持 agent/bash/create/edit/read/remove 六个工具，子 agent 按现有委派限制移除 agent。CLI 为 TUI 选择逐次审批策略，读取、写入、命令执行和模型委派均需确认；可加 `--jev` 显示 bash 风险评估。详见 [TUI 使用说明](docs/tui.md)。
 
-内置 `skill` 从启动目录下的 `.agents/skills`、`skills` 和 `SKILL.md` 发现技能。插件自己的 `onLoad({ paths })` 接受额外路径；CLI 示例：`ply tui --plugin-options 'skill={"paths":["./examples/skills"]}'`。元数据写入 context 的 Extensions 模板，完整指令由 read 按需读取，详见 [Skills](docs/skills.md)。
+内置 `skill` 从启动目录下的 `.agents/skills`、`skills` 和 `SKILL.md` 发现技能，并默认加载 `~/.agents/skills`。CLI 为用户 skills 及其直属符号链接技能建立只读挂载；同名技能优先使用显式路径，其次项目目录，最后用户目录。插件自己的 `onLoad({ paths })` 接受额外路径；CLI 示例：`ply tui --plugin-options 'skill={"paths":["./examples/skills"]}'`。元数据写入 context 的 Extensions 模板，完整指令由 read 按需读取，详见 [Skills](docs/skills.md)。
 
 默认把当前目录以读写方式挂在它自己的路径上：
 
