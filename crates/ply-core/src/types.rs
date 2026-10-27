@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Type {
     /// `any`, `unknown`, or something ply does not read (generics,
-    /// imported types, conditional types...).
+    /// unresolved/external types, conditional types...).
     Unknown,
     String,
     Number,

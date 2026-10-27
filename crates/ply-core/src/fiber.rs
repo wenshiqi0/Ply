@@ -1,4 +1,4 @@
-//! Fibers: one execution of a plugin, its records, where it came from and how it ended.
+//! Fibers: one execution of a plugin, where it came from and how it ended.
 
 use serde::{Deserialize, Serialize};
 
@@ -79,13 +79,6 @@ pub enum FiberEvent {
         at_ms: u64,
         fiber: Fiber,
     },
-    /// A structured record the running fiber emitted. The kernel attaches
-    /// its identity; the payload's meaning belongs to the plugin.
-    Record {
-        at_ms: u64,
-        id: String,
-        data: Payload,
-    },
     Exit {
         at_ms: u64,
         id: String,
@@ -117,11 +110,9 @@ mod tests {
             exit: Exit::Failed { error: "Error: ENOENT".into(), stack: None },
             ms: 3,
         };
-        let record = FiberEvent::Record { at_ms: 2, id: "f2".into(), data: json!({ "type": "progress", "completed": 1 }) };
         assert_eq!(serde_json::to_value(&spawn).unwrap()["event"], "spawn");
-        assert_eq!(serde_json::to_value(&record).unwrap()["event"], "record");
         assert_eq!(serde_json::to_value(&exit).unwrap()["exit"]["status"], "failed");
-        for event in [spawn, record, exit] {
+        for event in [spawn, exit] {
             let json = serde_json::to_value(&event).unwrap();
             assert_eq!(serde_json::from_value::<FiberEvent>(json).unwrap(), event);
         }

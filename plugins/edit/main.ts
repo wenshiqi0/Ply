@@ -1,21 +1,14 @@
+import path from "node:path";
+import type { EditInput, EditResult } from "./types";
 import { context } from "ply:plugins";
 import { readFile, stat, writeFile } from "node:fs/promises";
-import path from "node:path";
 
 /**
  * Replace an exact string in a file. old_string must occur exactly once
  * unless replace_all is set; include enough surrounding text to make it
  * unique.
  */
-export async function onHandle(input: {
-  path: string;
-  /** Exact text to replace. */
-  old_string: string;
-  /** Replacement text. */
-  new_string: string;
-  /** Replace every occurrence. */
-  replace_all?: boolean;
-}): Promise<{ path: string; replacements: number }> {
+export async function onHandle(input: EditInput): Promise<EditResult> {
   const { path: file, old_string: before, new_string: after } = input ?? ({} as typeof input);
   if (typeof file !== "string" || file === "") throw new Error("'path' must be a non-empty string");
   if (typeof before !== "string" || before === "") throw new Error("'old_string' must be a non-empty string");
@@ -34,6 +27,5 @@ export async function onHandle(input: {
 
 /** Offer this plugin to the model as a tool. */
 export async function onLoad() {
-  await context.loaded;
   await context.registerTool("edit");
 }

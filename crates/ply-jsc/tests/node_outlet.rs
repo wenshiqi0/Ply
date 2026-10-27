@@ -617,31 +617,39 @@ export async function onHandle(input) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn fiber_disposal_runs_after_cancellation_and_cpu_termination() {
+async fn finally_runs_after_cancellation_and_cpu_termination() {
     let w = world();
-    let main = w.plugin("dispose.ts", r#"
-import { onDispose } from "ply:lifecycle";
+    let main = w.plugin("cleanup.ts", r#"
+import fs from "node:fs";
 let active = new Set();
 export function count() { return active.size; }
+async function spin() { await null; while (true) {} }
 export async function onHandle(input) {
   active.add(input.id);
-  const unwatch = onDispose(async () => { await null; active.delete(input.id); });
-  if (input.spin) { await null; while (true) {} }
-  await new Promise(resolve => setTimeout(resolve, 200));
-  active.delete(input.id); unwatch();
+  try {
+    if (input.spin) await spin();
+    else await new Promise(resolve => setTimeout(resolve, 200));
+  } catch (error) {
+    fs.writeFileSync(input.id + "-caught", `${error.name}:${error.code}`);
+    throw error;
+  } finally { await null; active.delete(input.id); }
 }
 "#);
-    let realm = w.realm_with("dispose", Limits { turn_cpu: Duration::from_millis(100), ..Limits::default() }, None).await;
+    let realm = w.realm_with("cleanup", Limits { turn_cpu: Duration::from_millis(100), ..Limits::default() }, None).await;
     let input = json!({ "id": "cancelled" });
     let mut pending = Box::pin(w.rt.run_fiber(realm, &main, &input, "cancelled"));
     tokio::select! { result = &mut pending => panic!("premature: {result:?}"), _ = tokio::time::sleep(Duration::from_millis(20)) => {} }
     drop(pending);
     tokio::time::timeout(Duration::from_secs(2), w.rt.idle(realm)).await.unwrap();
     assert_eq!(w.rt.call(realm, &main, "count", vec![]).await.unwrap(), json!(0));
+    assert_eq!(std::fs::read_to_string(w.data.path().join("cancelled-caught")).unwrap(), "AbortError:ERR_PLY_CANCELLED");
+    // The spinning frame is terminated without its own finally; the frame
+    // awaiting it is rejected and runs its finally.
     let error = w.rt.run_fiber(realm, &main, &json!({ "id": "spin", "spin": true }), "spin").await.unwrap_err();
     assert_eq!(error.kind, ply_jsc::FailureKind::CpuLimit);
     tokio::time::timeout(Duration::from_secs(2), w.rt.idle(realm)).await.unwrap();
     assert_eq!(w.rt.call(realm, &main, "count", vec![]).await.unwrap(), json!(0));
+    assert_eq!(std::fs::read_to_string(w.data.path().join("spin-caught")).unwrap(), "AbortError:ERR_PLY_CANCELLED");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -689,23 +697,35 @@ impl HostBridge for CleanupObserver {
     fn on_event(&self, event: FiberEvent) { self.0.lock().unwrap().push(event); }
 }
 
+/// Start a call, let it reach its first await, then cancel it.
+async fn cancel_once_awaiting(w: &World, realm: RealmId, main: &str, input: Value, fiber: &str) {
+    let mut pending = Box::pin(w.rt.run_fiber(realm, main, &input, fiber));
+    tokio::select! { result = &mut pending => panic!("premature: {result:?}"), _ = tokio::time::sleep(Duration::from_millis(30)) => {} }
+    drop(pending);
+}
+
+fn cleanups(observer: &CleanupObserver, owner: &str) -> Vec<(u64, CleanupStatus, Option<String>)> {
+    observer.0.lock().unwrap().iter().filter_map(|event| match event {
+        FiberEvent::Cleanup { id, owner: Some(o), status, error, .. } if o == owner => Some((*id, *status, error.clone())),
+        _ => None,
+    }).collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn disposal_deadline_interrupts_cpu_sync_exec_and_async_waits() {
+async fn cleanup_deadline_interrupts_cpu_sync_exec_and_async_waits() {
     let w = world();
     let main = w.plugin("cleanup-deadline.ts", r#"
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
-import { onDispose } from "ply:lifecycle";
-export function onHandle(input) {
-  onDispose(async () => {
+export async function onHandle(input) {
+  try { await new Promise(resolve => setTimeout(resolve, 30000)); }
+  finally {
     fs.writeFileSync(input.mode + "-entered", "yes");
     if (input.mode === "cpu") while (true) {}
     if (input.mode === "exec") execFileSync("/bin/sleep", ["30"]);
     if (input.mode === "async") await new Promise(resolve => setTimeout(resolve, 30000));
     fs.writeFileSync(input.mode + "-late", "must not run");
-  });
-  onDispose(() => fs.writeFileSync(input.mode + "-tail", "must not run"));
-  throw new Error("start disposal");
+  }
 }
 "#);
     let observer = Arc::new(CleanupObserver::default());
@@ -714,20 +734,13 @@ export function onHandle(input) {
     for mode in ["cpu", "exec", "async"] {
         let started = std::time::Instant::now();
         tokio::time::timeout(Duration::from_secs(4), async {
-            w.rt.run_fiber(realm, &main, &json!({ "mode": mode }), mode).await.unwrap_err();
+            cancel_once_awaiting(&w, realm, &main, json!({ "mode": mode }), mode).await;
             w.rt.idle(realm).await;
         }).await.expect("cleanup must not wait for the 20s CPU / 30s IO limit");
         assert!(started.elapsed() >= Duration::from_millis(1900));
         assert!(w.data.path().join(format!("{mode}-entered")).exists());
         assert!(!w.data.path().join(format!("{mode}-late")).exists());
-        assert!(!w.data.path().join(format!("{mode}-tail")).exists());
-        let events: Vec<_> = {
-            let events = observer.0.lock().unwrap();
-            events.iter().filter_map(|event| match event {
-                FiberEvent::Cleanup { id, owner, status, error, .. } if owner.as_deref() == Some(mode) => Some((*id, *status, error.clone())),
-                _ => None,
-            }).collect()
-        };
+        let events = cleanups(&observer, mode);
         assert_eq!(events.len(), 2, "{events:?}");
         assert_eq!(events[0].1, CleanupStatus::Started);
         assert_eq!(events[1].1, CleanupStatus::TimedOut);
@@ -739,82 +752,107 @@ export function onHandle(input) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn disposal_failures_are_observed_and_do_not_skip_later_callbacks() {
+async fn a_host_call_that_sees_the_cancel_throws_it_once_and_finally_still_awaits() {
+    let w = world();
+    let main = w.plugin("sync-cancel.ts", r#"
+import fs from "node:fs";
+export async function onHandle() {
+  try {
+    fs.writeFileSync("spinning", "yes");
+    while (true) fs.readFileSync("spinning");
+  } catch (error) {
+    fs.writeFileSync("caught", `${error.name}:${error.code}`);
+    throw error;
+  } finally {
+    await fs.promises.writeFile("finally-1", "awaited");
+    await new Promise(resolve => setTimeout(resolve, 10));
+    fs.writeFileSync("finally-2", "after a timer");
+  }
+}
+"#);
+    let observer = Arc::new(CleanupObserver::default());
+    let realm = w.realm_with("sync-cancel", Limits { turn_cpu: Duration::from_secs(20), ..Limits::default() }, Some(observer.clone())).await;
+    let input = json!({});
+    let mut pending = Box::pin(w.rt.run_fiber(realm, &main, &input, "owner"));
+    let spinning = async { while !w.data.path().join("spinning").exists() { tokio::time::sleep(Duration::from_millis(2)).await; } };
+    tokio::select! { result = &mut pending => panic!("premature: {result:?}"), result = tokio::time::timeout(Duration::from_secs(3), spinning) => result.unwrap() }
+    drop(pending);
+    tokio::time::timeout(Duration::from_secs(2), w.rt.idle(realm)).await.expect("cleanup did not finish");
+    assert_eq!(std::fs::read_to_string(w.data.path().join("caught")).unwrap(), "AbortError:ERR_PLY_CANCELLED");
+    assert_eq!(std::fs::read_to_string(w.data.path().join("finally-1")).unwrap(), "awaited");
+    assert_eq!(std::fs::read_to_string(w.data.path().join("finally-2")).unwrap(), "after a timer");
+    assert_eq!(cleanups(&observer, "owner").iter().map(|e| e.1).collect::<Vec<_>>(), vec![CleanupStatus::Started, CleanupStatus::Done]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cleanup_failures_are_observed() {
     let w = world();
     let main = w.plugin("cleanup-errors.ts", r#"
 import fs from "node:fs";
-import { onDispose } from "ply:lifecycle";
-export function onHandle(input) {
-  onDispose(() => { if (input.fail) throw new Error("first cleanup failed"); });
-  onDispose(async () => { await null; fs.writeFileSync(input.name, "second cleanup ran"); });
-  throw new Error("start disposal");
+export async function onHandle(input) {
+  try { await new Promise(resolve => setTimeout(resolve, 30000)); }
+  finally {
+    await null;
+    fs.writeFileSync(input.name, "finally ran");
+    if (input.fail) throw new Error("cleanup failed");
+  }
 }
 "#);
     let observer = Arc::new(CleanupObserver::default());
     let realm = w.realm_with("cleanup-errors", Limits::default(), Some(observer.clone())).await;
     for (name, fail, expected) in [("failed", true, CleanupStatus::Failed), ("done", false, CleanupStatus::Done)] {
-        w.rt.run_fiber(realm, &main, &json!({ "name": name, "fail": fail }), name).await.unwrap_err();
+        cancel_once_awaiting(&w, realm, &main, json!({ "name": name, "fail": fail }), name).await;
         tokio::time::timeout(Duration::from_secs(1), w.rt.idle(realm)).await.unwrap();
         assert!(w.data.path().join(name).exists());
-        let events = observer.0.lock().unwrap();
-        let events: Vec<_> = events.iter().filter_map(|event| match event {
-            FiberEvent::Cleanup { owner, status, error, .. } if owner.as_deref() == Some(name) => Some((*status, error.clone())),
-            _ => None,
-        }).collect();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].0, CleanupStatus::Started);
-        assert_eq!(events[1].0, expected);
-        if fail { assert!(events[1].1.as_ref().unwrap().contains("first cleanup failed")); }
-        else { assert_eq!(events[1].1, None); }
+        let events = cleanups(&observer, name);
+        assert_eq!(events.iter().map(|e| e.1).collect::<Vec<_>>(), vec![CleanupStatus::Started, expected]);
+        // Rethrowing the AbortError is the normal end of a cleanup.
+        if fail { assert!(events[1].2.as_ref().unwrap().contains("cleanup failed")); }
+        else { assert_eq!(events[1].2, None); }
     }
 }
 
-
 #[tokio::test(flavor = "multi_thread")]
-async fn successful_disposal_retires_pending_timers() {
+async fn finished_cleanup_retires_pending_timers() {
     let w = world();
     let main = w.plugin("cleanup-complete.ts", r#"
 import fs from "node:fs";
-import { onDispose } from "ply:lifecycle";
-export function onHandle() {
-  onDispose(() => {
+export async function onHandle() {
+  try { await new Promise(resolve => setTimeout(resolve, 30000)); }
+  finally {
     setInterval(() => fs.writeFileSync("interval-late", "leaked"), 1000);
     setTimeout(() => fs.writeFileSync("timeout-late", "leaked"), 5000);
     new Promise(resolve => setTimeout(resolve, 5000)).then(() => fs.writeFileSync("promise-late", "leaked"));
-  });
-  throw new Error("start disposal");
+  }
 }
 "#);
     let observer = Arc::new(CleanupObserver::default());
     let realm = w.realm_with("cleanup-complete", Limits::default(), Some(observer.clone())).await;
-    w.rt.run_fiber(realm, &main, &json!({}), "owner").await.unwrap_err();
+    cancel_once_awaiting(&w, realm, &main, json!({}), "owner").await;
     tokio::time::timeout(Duration::from_secs(1), w.rt.idle(realm)).await.expect("completed cleanup left timer resources alive");
     for file in ["interval-late", "timeout-late", "promise-late"] {
         assert!(!w.data.path().join(file).exists());
     }
-    let statuses: Vec<_> = observer.0.lock().unwrap().iter().filter_map(|event| match event {
-        FiberEvent::Cleanup { owner, status, .. } if owner.as_deref() == Some("owner") => Some(*status),
-        _ => None,
-    }).collect();
-    assert_eq!(statuses, vec![CleanupStatus::Started, CleanupStatus::Done]);
+    assert_eq!(cleanups(&observer, "owner").iter().map(|e| e.1).collect::<Vec<_>>(), vec![CleanupStatus::Started, CleanupStatus::Done]);
     assert_eq!(w.rt.eval(realm, "'available'").await.unwrap(), json!("available"));
 }
 
-
 #[tokio::test(flavor = "multi_thread")]
-async fn successful_disposal_cancels_unawaited_host_tasks() {
+async fn finished_cleanup_cancels_unawaited_host_tasks_and_refuses_new_calls() {
     use std::sync::atomic::{AtomicBool, Ordering};
     #[derive(Default)]
-    struct WaitingHost { started: AtomicBool, active: AtomicBool, events: Mutex<Vec<FiberEvent>> }
+    struct WaitingHost { started: AtomicBool, active: AtomicBool, spawned: AtomicBool, events: Mutex<Vec<FiberEvent>> }
     struct Active<'a>(&'a AtomicBool);
     impl Drop for Active<'_> { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
     #[async_trait::async_trait]
     impl HostBridge for WaitingHost {
-        async fn call(&self, _: Caller, _: &str, args: Value) -> Result<Value, String> {
-            if args["plugin"] == "ready" {
+        async fn call(&self, _: Caller, op: &str, args: Value) -> Result<Value, String> {
+            if op == "kernel.spawn" { self.spawned.store(true, Ordering::SeqCst); return Ok(Value::Null); }
+            if args["name"] == "ready" {
                 while !self.started.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
                 return Ok(Value::Null);
             }
+            if args["name"] != "never" { return std::future::pending().await; }
             self.active.store(true, Ordering::SeqCst);
             let _active = Active(&self.active);
             self.started.store(true, Ordering::SeqCst);
@@ -824,23 +862,26 @@ async fn successful_disposal_cancels_unawaited_host_tasks() {
     }
     let w = world();
     let main = w.plugin("cleanup-host.ts", r#"import plugins from "ply:plugins";
-
-import { onDispose } from "ply:lifecycle";
-export function onHandle() {
-  onDispose(async () => {
-    plugins.never({}).catch(() => {});
-    await plugins.ready({});
-  });
-  throw new Error("start disposal");
+import * as events from "ply:events";
+import fs from "node:fs";
+export async function onHandle() {
+  try { await events.emit("first", {}); }
+  finally {
+    try { await plugins.child({}); } catch (error) { fs.writeFileSync("spawn-refused", `${error.name}:${error.code}`); }
+    events.emit("never", {}).catch(() => {});
+    await events.emit("ready", {});
+  }
 }
 "#);
     let host = Arc::new(WaitingHost::default());
     let realm = w.realm_with("cleanup-host", Limits::default(), Some(host.clone())).await;
-    w.rt.run_fiber(realm, &main, &json!({}), "owner").await.unwrap_err();
+    cancel_once_awaiting(&w, realm, &main, json!({}), "owner").await;
     if tokio::time::timeout(Duration::from_secs(1), w.rt.idle(realm)).await.is_err() {
         panic!("completed cleanup left a host task pending: started={} active={} output={:?}", host.started.load(Ordering::SeqCst), host.active.load(Ordering::SeqCst), w.rt.take_output(realm).await);
     }
     assert!(host.started.load(Ordering::SeqCst));
+    assert!(!host.spawned.load(Ordering::SeqCst), "a cleaning call started a new call");
+    assert_eq!(std::fs::read_to_string(w.data.path().join("spawn-refused")).unwrap(), "AbortError:ERR_PLY_CANCELLED");
     tokio::time::timeout(Duration::from_secs(1), async {
         while host.active.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
     }).await.expect("host task cancellation did not drop its future");
@@ -849,4 +890,37 @@ export function onHandle() {
         _ => None,
     }).collect();
     assert_eq!(statuses, vec![CleanupStatus::Started, CleanupStatus::Done]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_dispose_hook_runs_once_within_its_deadline() {
+    let w = world();
+    let main = w.plugin("dispose-hook.ts", r#"
+import fs from "node:fs";
+let calls = 0;
+export async function onDispose() {
+  fs.writeFileSync("disposed-" + (++calls), "yes");
+  if (fs.existsSync("hang")) await new Promise(resolve => setTimeout(resolve, 30000));
+}
+export function onHandle() { return "ok"; }
+"#);
+    let plain = w.plugin("no-dispose.ts", "export function onHandle() { return 1; }\n");
+    let observer = Arc::new(CleanupObserver::default());
+    let realm = w.realm_with("dispose-hook", Limits::default(), Some(observer.clone())).await;
+    w.rt.run_main(realm, &main).await.unwrap();
+    w.rt.dispose(realm, &main).await.unwrap();
+    assert!(w.data.path().join("disposed-1").exists());
+    // A module whose entry never evaluated, or without onDispose, is a no-op.
+    w.rt.dispose(realm, &plain).await.unwrap();
+    std::fs::write(w.data.path().join("hang"), "").unwrap();
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(Duration::from_secs(4), w.rt.dispose(realm, &main)).await.expect("onDispose ignored its deadline").unwrap_err();
+    assert!(started.elapsed() >= Duration::from_millis(1900));
+    assert!(error.message.contains("two-second deadline"), "{error:?}");
+    let statuses: Vec<_> = observer.0.lock().unwrap().iter().filter_map(|event| match event {
+        FiberEvent::Cleanup { owner: None, status, .. } => Some(*status),
+        _ => None,
+    }).collect();
+    assert_eq!(statuses, vec![CleanupStatus::Started, CleanupStatus::Done, CleanupStatus::Started, CleanupStatus::Done,
+        CleanupStatus::Started, CleanupStatus::TimedOut]);
 }

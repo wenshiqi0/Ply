@@ -1,4 +1,5 @@
-//! Plugin-owned events. Callbacks stay in their own realm and run as child fibers.
+//! Plugin-owned events. Callbacks stay in their own realm and run as child
+//! fibers of the emitter; the envelope names the emitting plugin only.
 use crate::{FiberEvent, FiberInvocation, Kernel, LoadState, PluginSpec, now_ms};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -44,6 +45,26 @@ impl Kernel {
             return Err("declare and subscribe to events during onLoad".into());
         }
         Ok(plugin.spec.name.clone())
+    }
+
+    /// Wait until `<plugin>.<name>` is declared, or its plugin's onLoad has
+    /// ended without declaring it.
+    async fn declared(&self, name: &str) -> Result<(), String> {
+        let unknown = || format!("unknown event {name}");
+        let (owner, _) = name.split_once('.').ok_or_else(unknown)?;
+        let mut generation = self.inner.generation.subscribe();
+        loop {
+            if self.inner.events.lock().expect("event table poisoned").definitions.contains_key(name) {
+                return Ok(());
+            }
+            let settled = match self.find(owner) {
+                Some(plugin) => !matches!(*plugin.state.borrow(), LoadState::Loading),
+                None => self.inner.sealed.load(Ordering::SeqCst),
+            };
+            if settled || generation.changed().await.is_err() {
+                return Err(unknown());
+            }
+        }
     }
 
     pub(super) async fn event_op(
@@ -97,6 +118,9 @@ impl Kernel {
                     subscriptions: Vec::new(),
                 },
             );
+            drop(events);
+            // Wake subscribers waiting for this declaration.
+            self.inner.generation.send_modify(|g| *g += 1);
             return Ok(json!(name));
         }
         if op == "kernel.event_on" {
@@ -105,11 +129,10 @@ impl Kernel {
                 .and_then(Value::as_u64)
                 .filter(|v| *v > 0 && *v <= 9_007_199_254_740_991)
                 .ok_or("invalid event callback")?;
+            self.declared(name).await?;
             let mut events = self.inner.events.lock().expect("event table poisoned");
             if !events.definitions.contains_key(name) {
-                return Err(format!(
-                    "unknown event {name}; await the provider's plugins.<plugin>.loaded before subscribing"
-                ));
+                return Err(format!("unknown event {name}"));
             }
             let id = events
                 .next_subscription
@@ -168,7 +191,7 @@ impl Kernel {
             self.inner.next_event.fetch_add(1, Ordering::Relaxed)
         );
         let data = args.get("data").cloned().unwrap_or(Value::Null);
-        let envelope = json!({ "id": id, "name": name, "source": { "plugin": owner, "fiber": caller.fiber }, "data": data });
+        let envelope = json!({ "id": id, "name": name, "source": { "plugin": owner }, "data": data });
         self.emit(&FiberEvent::Plugin {
             at_ms: now_ms(),
             id,

@@ -40,7 +40,6 @@ fn default_user_skills_are_visible_readable_and_read_only_including_links() {
     std::fs::write(&secret, "not exposed by a linked skill").unwrap();
     let probe = work.path().join("probe.ts");
     std::fs::write(&probe, r#"import {skill,context,read} from "ply:plugins";
-await skill.loaded;
 const catalog=skill.catalog;
 const id=await context.openTask({prompt:"inspect skills",model:{contextWindow:131072,maxTokens:16384},allowed_tools:["read"],facts:{max_children:0,max_delegation_depth:0,report_sections:[],completion_marker:"[[DONE]]"}});
 try {
@@ -115,7 +114,6 @@ fn skills_disclose_context_from_plugin_options_and_use_existing_mounts() {
     }
     let probe=work.path().join("probe.ts");
     std::fs::write(&probe,r#"import {skill,agent} from "ply:plugins";
-await skill.loaded;
 console.log(JSON.stringify({catalog:skill.catalog,cwd:process.cwd(),agent:agent.parameters}));"#).unwrap();
     let options=r#"skill={"paths":["/team"]}"#;
     let mounts=["--mount".to_string(),"disk:.".into(),"--mount".into(),format!("/team=disk:{}:ro",external.path().display())];
@@ -137,7 +135,7 @@ console.log(JSON.stringify({catalog:skill.catalog,cwd:process.cwd(),agent:agent.
 fn plugin_onload_receives_only_its_own_json_options() {
     let work=tempfile::tempdir().unwrap(); let one=work.path().join("one"); let two=work.path().join("two");
     std::fs::create_dir_all(&one).unwrap(); std::fs::create_dir_all(&two).unwrap();
-    std::fs::write(one.join("main.ts"),"export function onLoad(options: unknown) { return {oneOptions:options}; } export function onHandle(input: {}) { return {one:ctx.oneOptions,two:ctx.twoOptions}; }").unwrap();
+    std::fs::write(one.join("main.ts"),"import plugins from \"ply:plugins\"; export function onLoad(options: unknown) { return {oneOptions:options}; } export function onHandle(input: {}) { return {one:plugins.one.oneOptions,two:plugins.two.twoOptions}; }").unwrap();
     std::fs::write(two.join("main.ts"),"export function onLoad(options: unknown) { return {twoOptions:options}; }").unwrap();
     let configured=value(&command(work.path(),"call").arg("--no-default-plugins").arg("--plugin").arg(&one).arg("--plugin").arg(&two).args(["--plugin-options",r#"one={"label":"alpha"}"#,"--plugin-options",r#"two=["beta",2]"#,"one","{}"]).output().unwrap());
     assert_eq!(configured,json!({"one":{"label":"alpha"},"two":["beta",2]}));
@@ -150,7 +148,7 @@ fn plugin_onload_receives_only_its_own_json_options() {
 fn cli_tools_files_scripts_and_read_only_mounts_work_end_to_end() {
     let work = tempfile::tempdir().unwrap();
     let catalog = value(&command(work.path(), "tools").output().unwrap());
-    for name in ["agent", "bash", "context", "create", "deepseek", "edit", "read", "remove", "skill"] {
+    for name in ["agent", "bash", "context", "create", "deepseek", "edit", "memory", "read", "remove", "skill"] {
         assert!(catalog.as_array().unwrap().iter().any(|p| p["name"] == name));
     }
     value(&call(work.path(), "create", json!({ "path": "note.txt", "content": "one\ntwo\nthree\n" })));
@@ -167,12 +165,14 @@ fn cli_tools_files_scripts_and_read_only_mounts_work_end_to_end() {
     assert!(!denied.status.success());
     assert!(!work.path().join("forbidden").exists());
     let plugin = work.path().join("echo"); std::fs::create_dir(&plugin).unwrap();
-    std::fs::write(plugin.join("main.ts"), "export function onHandle(input: string): string { return input.toUpperCase(); }").unwrap();
+    std::fs::write(plugin.join("main.ts"), "import fs from \"node:fs\"; export function onHandle(input: string): string { return input.toUpperCase(); } export function onDispose() { fs.appendFileSync(\"disposed.txt\", \"once\"); }").unwrap();
     let script = work.path().join("script.ts");
     std::fs::write(&script, "import plugins from \"ply:plugins\";\nconst v=await plugins.echo('script'); setTimeout(()=>console.log('late timer: '+v),20);").unwrap();
     let output = command(work.path(), "run").arg("--plugin").arg(&plugin).arg(&script).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("late timer: SCRIPT"));
+    // The CLI closes the kernel before exiting, so the plugin's onDispose ran once.
+    assert_eq!(std::fs::read_to_string(work.path().join("disposed.txt")).unwrap(), "once");
     value(&call(work.path(), "remove", json!({ "path": "note.txt" })));
     assert!(!work.path().join("note.txt").exists());
 }
@@ -258,18 +258,23 @@ fn cli_dispatches_registered_top_level_commands_and_lists_providers() {
 import * as commands from "ply:commands";
 import plugins from "ply:plugins";
 export async function onLoad() {
-  await commands.register({name:"hello",description:"Say hello",handler:async input => ({greeting:"hello "+input.name,owner:await fiber.info(),legacy:typeof globalThis.tools,names:Object.keys(plugins)})});
+  await commands.register({name:"hello",description:"Say hello",handler:async input => ({greeting:"hello "+input.name,hidden:[typeof globalThis.fiber,typeof globalThis.ctx],legacy:typeof globalThis.tools,names:Object.keys(plugins)})});
 }
 "#).unwrap();
     let list = command(work.path(), "commands").args(["--no-default-plugins", "--plugin"]).arg(&provider).output().unwrap();
     assert!(list.status.success(),"{}",String::from_utf8_lossy(&list.stderr));
     let metadata: Value = serde_json::from_slice(&list.stdout).unwrap();
     assert_eq!(metadata,json!([{"name":"hello","description":"Say hello","plugin":"greeter"}]));
-    let output = command(work.path(), "hello").args(["--no-default-plugins", "--plugin"]).arg(&provider).arg("{\"name\":\"Ply\"}").output().unwrap();
+    let record = work.path().join("hello.jsonl");
+    let output = command(work.path(), "hello").args(["--no-default-plugins", "--plugin"]).arg(&provider).arg("--record").arg(&record).arg("{\"name\":\"Ply\"}").output().unwrap();
     assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
     let output: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output["greeting"],"hello Ply");assert_eq!(output["legacy"],"undefined");
-    assert_eq!(output["names"],json!(["greeter"]));assert_eq!(output["owner"]["parent"],Value::Null);
+    assert_eq!(output["greeting"],"hello Ply");assert_eq!(output["legacy"],"undefined");assert_eq!(output["hidden"],json!(["undefined","undefined"]));
+    assert_eq!(output["names"],json!(["greeter"]));
+    // The command runs as a root call; only the host journal sees the tree.
+    let journal: Vec<Value> = std::fs::read_to_string(&record).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    let spawn = journal.iter().find(|e| e["event"] == "spawn" && e["fiber"]["plugin"] == "greeter").unwrap();
+    assert!(spawn["fiber"].get("parent").is_none());
     let bundled=command(work.path(),"commands").output().unwrap();
     assert!(bundled.status.success(),"{}",String::from_utf8_lossy(&bundled.stderr));
     let bundled: Value=serde_json::from_slice(&bundled.stdout).unwrap();

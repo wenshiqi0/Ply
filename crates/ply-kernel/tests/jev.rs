@@ -1,4 +1,6 @@
 //! Jev's native System One API over loopback HTTP: no supplier calls or keys.
+mod common;
+
 use serde_json::{Value, json};
 use std::{
     io::{Read, Write},
@@ -19,6 +21,29 @@ struct Records(Mutex<Vec<FiberEvent>>);
 impl FiberHook for Records {
     fn on_event(&self, event: &FiberEvent) {
         self.0.lock().unwrap().push(event.clone());
+    }
+}
+impl Records {
+    /// Plugin events named `name`, with the fiber the kernel attributed each to.
+    fn named(&self, name: &str) -> Vec<(String, Value)> {
+        self.0.lock().unwrap().iter().filter_map(|event| match event {
+            FiberEvent::Plugin { name: event, fiber, data, .. } if event == name => Some((fiber.clone().unwrap_or_default(), data.clone())),
+            _ => None,
+        }).collect()
+    }
+    /// Whether fiber `id` ran inside the call tree of `ancestor`.
+    fn within(&self, id: &str, ancestor: &str) -> bool {
+        let events = self.0.lock().unwrap();
+        let parent = |id: &str| events.iter().find_map(|event| match event {
+            FiberEvent::Spawn { fiber, .. } if fiber.id == id => Some(fiber.parent.clone()),
+            _ => None,
+        }).flatten();
+        let mut current = Some(id.to_string());
+        while let Some(id) = current {
+            if id == ancestor { return true; }
+            current = parent(&id);
+        }
+        false
     }
 }
 
@@ -127,10 +152,7 @@ fn jev_native_contract_guards_commands_and_accounts_for_its_model_calls() {
         assert!(!config.env.contains_key("TYPESAFE_API_KEY"));
         let kernel=Kernel::new(config);let records=Arc::new(Records::default());kernel.add_hook(records.clone());
         for plugin in PluginSource::defaults() {
-            let plugin=match plugin {
-                PluginSource::Embedded{name,source} if name=="agent" => PluginSource::Embedded{name,source:source.replacen("import { request as modelRequest } from \"ply:models\";",FAKE_MODEL,1)},
-                other=>other,
-            };
+            let plugin = common::mock_model(plugin, FAKE_MODEL);
             kernel.load(plugin).await.unwrap();
         }
         kernel.load(PluginSource::builtin("jev").unwrap()).await.unwrap();kernel.ready().await.unwrap();
@@ -149,32 +171,45 @@ fn jev_native_contract_guards_commands_and_accounts_for_its_model_calls() {
         assert_eq!(oversized["status"],"approval_required");
         assert!(oversized.to_string().contains("state_too_large"));
         assert_eq!(requests.lock().unwrap().len(),before);
+        // Jev's model calls are accounted in its own events, inside the agent's
+        // call tree; the agent's total_usage counts only agent model calls.
         let output=kernel.call("agent",json!({"prompt":"guard allow","allowed_tools":["bash"],"max_delegation_depth":0})).await.unwrap();
-        assert_eq!(output["text"],"done");assert_eq!(output["usage"]["calls"],2);assert_eq!(output["total_usage"]["calls"],3);
-        assert_eq!(output["total_usage"]["input_tokens"],320);assert_eq!(output["total_usage"]["output_tokens"],22);assert_eq!(output["total_usage"]["total_tokens"],342);
-        assert_eq!(output["total_usage"]["complete"],true);assert_eq!(output["total_usage"]["cache_read_tokens"],Value::Null);assert_eq!(output["total_usage"]["cache_hit_rate"],Value::Null);
+        assert_eq!(output["text"],"done");assert_eq!(output["usage"]["calls"],2);assert_eq!(output["total_usage"],output["usage"]);
+        assert_eq!(output["total_usage"]["input_tokens"],200);assert_eq!(output["total_usage"]["output_tokens"],10);assert_eq!(output["total_usage"]["total_tokens"],210);
+        assert_eq!(output["total_usage"]["complete"],true);assert_eq!(output["total_usage"]["cache_read_tokens"],180);assert_eq!(output["total_usage"]["cache_hit_rate"],0.9);
+        let agent=records.0.lock().unwrap().iter().rev().find_map(|event|match event {FiberEvent::Spawn{fiber,..} if fiber.plugin=="agent"=>Some(fiber.id.clone()),_=>None}).unwrap();
+        let calls:Vec<_>=records.named("jev.model_call").into_iter().filter(|(fiber,_)|records.within(fiber,&agent)).collect();
+        assert_eq!(calls.len(),1);assert_eq!(calls[0].1["usage"]["input_tokens"],120);assert_eq!(calls[0].1["usage"]["output_tokens"],12);assert_eq!(calls[0].1["usage"]["total_tokens"],132);
+        let started:Vec<_>=records.named("jev.model_call_started").into_iter().filter(|(fiber,data)|fiber==&calls[0].0&&data["check_id"]==calls[0].1["check_id"]).collect();
+        assert_eq!(started.len(),1);
         let error=kernel.call("agent",json!({"prompt":"guard allow","allowed_tools":["bash"],"max_turns":1})).await.unwrap_err();
         assert!(error.to_string().contains("resume_id"));
-        let checkpoint=records.0.lock().unwrap().iter().rev().find_map(|event|match event {FiberEvent::Record{data,..} if data["type"]=="agent_checkpoint"=>Some(data["resume_id"].clone()),_=>None}).unwrap();
+        let checkpoint=records.named("agent.checkpoint").last().unwrap().1["resume_id"].clone();
         let resumed=kernel.call("agent",json!({"resume_id":checkpoint})).await.unwrap();
-        assert_eq!(resumed["previous_total_usage"]["calls"],2);assert_eq!(resumed["previous_total_usage"]["cache_read_tokens"],Value::Null);
+        assert_eq!(resumed["previous_total_usage"]["calls"],1);assert_eq!(resumed["previous_total_usage"],resumed["previous_usage"]);
+        // An unanswered Jev call is unknown usage in Jev's record, not zero.
         let timed=kernel.call("agent",json!({"prompt":"guard timeout","allowed_tools":["bash"]})).await.unwrap();
-        assert_eq!(timed["status"],"approval_required");assert_eq!(timed["usage"]["calls"],1);assert_eq!(timed["total_usage"]["calls"],2);assert_eq!(timed["total_usage"]["missing_calls"],1);assert_eq!(timed["total_usage"]["complete"],false);assert_eq!(timed["total_usage"]["cache_hit_rate"],Value::Null);
+        assert_eq!(timed["status"],"approval_required");assert_eq!(timed["usage"]["calls"],1);assert_eq!(timed["total_usage"],timed["usage"]);
+        let check=timed["approval_requests"][0]["request"]["assessments"][0].clone();
+        assert_eq!(check["reason_codes"],json!(["timeout"]));
+        let unanswered:Vec<_>=records.named("jev.model_call").into_iter().filter(|(_,data)|data["check_id"]==check["check_id"]).collect();
+        assert_eq!(unanswered.len(),1);assert_eq!(unanswered[0].1["usage"],Value::Null);assert_eq!(unanswered[0].1["error"],"timeout");
         assert!(!work.path().join("agent-timeout").exists());
-        let before=kernel.call_ctx("jevStatus",vec![]).await.unwrap();
+        let before=kernel.call_plugin_method("jev", "jevStatus",vec![]).await.unwrap();
         let root=kernel.wake("bash",json!({"command":"echo cancel > cancel-marker"})).unwrap();
         tokio::time::timeout(Duration::from_secs(3),async {while !requests.lock().unwrap().iter().any(|cmd|cmd.contains("cancel")){tokio::task::yield_now().await;}}).await.unwrap();
         assert!(kernel.cancel_fiber(&root));
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let status=kernel.call_ctx("jevStatus",vec![]).await.unwrap();
+        let status=kernel.call_plugin_method("jev", "jevStatus",vec![]).await.unwrap();
         assert_eq!(status["missing_calls"].as_u64().unwrap(),before["missing_calls"].as_u64().unwrap()+1);
         assert_eq!(status["complete"],false);assert!(!work.path().join("cancel-marker").exists());
         let events=records.0.lock().unwrap();
         assert!(!serde_json::to_string(&*events).unwrap().contains("jev-fixture-secret"));
         assert!(events.iter().any(|event|matches!(event,FiberEvent::Spawn{fiber,..} if fiber.plugin=="jev" && fiber.event.as_deref()==Some("bash.beforeExecute"))));
-        let completed:Vec<_>=events.iter().filter_map(|event|match event{FiberEvent::Record{data,..} if data["type"]=="jev_check"=>Some(data),_=>None}).collect();
-        assert!(completed.iter().any(|data|data["result"]["decision"]=="deny"));assert!(completed.iter().any(|data|data["result"]["decision"]=="review"));
-        assert!(completed.iter().any(|data|data["result"]["model"]=="jev-1.14.0"));
+        let completed:Vec<_>=events.iter().filter_map(|event|match event{FiberEvent::Plugin{name,plugin,fiber,data,..} if name=="jev.check"=>Some((plugin,fiber,data)),_=>None}).collect();
+        assert!(completed.iter().all(|(plugin,fiber,data)|*plugin=="jev"&&fiber.is_some()&&data["source"]==json!({"plugin":"bash"})&&data.get("type").is_none()));
+        assert!(completed.iter().any(|(_,_,data)|data["result"]["decision"]=="deny"));assert!(completed.iter().any(|(_,_,data)|data["result"]["decision"]=="review"));
+        assert!(completed.iter().any(|(_,_,data)|data["result"]["model"]=="jev-1.14.0"));
         drop(events);drop(kernel);
     });
     drop(runtime);

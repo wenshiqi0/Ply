@@ -6,7 +6,7 @@
 //! Only the structural part of TypeScript a signature usually uses is
 //! read: primitives, literals, arrays, object types and interfaces declared
 //! in the same module, `Record<string, T>`, unions, `Promise<T>` on the
-//! return type. Anything else (generics, imported types, conditional or
+//! return type. Relative named imports are supplied by the module loader. Other forms (generics, conditional or
 //! mapped types) reads as [`Type::Unknown`]; the plugin still loads.
 
 use std::collections::HashMap;
@@ -38,7 +38,20 @@ pub struct Signature {
 /// parameters and return type.
 type Hook<'p, 'a> = (u32, &'p FormalParameters<'a>, Option<&'p TSTypeAnnotation<'a>>);
 
+#[cfg(test)]
 pub fn read(source: &str, path: &Path) -> Result<Signature, String> {
+    with_imports(source, path, HashMap::new())
+}
+
+pub fn with_imports(source: &str, path: &Path, imported: HashMap<String, Type>) -> Result<Signature, String> {
+    analyze(source, path, imported)?.0.ok_or_else(|| format!("{}: exports neither an `onHandle` nor an `onLoad` function", path.display()))
+}
+
+pub fn types(source: &str, path: &Path, imported: HashMap<String, Type>) -> Result<HashMap<String, Type>, String> {
+    Ok(analyze(source, path, imported)?.1)
+}
+
+fn analyze(source: &str, path: &Path, imported: HashMap<String, Type>) -> Result<(Option<Signature>, HashMap<String, Type>), String> {
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let parsed = Parser::new(&allocator, source, source_type).parse();
@@ -92,11 +105,17 @@ pub fn read(source: &str, path: &Path) -> Result<Signature, String> {
     }
     let handle = hooks.get("onHandle").copied();
     let load = hooks.get("onLoad").copied();
-    if handle.is_none() && load.is_none() {
-        return Err(format!("{}: exports neither an `onHandle` nor an `onLoad` function", path.display()));
-    }
-
-    let reader = Reader { source, comments: &program.comments, declared };
+    let names: Vec<_> = declared.keys().copied().collect();
+    let reader = Reader { source, comments: &program.comments, declared, imported };
+    let types = names.into_iter().map(|name| {
+        let mut visiting = vec![name.to_string()];
+        let ty = match &reader.declared[name] {
+            Declared::Members(members) => reader.members(members, &mut visiting),
+            Declared::Alias(alias) => reader.ty(alias, &mut visiting),
+        };
+        (name.to_string(), ty)
+    }).collect();
+    if handle.is_none() && load.is_none() { return Ok((None, types)); }
     let (input, output) = match handle {
         Some((_, params, returns)) => (
             match parameter(params) {
@@ -113,7 +132,7 @@ pub fn read(source: &str, path: &Path) -> Result<Signature, String> {
     };
     let doc = |hook: Option<Hook>| hook.and_then(|(start, _, _)| reader.doc(start));
     let description = doc(handle).or_else(|| doc(load));
-    Ok(Signature { description: description.unwrap_or_default(), callable: handle.is_some(), loads: load.is_some(), input, output })
+    Ok((Some(Signature { description: description.unwrap_or_default(), callable: handle.is_some(), loads: load.is_some(), input, output }), types))
 }
 
 /// `None`: no parameter; `Some(None)`: one without a type.
@@ -142,6 +161,7 @@ struct Reader<'p, 'a> {
     source: &'p str,
     comments: &'p [Comment],
     declared: HashMap<&'p str, Declared<'p, 'a>>,
+    imported: HashMap<String, Type>,
 }
 
 impl<'p, 'a> Reader<'p, 'a> {
@@ -191,7 +211,7 @@ impl<'p, 'a> Reader<'p, 'a> {
                             visiting.pop();
                             ty
                         }
-                        None => Type::Unknown,
+                        None => self.imported.get(name).cloned().unwrap_or(Type::Unknown),
                     },
                 }
             }

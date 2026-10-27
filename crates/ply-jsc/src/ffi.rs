@@ -77,6 +77,7 @@ unsafe extern "C" {
     pub fn JSValueMakeString(ctx: JSContextRef, s: JSStringRef) -> JSValueRef;
     pub fn JSValueMakeUndefined(ctx: JSContextRef) -> JSValueRef;
     pub fn JSValueMakeNumber(ctx: JSContextRef, n: f64) -> JSValueRef;
+    pub fn JSValueMakeBoolean(ctx: JSContextRef, b: bool) -> JSValueRef;
     pub fn JSValueMakeFromJSONString(ctx: JSContextRef, s: JSStringRef) -> JSValueRef;
     pub fn JSValueIsString(ctx: JSContextRef, v: JSValueRef) -> bool;
     pub fn JSValueIsObject(ctx: JSContextRef, v: JSValueRef) -> bool;

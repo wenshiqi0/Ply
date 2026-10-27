@@ -1,6 +1,7 @@
 // Model boundary for the agent-loop tests. It runs in the same JSC realm
 // and never opens a socket or starts a process.
 import { existsSync as canRecoverSummary } from "node:fs";
+import { context as fixtureContext } from "ply:plugins";
 const summaryFailedOnce = new Set();
 
 async function modelRequest(req) {
@@ -146,6 +147,30 @@ async function modelRequest(req) {
     if (task === "child branch" && !results.length) return emit([call("grandchild", "agent", { prompt: "grandchild" })], tokens, "toolUse");
     return emit(text("done " + task), tokens);
   }
+  if (task === "quota three") return !results.length
+    ? emit(["q1", "q2", "q3"].map(id => call(id, "agent", { prompt: "quota leaf" })), usage(10, 5, 90), "toolUse")
+    : emit(text(JSON.stringify(results.map(result => [result.toolCallId, result.isError,
+      result.isError ? result.content[0].text : JSON.parse(result.content[0].text).text]))), usage(10, 5, 90));
+  if (task === "forged delegation") return !results.length
+    ? emit([call("forged", "agent", { prompt: "quota leaf", delegation: "forged-by-model" })], usage(10, 5, 90), "toolUse")
+    : emit(text(JSON.stringify([results[0].isError, results[0].isError ? results[0].content[0].text : JSON.parse(results[0].content[0].text).text])), usage(10, 5, 90));
+  if (task === "inherit root") {
+    if (!results.length) return emit([call("remember", "memory", { action: "remember", scope: "project", key: "inherit-note", content: "ROOT-MEMORY-NOTE" })], usage(10, 5, 90), "toolUse");
+    if (results.length === 1) {
+      // A template change reaches only new conversations; the child must start from this one.
+      await fixtureContext.set({ source: "probe", type: "extensions", key: "snapshot", content: "TEMPLATE-AFTER-PARENT" });
+      return emit([call("leaf", "agent", { prompt: "inherit leaf" })], usage(10, 5, 90), "toolUse");
+    }
+    const [memory, child] = results.map(result => JSON.parse(result.content[0].text));
+    return emit(text("## Findings\n" + JSON.stringify({ memory: memory.changed, child: { text: child.text, policy: child.policy, report: child.report_validation },
+      own_snapshot: ctx.systemPrompt.includes("PARENT-SNAPSHOT"), user_messages: ctx.messages.filter(message => message.role === "user" && !message.ply_context).length,
+      leaked: JSON.stringify(ctx).includes("CHILD-PRIVATE") })), usage(10, 5, 90));
+  }
+  if (task === "inherit leaf") return !results.length
+    ? emit([call("child-memory", "memory", { action: "remember", key: "child-note", content: "CHILD-PRIVATE" })], usage(10, 5, 90), "toolUse")
+    : emit(text("## Findings\n" + JSON.stringify({ tools: ctx.tools.map(tool => tool.name).sort(), memory: results[0].isError ? results[0].content[0].text : "allowed",
+      parent_snapshot: ctx.systemPrompt.includes("PARENT-SNAPSHOT"), template_after: JSON.stringify(ctx).includes("TEMPLATE-AFTER-PARENT"),
+      memory_note: JSON.stringify(ctx).includes("ROOT-MEMORY-NOTE") })), usage(10, 5, 90));
   if (!results.length) return emit([
     ...text("working"), call("c1", "create", { path: "made.txt", content: "by agent" }), call("c2", "nope", {}),
   ], usage(100, 20, 300, 100, 5), "toolUse");

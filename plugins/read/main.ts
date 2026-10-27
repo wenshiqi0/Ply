@@ -1,19 +1,13 @@
+import path from "node:path";
+import type { ReadInput, ReadResult } from "./types";
 import { context } from "ply:plugins";
 import { readFile } from "node:fs/promises";
-import path from "node:path";
 
 /**
  * Read UTF-8 text from a mounted file. Prefer this tool over bash for reading
  * files. Use offset and limit to read a range of lines (default: first 200).
  */
-export async function onHandle(input: {
-  /** File to read, relative to the workspace or an absolute mounted path. */
-  path: string;
-  /** First line to read, starting at 1 (default 1). */
-  offset?: number;
-  /** Maximum number of lines to return (default 200). */
-  limit?: number;
-}): Promise<{ path: string; content: string; offset: number; lines: number; total_lines: number; has_more: boolean }> {
+export async function onHandle(input: ReadInput): Promise<ReadResult> {
   if (typeof input?.path !== "string" || input.path === "") throw new Error("'path' must be a non-empty string");
   const offset = input.offset ?? 1;
   const limit = input.limit ?? 200;
@@ -37,6 +31,5 @@ export async function onHandle(input: {
 
 /** Offer this plugin to the model as a tool. */
 export async function onLoad() {
-  await context.loaded;
   await context.registerTool("read");
 }

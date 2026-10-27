@@ -13,13 +13,14 @@
 //!   A plugin reaches another
 //!   only by awaiting it (`await plugins.bash(...)`): `then` is the call, and
 //!   the awaited execution is a child fiber.
-//! - What `onLoad` returns is mounted, flat, on the global `ctx` every
-//!   plugin sees ([`Mounts`]); `plugins.<name>.loaded` resolves when that
-//!   plugin's `onLoad` has returned, so plugins can build on each other
-//!   (register into a context, say).
-//! - What is recorded is fibers: their input, their structured records,
-//!   how they exited, and which fiber awaited which ([`FiberEvent`],
-//!   delivered to [`FiberHook`]s).
+//! - What `onLoad` returns is mounted on that plugin's handle
+//!   ([`Mounts`]). A plugin's `onLoad` starts after the plugins it imports
+//!   by name have loaded, so plugins can build on each other (register
+//!   into a context, say).
+//! - Fibers are the kernel's: plugin code never sees one. What is recorded
+//!   is their input, the events their plugins emitted, how they exited,
+//!   and which fiber awaited which ([`FiberEvent`], delivered to
+//!   [`FiberHook`]s).
 //! - These types are the only definition. The kernel builds them, hooks
 //!   receive them, records are their serialization.
 

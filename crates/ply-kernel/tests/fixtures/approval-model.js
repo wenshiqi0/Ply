@@ -1,4 +1,5 @@
 // Local model boundary for approval tests; used with the real agent loop.
+// It sees only the model request: tool errors are echoed in the reply.
 const fixtureMarkdownReply = [
   "## 项目结论", "",
   "这段包含 **加粗**、*斜体*、`inline()` 和 ~~旧方案~~。", "",
@@ -17,17 +18,24 @@ function fixtureReply(content, stopReason) {
 async function modelRequest(req) {
   if (req.operation === "describe") return { contextWindow: 32768, maxTokens: 1024 };
   const prompt = req.context.messages.find(m => m.role === "user").content;
-  const names = req.context.tools.map(t => t.name).sort();
-  await fiber.record({ type: "fixture_offered_tools", names, prompt });
   const results = req.context.messages.filter(m => m.role === "toolResult");
+  const resultText = r => r.content.map(c => c.text ?? "").join("");
+  if (prompt === "delegate-retry" && results.length === 1) {
+    return fixtureReply([{ type: "toolCall", id: "call-retry", name: "agent", arguments: { prompt: "approved-child" } }], "toolUse");
+  }
+  if (prompt === "delegate-retry" && results.length === 2) {
+    const seen = results.map(r => [r.isError, r.isError ? resultText(r) : JSON.parse(resultText(r)).text]);
+    return fixtureReply([{ type: "text", text: "retry-done " + JSON.stringify(seen) + "\n[[PLY_REPORT_COMPLETE]]" }], "stop");
+  }
   if (results.length) {
     const summary = results.map(r => {
-      const text = r.content.map(c => c.text ?? "").join("");
+      const text = resultText(r);
       let output; try { output = JSON.parse(text); } catch { output = text; }
       return { tool: r.toolName, output: r.toolName === "bash" ? { stdout: output.stdout, stderr: output.stderr, exit_code: output.exit_code }
         : r.toolName === "agent" ? output.text : output };
     });
-    const text = results.some(r => r.isError) ? "tool-rejected" : "agent-done " + JSON.stringify(summary);
+    const errors = results.filter(r => r.isError).map(resultText);
+    const text = errors.length ? "tool-rejected " + JSON.stringify(errors) : "agent-done " + JSON.stringify(summary);
     return fixtureReply([{ type: "text", text: text + "\n[[PLY_REPORT_COMPLETE]]" }], "stop");
   }
   let calls;
@@ -38,8 +46,9 @@ async function modelRequest(req) {
   else if (prompt === "double-read") calls = ["first.txt", "second.txt"].map(path => ({ name: "read", arguments: { path } }));
   else if (prompt === "delegate") calls = [{ name: "agent", arguments: { prompt: "child" } }];
   else if (prompt === "delegate-many") calls = [0,1,2].map(() => ({ name: "agent", arguments: { prompt: "child" } }));
+  else if (prompt === "delegate-retry") calls = [{ name: "agent", arguments: { prompt: "rejected-child" } }];
   else if (prompt === "child") calls = [{ name: "read", arguments: { path: "secret.txt" } }];
-  else if (prompt === "ansi") calls = [{ name: "bash", arguments: { command: "echo '\x1b]52;c;injected\x07\u202e' > ansi" } }];
+  else if (prompt === "ansi") calls = [{ name: "bash", arguments: { command: "echo '\x1b]52;c;injected\x07‮' > ansi" } }];
   else if (prompt === "cancel") {
     await new Promise(resolve => setTimeout(resolve, 5000));
     calls = [{ name: "bash", arguments: { command: "echo late > late" } }];

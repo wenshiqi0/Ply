@@ -20,7 +20,6 @@ async fn ply_named_exports_work_and_legacy_module_and_environment_are_not_aliase
             source: r#"
           import plugins, {context} from "ply:plugins";
           export async function onHandle(input: {}) {
-            await context.loaded;
             let rejected = false;
             try { await import("wendy:plugins"); } catch { rejected = true; }
             return { same: context === plugins.context, rejected, type: context.Type.Extensions };

@@ -9,9 +9,10 @@ struct Records(Mutex<Vec<(String, String)>>);
 #[async_trait::async_trait]
 impl HostBridge for Records {
     async fn call(&self, caller: Caller, op: &str, args: Value) -> Result<Value, String> {
-        assert_eq!(op, "kernel.record");
+        // The host attributes each emitted event to the call that emitted it.
+        assert_eq!((op, args["name"].as_str()), ("kernel.event_emit", Some("models.provider")));
         self.0.lock().unwrap().push((caller.fiber.unwrap(), args["data"]["provider"].as_str().unwrap().to_owned()));
-        Ok(Value::Null)
+        Ok(json!([]))
     }
 }
 
@@ -76,11 +77,12 @@ fn embedded_deepseek_and_mimo_stream_concurrently_with_their_own_identity() {
         let file = directory.path().join("model.ts");
         std::fs::write(&file, r#"
 import { request } from "ply:models";
+import * as events from "ply:events";
 export async function onHandle(input) {
   const result = await request({ operation: "complete", profile: input.profile, purpose: "task", maxTokens: 128,
     context: { systemPrompt: "Offline fixture", messages: [{ role: "user", content: "Review", timestamp: 0 }],
       tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }] } });
-  await fiber.record({ provider: input.profile.provider });
+  await events.emit("models.provider", { provider: input.profile.provider });
   return result;
 }
 "#).unwrap();

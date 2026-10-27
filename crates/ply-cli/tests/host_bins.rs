@@ -82,7 +82,7 @@ fn before_execute_hook_can_veto_a_host_program_before_it_starts() {
     program(&bins, "ply-write", "printf bad > marker");
     let guard = work.join("guard");
     std::fs::create_dir(&guard).unwrap();
-    std::fs::write(guard.join("main.ts"), r#"import {bash} from "ply:plugins";import * as events from "ply:events";export async function onLoad(){await bash.loaded;await events.on("bash.beforeExecute",()=>false);}"#).unwrap();
+    std::fs::write(guard.join("main.ts"), r#"import {bash} from "ply:plugins";import * as events from "ply:events";export async function onLoad(){await events.on("bash.beforeExecute",()=>false);}"#).unwrap();
     let output = command(&work, &bins).arg("--plugin").arg(guard).arg("bash")
         .arg(json!({"command":"ply-write"}).to_string()).output().unwrap();
     assert!(!output.status.success());

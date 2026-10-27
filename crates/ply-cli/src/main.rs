@@ -13,7 +13,7 @@
 //! directory, read-write, at its own path, plus read-only user skills when
 //! the skill plugin is enabled). The file plugins and Ply sh see the same
 //! paths. The default plugins (agent, bash,
-//! context, create, deepseek, edit, read, remove, skill) are loaded unless
+//! context, create, deepseek, edit, memory, read, remove, skill) are loaded unless
 //! `--no-default-plugins`; `--model mimo-v2.6-pro` replaces deepseek with
 //! mimo. `--plugin DIR` adds more. `--record FILE` appends every fiber event as a JSON line.
 
@@ -106,7 +106,7 @@ struct Setup {
     #[arg(long, value_name = "RATIO", value_parser = parse_context_ratio)]
     context_compact_target: Option<f64>,
     /// Do not load the default plugins (agent, bash, context, create,
-    /// deepseek, edit, read, remove, skill).
+    /// deepseek, edit, memory, read, remove, skill).
     #[arg(long)]
     no_default_plugins: bool,
     /// Append every fiber event (spawn / record / exit / cleanup / plugin, JSON lines) to this file.
@@ -313,7 +313,7 @@ async fn kernel(setup: &Setup, ui: UiMode) -> Result<Kernel> {
     let defaults = if setup.no_default_plugins { Vec::new() } else { PluginSource::defaults() };
     for plugin in defaults {
         let plugin = match &plugin {
-            PluginSource::Embedded { name, .. } if name == "deepseek" && integration == "mimo" => {
+            PluginSource::Embedded { name, .. } | PluginSource::Bundled { name, .. } if name == "deepseek" && integration == "mimo" => {
                 PluginSource::builtin("mimo").context("missing built-in MiMo integration")?
             }
             _ => plugin,
@@ -344,6 +344,7 @@ async fn kernel(setup: &Setup, ui: UiMode) -> Result<Kernel> {
 async fn describe(setup: Setup) -> Result<i32> {
     let kernel = kernel(&setup, UiMode::Disabled).await?;
     println!("{}", serde_json::to_string_pretty(&kernel.plugins())?);
+    kernel.close().await;
     Ok(0)
 }
 
@@ -353,6 +354,7 @@ async fn describe_commands(setup: Setup) -> Result<i32> {
     let include_tui = !setup.no_default_plugins;
     let kernel = kernel(&setup, if include_tui { UiMode::Ask } else { UiMode::Disabled }).await?;
     println!("{}", serde_json::to_string_pretty(&kernel.commands())?);
+    kernel.close().await;
     Ok(0)
 }
 
@@ -374,6 +376,7 @@ async fn registered(args: Vec<String>) -> Result<i32> {
     for plugin in kernel.plugins() {
         if let Some(out) = kernel.take_output(&plugin.name).await { eprint!("{}{}", out.stdout, out.stderr); }
     }
+    kernel.close().await;
     match result {
         Ok(output) => { println!("{}", serde_json::to_string_pretty(&output)?); Ok(0) }
         Err(error) => { eprintln!("ply {}: {error}", args.plugin); Ok(1) }
@@ -392,6 +395,7 @@ async fn call(args: CallArgs) -> Result<i32> {
             eprint!("{}{}", out.stdout, out.stderr);
         }
     }
+    kernel.close().await;
     match result {
         Ok(Value::String(text)) => println!("{text}"),
         Ok(output) => println!("{}", serde_json::to_string_pretty(&output)?),
@@ -406,6 +410,7 @@ async fn call(args: CallArgs) -> Result<i32> {
 async fn run(args: RunArgs) -> Result<i32> {
     let kernel = kernel(&args.setup, UiMode::Disabled).await?;
     let outcome = kernel.run_script(&args.file, args.args).await?;
+    kernel.close().await;
     std::io::stdout().write_all(outcome.output.stdout.as_bytes())?;
     std::io::stderr().write_all(outcome.output.stderr.as_bytes())?;
     Ok(match outcome.result {
@@ -450,6 +455,7 @@ async fn serve_mcp(setup: Setup) -> Result<i32> {
         });
     }
     while tasks.join_next().await.is_some() {}
+    kernel.close().await;
     Ok(0)
 }
 
@@ -543,10 +549,12 @@ async fn main() -> Result<()> {
         Cmd::Tui(args) => {
             let kernel = kernel(&args.setup, if args.bypass { UiMode::Bypass } else { UiMode::Ask }).await?;
             let input = args.prompt.map_or_else(|| json!({}), |prompt| json!({ "prompt": prompt }));
-            match kernel.run_command("tui", input).await {
+            let status = match kernel.run_command("tui", input).await {
                 Ok(_) => 0,
                 Err(error) => { eprintln!("ply tui: {error}"); 1 }
-            }
+            };
+            kernel.close().await;
+            status
         }
         Cmd::Registered(args) => registered(args).await?,
     };
@@ -568,7 +576,7 @@ mod tests {
         for (flags,expected) in [(vec!["ply","tui"],"ask"),(vec!["ply","tui","--bypass"],"bypass")] {
             let Cli {command:Cmd::Tui(args)}=Cli::try_parse_from(flags).unwrap() else {unreachable!()};
             let k=kernel(&args.setup,if args.bypass {UiMode::Bypass}else{UiMode::Ask}).await.unwrap();
-            let status=k.call_ctx("approvalStatus",vec![]).await.unwrap();
+            let status=k.call_plugin_method("approval","approvalStatus",vec![]).await.unwrap();
             assert_eq!(status["mode"],expected);assert_eq!(status["bypassed"],0);
         }
         assert!(Cli::try_parse_from(["ply","call","--bypass","agent"]).is_err());
@@ -577,11 +585,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn model_selection_loads_one_integration_and_keeps_keys_on_the_host() {
         let deepseek = kernel(&tools_setup(&[]), UiMode::Disabled).await.unwrap();
-        assert_eq!(deepseek.call_ctx("currentModel", vec![]).await.unwrap()["provider"], "deepseek");
+        assert_eq!(deepseek.call_plugin_method("context","currentModel", vec![]).await.unwrap()["provider"], "deepseek");
 
         for model in ["mimo-v2.6-pro", "mimo-v2.6-flash"] {
             let mimo = kernel(&tools_setup(&["--model", model]), UiMode::Disabled).await.unwrap();
-            let profile = mimo.call_ctx("currentModel", vec![]).await.unwrap();
+            let profile = mimo.call_plugin_method("context","currentModel", vec![]).await.unwrap();
             assert_eq!(profile["provider"], "xiaomi-token-plan-cn");
             assert_eq!(profile["model"], model);
             assert_eq!(profile["apiKeyEnv"], "MIMO_API_KEY");
@@ -595,7 +603,7 @@ mod tests {
         }
 
         let public = kernel(&tools_setup(&["--model", "mimo-v2.6-pro-ultraspeed", "--mimo-provider", "xiaomi"]), UiMode::Disabled).await.unwrap();
-        let profile = public.call_ctx("currentModel", vec![]).await.unwrap();
+        let profile = public.call_plugin_method("context","currentModel", vec![]).await.unwrap();
         assert_eq!(profile["definition"]["baseUrl"], "https://api.xiaomimimo.com/v1");
         assert_eq!(profile["definition"]["id"], "mimo-v2.6-pro-ultraspeed");
     }
@@ -624,13 +632,13 @@ mod tests {
         let configured = kernel(&tools_setup(&[
             "--context-config", path.to_str().unwrap(), "--max-context-tokens", "32768", "--context-compact-trigger", "0.75",
         ]), UiMode::Disabled).await.unwrap();
-        let policy = configured.call_ctx("contextConfig", vec![]).await.unwrap();
+        let policy = configured.call_plugin_method("context","contextConfig", vec![]).await.unwrap();
         assert_eq!(policy["max_context_tokens"], 32768);
         assert_eq!(policy["compaction"]["trigger_ratio"], 0.75);
         assert_eq!(policy["compaction"]["target_ratio"], 0.4);
         assert_eq!(policy["compaction"]["keep_recent_turns"], 2);
-        let id = configured.call_ctx("openConversation", vec![json!("go"), json!({ "contextWindow": 24576, "maxTokens": 4096 })]).await.unwrap();
-        let prepared = configured.call_ctx("prepareContext", vec![id]).await.unwrap();
+        let id = configured.call_plugin_method("context","openConversation", vec![json!("go"), json!({ "contextWindow": 24576, "maxTokens": 4096 })]).await.unwrap();
+        let prepared = configured.call_plugin_method("context","prepareContext", vec![id]).await.unwrap();
         assert_eq!(prepared["budget"]["configured_context_tokens"], 32768);
         assert_eq!(prepared["budget"]["max_context_tokens"], 24576);
         assert_eq!(prepared["budget"]["reserve_output_tokens"], 4096);
@@ -638,7 +646,7 @@ mod tests {
         assert_eq!(prepared["budget"]["trigger_tokens"], 15360);
 
         let disabled = kernel(&tools_setup(&["--context-compaction", "off"]), UiMode::Disabled).await.unwrap();
-        assert_eq!(disabled.call_ctx("contextConfig", vec![]).await.unwrap()["compaction"]["enabled"], false);
+        assert_eq!(disabled.call_plugin_method("context","contextConfig", vec![]).await.unwrap()["compaction"]["enabled"], false);
     }
 
     #[tokio::test(flavor = "multi_thread")]

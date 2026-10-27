@@ -1,12 +1,12 @@
 # ply
 
-命令、模块和配置统一使用 ply，见 [改名说明](docs/rename.md)。
+命令、模块和配置统一使用 ply。开发从 [SPEC.md](SPEC.md) 开始：当前契约、权限边界和验收来源统一写在规范中；方案与变更理由放在 [rfcs/](rfcs/README.md)，新方案使用 [RFC 模板](rfcs/TEMPLATE.md)。
 
-一个 agent harness。Rust 是主核心，插件用 TS 写。一个插件最多导出两个钩子：`onHandle(input)` 每次调用运行一次，每次运行是内核调度的一个 fiber；`onLoad()` 在加载时运行一次，返回的接口通过 `import { context } from "ply:plugins"` 这样的具名句柄访问。通过 `import plugins from "ply:plugins"` 获取动态插件目录；`await plugins.bash({ command })` 的那一刻就是调用。CLI 入口通过 `ply:commands` 在 onLoad 注册，见 [命令与模块接口](docs/commands.md)。
+一个 agent harness。Rust 是主核心，插件用 TS 写。一个插件最多导出三个钩子：`onHandle(input)` 每次调用运行一次（内核把它作为一个 fiber 调度，插件看不到 fiber）；`onLoad()` 在加载时运行一次，返回的接口通过 `import { context } from "ply:plugins"` 这样的具名句柄访问；`onDispose()` 在插件 realm 回收时运行一次。插件只关心能力：输入、调用别的插件得到的返回值和自己持有的值，不关心是谁调用了它，详见 [RFC 0012](rfcs/0012-capabilities-not-scheduling.md)。通过 `import plugins from "ply:plugins"` 获取动态插件目录；`await plugins.bash({ command })` 的那一刻就是调用。CLI 入口通过 `ply:commands` 在 onLoad 注册，见 [命令与模块接口](rfcs/0004-commands.md)。
 
-ply 记录的是 fiber：每个 fiber 的输入、运行中主动记录的数据、输出（或错误），以及谁等待了谁。文件 API 通过挂载访问存储，后端可以在磁盘、内存、数据库之间切换；系统进程保留宿主权限，挂载不等于 OS 沙箱。
+ply 记录的是 fiber：每个 fiber 的输入、它所在插件发出的事件、输出（或错误），以及谁等待了谁。文件 API 通过挂载访问存储，后端可以在磁盘、内存、数据库之间切换；系统进程保留宿主权限，挂载不等于 OS 沙箱。
 
-设计细节见 [docs/design.md](docs/design.md)，当前能力及验收范围见 [docs/capabilities.md](docs/capabilities.md)，插件事件和 bash hook 见 [docs/plugin-events.md](docs/plugin-events.md)，Jev 安全订阅插件见 [docs/jev.md](docs/jev.md)，环境审批协议见 [docs/approval.md](docs/approval.md)。
+设计细节见 [rfcs/0001-runtime.md](rfcs/0001-runtime.md)，当前能力及验收范围见 [SPEC.md](SPEC.md)，插件事件和 bash hook 见 [rfcs/0002-events.md](rfcs/0002-events.md)，Jev 安全订阅插件见 [rfcs/0010-jev.md](rfcs/0010-jev.md)，环境审批协议见 [rfcs/0003-approval.md](rfcs/0003-approval.md)。
 
 ## 写一个插件
 
@@ -20,7 +20,7 @@ import plugins, { context } from "ply:plugins";
 export async function onHandle(input: { path: string }): Promise<{ todos: number; lines: number }> {
   const file = JSON.stringify(input.path);
   const [grep, wc] = await Promise.all([
-    plugins.bash({ command: `grep -c TODO ${file}` }),   // 等待另一个插件：一个子 fiber
+    plugins.bash({ command: `grep -c TODO ${file}` }),   // 等待另一个插件：内核把它作为子调用调度
     plugins.bash({ command: `wc -l < ${file}` }),
   ]);
   return { todos: Number(grep.stdout.trim()), lines: Number(wc.stdout.trim()) };
@@ -28,21 +28,21 @@ export async function onHandle(input: { path: string }): Promise<{ todos: number
 
 /** Offer this plugin to the model as a tool. */
 export async function onLoad() {
-  await context.loaded;                  // 等 context 插件加载完
-  await context.registerTool("todos");     // 调用它挂在 ctx 上的函数
+  // 具名导入 context：内核保证它的 onLoad 先完成
+  await context.registerTool("todos");     // 调用 context 的 onLoad 返回的函数
 }
 ```
 
-- **`onHandle`**：`plugins.todos(input)` 被 await 时运行。它上面的 JSDoc 是插件的描述，参数类型和返回类型就是输入和输出（ply 加载时从签名里读出来）。参数校验由插件负责；agent 权限由插件收窄，fiber 归属与子任务配额由内核执行。
+- **`onHandle`**：`plugins.todos(input)` 被 await 时运行。它上面的 JSDoc 是插件的描述，参数类型和返回类型就是输入和输出（ply 加载时从签名里读出来）。参数校验由插件负责；agent 权限和子 agent 配额由 agent 插件收窄，调用归属、取消和深度上限由内核执行。
 - **`onLoad(options)`**：加载时在后台运行，接收宿主为该插件配置的 JSON，未指定时为 `{}`；参数由插件自己解释。
-  - 返回的接口通过对应插件句柄访问：数据是一份拷贝，函数在所属插件里执行；现有 ctx 平铺入口保留。
-  - 同名的成员，后挂载的覆盖先挂载的。
-  - 可以 `await plugins.xxx.loaded` 等别的插件加载完，不受加载顺序影响。
+  - 返回的接口通过对应插件句柄访问：数据是一份拷贝，函数在所属插件里执行。
+  - 用 `import { x } from "ply:plugins"` 具名导入的插件，内核保证它的 `onLoad` 先完成；它加载失败时本插件也加载失败，相互导入成环会报错。默认导入 `plugins.x` 不建立顺序，调用照常等待目标加载完。
+- **`onDispose()`**：内核回收插件 realm 时运行一次（`Kernel::close()` 或 onLoad 失败之后），两秒期限。每次调用的清理用 `finally`：调用被取消时，它等待的东西以 `AbortError`（`code: "ERR_PLY_CANCELLED"`）拒绝，`catch`/`finally` 照常运行。
 - **共享闭包**：同一个插件的多次执行共享模块里的闭包，在 `await` 处交替执行。
 - **可以列举插件**：`Object.keys(plugins)` 列出已加载的插件；有 `onHandle` 的插件还带 `plugins.x.parameters`，即它作为工具时的参数 schema。
-- **node 模块照常用**（`fs`、`path`、`child_process` 等），类型声明见 [packages/sdk/globals.d.ts](packages/sdk/globals.d.ts)。
+- **node 模块照常用**（`fs`、`path`、`child_process` 等），Node 类型只用于编辑器，实际运行范围由 JSC shim 提供；Ply 模块与插件句柄的声明入口为 [packages/sdk/index.d.ts](packages/sdk/index.d.ts)。
 
-上下文插件入口统一为 `import { context } from "ply:plugins"`。其他插件用 `context.set({type:context.Type.Extensions,key:"skills",content})` 提供内容，不指定数字 order，也不注册构建回调。类型控制顺序和更新策略，详见 [Context](docs/context.md)。
+上下文插件入口统一为 `import { context } from "ply:plugins"`。其他插件用 `context.set({source:"skill",type:context.Type.Extensions,key:"skills",content})` 提供内容，`source` 是插件自己的名字，不指定数字 order，也不注册构建回调。类型控制顺序和更新策略，详见 [Context](rfcs/0007-context.md)。
 
 ## 内置插件
 
@@ -62,17 +62,18 @@ export async function onLoad() {
 | [edit](plugins/edit/main.ts) | onHandle、onLoad | 精确替换文件里的一段文字，并把自己注册到 context |
 | [read](plugins/read/main.ts) | onHandle、onLoad | 从挂载存储读取 UTF-8 文本，支持按行分页，并把自己注册到 context |
 | [remove](plugins/remove/main.ts) | onHandle、onLoad | 删除文件或目录，并把自己注册到 context |
-| [skill](plugins/skill/main.ts) | onLoad | 接受插件参数，发现 SKILL.md 元数据并注入上下文，模型通过 read 加载指令；使用方式见 [Skills](docs/skills.md) |
+| [memory](plugins/memory/main.ts) | onHandle、onLoad | 显式记住、跨会话召回和遗忘；私有文件化存储，context 统一注入，见 [Memory](rfcs/0008-memory.md) |
+| [skill](plugins/skill/main.ts) | onLoad | 接受插件参数，发现 SKILL.md 元数据并注入上下文，模型通过 read 加载指令；使用方式见 [Skills](rfcs/0006-skills.md) |
 
-fiber 的归属由消费方的异步续体携带，共享 Promise 后也保持独立父子关系。异常、取消和 CPU 超限按所属调用隔离；Rust 可用 `Kernel::cancel_fiber(id)` 请求取消，父任务取消会传播到等待中的子任务。JSONL 的结束状态区分 `done`、`failed`、`cancelled` 和 `budget_exceeded`（CPU/内存）；独立的 `cleanup` 事件记录清理归属和结果。同插件仍共享闭包及线程，内存阈值仍是全进程水位。详见 [fiber 调度与隔离](docs/design.md#4-同一个插件的多个-fiber)。
+fiber 的归属由消费方的异步续体携带，共享 Promise 后也保持独立父子关系。异常、取消和 CPU 超限按所属调用隔离；Rust 可用 `Kernel::cancel_fiber(id)` 请求取消，父任务取消会传播到等待中的子任务。JSONL 的结束状态区分 `done`、`failed`、`cancelled` 和 `budget_exceeded`（CPU/内存）；独立的 `cleanup` 事件记录清理归属和结果。同插件仍共享闭包及线程，内存阈值仍是全进程水位。详见 [fiber 调度与隔离](rfcs/0001-runtime.md#4-同一个插件的多个-fiber)。
 
 context、deepseek 和 mimo 没有 `onHandle`，不能被调用，也不会作为工具透出给模型或 MCP 客户端。
 
-模型可见的 `bash` 工具统一使用 **Ply sh**。保留 `command` / `cwd` / `timeout_ms` 入参及原有输出字段；每次调用新建 shell，脚本内的状态和 cwd 独立。支持内部解释器的语法、builtin、自带工具，以及 PATH 中的宿主可执行文件；不存在的命令返回 127，无法执行返回 126。默认保留启动进程 PATH 的目录顺序，再补齐系统、Homebrew 和常见用户 bin 目录，不加载 bash/zsh 配置、alias、函数或全量环境变量。内部工具和重定向仍使用挂载 IO；宿主程序需要磁盘 cwd，其自身文件访问使用真实宿主文件系统，不受虚拟挂载权限隔离，参数中的虚拟绝对路径也不会自动重写。所有命令仍先经过 bash.beforeExecute 和审批；超时或 fiber 取消会回收宿主进程组。支持范围及缓冲管道限制见 [ply-sh](crates/ply-sh/README.md)。
+模型可见的 `bash` 工具统一使用 **Ply sh**。保留 `command` / `cwd` / `timeout_ms` 入参及原有输出字段；每次调用新建 shell，脚本内的状态和 cwd 独立。支持内部解释器的语法、builtin、自带工具，以及 PATH 中的宿主可执行文件；不存在的命令返回 127，无法执行返回 126。默认保留启动进程 PATH 的目录顺序，再补齐系统、Homebrew 和常见用户 bin 目录，不加载 bash/zsh 配置、alias、函数或全量环境变量。内部工具和重定向仍使用挂载 IO；宿主程序需要磁盘 cwd，其自身文件访问使用真实宿主文件系统，不受虚拟挂载权限隔离，参数中的虚拟绝对路径也不会自动重写。所有命令仍先经过 bash.beforeExecute 和审批；超时或调用取消会回收宿主进程组。支持范围及缓冲管道限制见 [ply-sh](crates/ply-sh/README.md)。
 
 `bash.beforeExecute` 覆盖整个工具调用，所有监听器异步完成且未拒绝后才进入 sh，包含重定向和命令替换在内的脚本内容都尚未执行。普通 hook 返回 `false` / `{allow:false, reason}` 是硬拒绝；带 requires_approval:true 的风险结果进入环境审批。批准后继续，缺少适配器时返回 approval_required。`timeout_ms` 包含检查与执行时间，审批等待单独计时。Ply sh 没有 shell 进程信号，因此 `signal` 为 null，超时仍通过 `timed_out` 表示。
 
-可用 `--jev` 启用 [Jev 安全检查](docs/jev.md)，自动审查需在宿主环境配置 `TYPESAFE_API_KEY`。它独立调用 TypeSafe `/v1/systemone`，批量评估命令风险概率并按本地阈值生成放行/高风险/复核建议，不更换主 agent 模型。未配置密钥、失败、高风险或待复核会请求确认/审批；可用 [ply tui](docs/tui.md) 进行真实终端确认，其他入口没有适配器时返回 approval_required。默认不加载 Jev；--jev 同时加载通用审批协调插件。环境模板见 [examples/jev.env.example](examples/jev.env.example)。
+可用 `--jev` 启用 [Jev 安全检查](rfcs/0010-jev.md)，自动审查需在宿主环境配置 `TYPESAFE_API_KEY`。它独立调用 TypeSafe `/v1/systemone`，批量评估命令风险概率并按本地阈值生成放行/高风险/复核建议，不更换主 agent 模型。未配置密钥、失败、高风险或待复核会请求确认/审批；可用 [ply tui](rfcs/0005-tui.md) 进行真实终端确认，其他入口没有适配器时返回 approval_required。默认不加载 Jev；--jev 同时加载通用审批协调插件。环境模板见 [examples/jev.env.example](examples/jev.env.example)。
 
 读取文件优先用 `read`：`path` 必填，`offset` 是从 1 开始的行号（默认 1），`limit` 是最多返回的行数（默认 200）。返回原始文本 `content`、本页起始行 `offset`、返回行数 `lines`、文件总行数 `total_lines` 和 `has_more`；下一页从 `offset + lines` 开始。空文件返回空文本和 0 行。分页限制返回内容，底层仍一次读取整个文件。
 
@@ -123,7 +124,7 @@ agent 每次调用工具都是它的子 fiber，记录里能看到完整的过�
 
 `allowed_tools` 省略时取已注册工具的快照；子任务继承并与父权限取交集，显式请求父级没有的工具或更深委派会报错。`max_delegation_depth:0` 禁止委派，`2` 允许孙任务。使用提示词限制工作范围时，仍应同时设置这些结构化权限。
 
-`max_children` 是每个 agent 累计创建直属子 agent 的硬上限，主调用默认 **2**；不是并发数，也不限制读取文件等普通工具。内核在同一把锁下检查名额并预占，超额请求在创建子 fiber 前拒绝。已启动后失败、完成、取消以及替换/恢复调用都不退还名额；拒绝创建的请求不占新名额。`0` 会移除 `agent` 工具；子级继承父级的上限并只能收窄，和代数限制分别生效。返回值的 `delegation` 给出 `limit`、`started`、`remaining`。
+`max_children` 是每个 agent 累计创建直属子 agent 的硬上限，主调用默认 **2**；不是并发数，也不限制读取文件等普通工具。agent 插件在审批之后、发起子调用之前同步检查并计数（同一插件的调用共享一个 JS 线程，所以是原子的），超额请求成为工具错误，不会创建子调用。已启动后失败、完成、取消以及替换/恢复调用都不退还名额；拒绝创建的请求不占新名额。`0` 会移除 `agent` 工具；子级继承父级的上限并只能收窄，和代数限制分别生效。返回值的 `delegation` 给出 `limit`、`started`、`remaining`。
 
 CLI 的 `--agent-max-children COUNT` 设置主调用默认值，主调用 JSON 中的 `max_children` 优先。Rust 宿主可通过 `KernelConfig.env["PLY_AGENT_MAX_CHILDREN"]` 设置同一默认值。模型轮数仍默认不限。
 
@@ -146,13 +147,13 @@ agent 的返回结果同时带两份用量汇总：`usage` 只统计当前 agent
 
 没有 usage 或 SDK 的全零占位 usage 都记为缺失，不当作实测 0 用量；没有输入 token 时命中率为 `null`。这些值来自 pi-ai 的 usage，单次 `complete` 内部的 SDK 重试不会另算一轮。
 
-每次付费模型调用前先记录 `model_call_started`，拿到响应或异常后记录对应 `model_call`，用同一 fiber ID 与 `call_index` 关联。强制取消可能只留下 started：该次用量未知，不能解释为 0 token；完整结束的调用仍按原有 usage 汇总。
+每次付费模型调用前先发出 `agent.model_call_started` 事件，拿到响应或异常后发出对应的 `agent.model_call`，内核记录时附上同一 fiber ID，再用 `call_index` 关联。强制取消可能只留下 started：该次用量未知，不能解释为 0 token；完整结束的调用仍按原有 usage 汇总。
 
-加上 `--record fibers.jsonl` 可保存每轮详情：新的 `event: "record"` 事件由内核附上 `id` 和 `at_ms`，其 `data.type` 为 `model_call` 时记录轮次、模型、响应 ID、停止原因、耗时、usage 或错误；为 `agent_usage` 时记录该 agent 的自身/子树汇总和完成/失败状态。每轮在拿到响应后、执行工具或处理错误前写出；达到轮数上限或模型调用失败也会写汇总。统计整棵树时，汇总 `model_call` 事件或读取根 agent 的 `total_usage`，不要再叠加各级 `total_usage`。
+加上 `--record fibers.jsonl` 可保存每轮详情：插件事件写成 `event: "plugin"` 行，内核附上 `name`、`plugin`、`fiber` 和 `at_ms`。`agent.model_call` 记录轮次、模型、响应 ID、停止原因、耗时、usage 或错误；agent 的自身/子树汇总在它的返回值 `usage` / `total_usage` 里。每轮在拿到响应后、执行工具或处理错误前发出。统计整棵树时，按 Spawn 的父子关系汇总 `agent.model_call` 与 `jev.model_call` 事件，或读取根 agent 的 `total_usage`（不含 Jev 等旁路插件的用量），不要再叠加各级 `total_usage`。
 
-`onDispose` 清理在执行第一条回调前就启动 **2 秒墙钟期限**，所有回调共享该期限。超时直接设置同一取消信号，CPU watchdog（约 100 ms 检查）和同步 fs/exec 等待可观察到取消，随后撤销所属定时器、HTTP、宿主等待和排队续体，阻止超时后的成功返回。清理调用排入下一次 realm 调度，避免嵌套在失败调用的 JS 栈中执行。回调先整批移出注册表；单条异常会继续执行后续回调并将整批标为失败，超时则停止剩余回调，禁止清理中再次注册清理。整批完成时同样撤销遗留的清理定时器、宿主等待及续体，未 await 的清理工作不能继续占用 realm；普通成功调用仍保留原有的 Node 风格定时器行为。
+调用被取消（或超出 CPU/内存预算）时立即发出终态，随后进入有界清理：它等待的、不是它自己创建的 Promise 与宿主操作以 `AbortError` 拒绝，它自己创建的叶子 Promise 也被拒绝，被强制终止的那段同步执行留下的 async 帧同样拒绝，于是外层的 `catch`/`finally` 照常运行。清理期间可以调用别的插件的方法、做宿主 IO，但不能发起新的子调用。整段清理有 **2 秒墙钟期限**：超时直接设置取消信号，CPU watchdog（约 100 ms 检查）和同步 fs/exec 等待可观察到；清理结束或超时后撤销所属定时器、HTTP、宿主等待和排队续体。被强制终止的那段同步代码里的 `finally` 不会执行。普通成功调用仍保留原有的 Node 风格定时器行为。
 
-`--record` 的 `event:"cleanup"` 包含清理调用 `id`、`realm`、所属 fiber `owner`、`status` 和可选 `error`；状态为 `started` 及一次 `done` / `failed` / `timed_out` / `cancelled`。它与 fiber 的 `exit` 独立，可能在其后出现。截止表示请求取消并收回 Ply 的等待与续体，JSC 中断存在检查间隔；已经发生的写入和不能中止的 OS 系统调用不会回滚。
+`--record` 的 `event:"cleanup"` 包含清理 `id`、`realm`、所属 fiber `owner`（`onDispose` 为空）、`status` 和可选 `error`；状态为 `started` 及一次 `done` / `failed` / `timed_out` / `cancelled`。它与 fiber 的 `exit` 独立，可能在其后出现。截止表示请求取消并收回 Ply 的等待与续体，JSC 中断存在检查间隔；已经发生的写入和不能中止的 OS 系统调用不会回滚。
 
 ## 上下文预算与压缩
 
@@ -193,9 +194,9 @@ agent 的返回结果同时带两份用量汇总：`usage` 只统计当前 agent
 ./target/debug/ply call agent '{"resume_id":"错误信息中的恢复 ID"}'
 ```
 
-**快照格式已升级为 2；旧格式明确拒绝恢复，需发起新任务，不进行自动迁移。** 恢复时须使用相同工作目录，会重算当前窗口预算、重新检查工具权限，不能扩大原授权；已花费的子 agent 名额和报告校验状态保留，不能通过恢复重置。恢复记录有跨进程互斥锁，成功后删除快照；工具执行到一半的状态不自动重放。恢复过程在执行工具前标记 `tools_pending`，工具结果全部保存后才回到 `ready`，避免崩溃后重复有副作用的调用。原始模型轮数延续，但 `max_turns` 限制的是这次调用新增轮数；usage/call_index 按本次 fiber 重新记录，历史累计以 `previous_usage` / `previous_total_usage` 单列，不重复累加进祖先。持久化失败会明确报告。单个不可拆交互过大时，仍需减少工具输出或提高预算。
+**快照格式已升级为 2；旧格式明确拒绝恢复，需发起新任务，不进行自动迁移。** 恢复时须使用相同工作目录，会重算当前窗口预算、重新检查工具权限，不能扩大原授权；已花费的子 agent 名额和报告校验状态保留，不能通过恢复重置。恢复记录有跨进程互斥锁，成功后删除快照；工具执行到一半的状态不自动重放。恢复过程在执行工具前标记 `tools_pending`，工具结果全部保存后才回到 `ready`，避免崩溃后重复有副作用的调用。原始模型轮数延续，但 `max_turns` 限制的是这次调用新增轮数；usage/call_index 按本次调用重新记录，历史累计以 `previous_usage` / `previous_total_usage` 单列，不重复累加进祖先。持久化失败会明确报告。单个不可拆交互过大时，仍需减少工具输出或提高预算。
 
-`model_call.purpose` 区分 `task`、`compaction` 与插件的 `safety` 审查，`call_index` 是发起调用的 fiber 内序号。agent 的任务/摘要计入自身及子树，Jev 审查记录在其回调 fiber 并计入祖先 `total_usage`；`turn` 是对应调用的循环轮次，`usage.calls` 包含摘要调用，因此两者可能不同。`context_compaction` 记录压缩成功/失败、重试、前后估算 token、替换消息数、目标是否达到及耗时；`context_compaction_deferred` 记录失败后的冷却与原因。压缩改变历史前缀，可能降低后续缓存复用率，缓存命中率仍以真实上报值累计。
+`model_call.purpose` 区分 `task`、`compaction` 与 Jev 的 `safety` 审查，`call_index` 是发起调用内的序号。agent 的任务/摘要计入自身及委派它的祖先 agent；Jev 审查只在它自己的 `jev.model_call` 事件里，不计入 agent 的 `total_usage`；`turn` 是对应调用的循环轮次，`usage.calls` 包含摘要调用，因此两者可能不同。`agent.context_compaction` 以 `status` 区分 `completed`、`failed` 和 `deferred`，记录重试、前后估算 token、替换消息数、目标是否达到、冷却原因及耗时。压缩改变历史前缀，可能降低后续缓存复用率，缓存命中率仍以真实上报值累计。
 
 ## 试一下
 
@@ -211,9 +212,9 @@ cargo build -p ply-cli
 
 显式跳过人工确认可用 `ply tui --bypass`；界面会显示 BYPASS，工具授权、子 agent 上限、挂载限制和普通 hook 的硬拒绝仍生效。
 
-TUI 将用户输入交给 agent，不直接调用 read/bash 等业务工具，也不额外传工具白名单。主 agent 默认支持 agent/bash/create/edit/read/remove 六个工具，子 agent 按现有委派限制移除 agent。CLI 为 TUI 选择逐次审批策略，读取、写入、命令执行和模型委派均需确认；可加 `--jev` 显示 bash 风险评估。详见 [TUI 使用说明](docs/tui.md)。
+TUI 将用户输入交给 agent，不直接调用 read/bash 等业务工具，也不额外传工具白名单。主 agent 默认支持 agent/bash/create/edit/memory/read/remove 七个工具，子 agent 移除 agent 与 memory，读取继承的记忆快照。CLI 为 TUI 选择逐次审批策略，读取、写入、命令执行和模型委派均需确认；可加 `--jev` 显示 bash 风险评估。详见 [TUI 使用说明](rfcs/0005-tui.md)。
 
-内置 `skill` 从启动目录下的 `.agents/skills`、`skills` 和 `SKILL.md` 发现技能，并默认加载 `~/.agents/skills`。CLI 为用户 skills 及其直属符号链接技能建立只读挂载；同名技能优先使用显式路径，其次项目目录，最后用户目录。插件自己的 `onLoad({ paths })` 接受额外路径；CLI 示例：`ply tui --plugin-options 'skill={"paths":["./examples/skills"]}'`。元数据写入 context 的 Extensions 模板，完整指令由 read 按需读取，详见 [Skills](docs/skills.md)。
+内置 `skill` 从启动目录下的 `.agents/skills`、`skills` 和 `SKILL.md` 发现技能，并默认加载 `~/.agents/skills`。CLI 为用户 skills 及其直属符号链接技能建立只读挂载；同名技能优先使用显式路径，其次项目目录，最后用户目录。插件自己的 `onLoad({ paths })` 接受额外路径；CLI 示例：`ply tui --plugin-options 'skill={"paths":["./examples/skills"]}'`。元数据写入 context 的 Extensions 模板，完整指令由 read 按需读取，详见 [Skills](rfcs/0006-skills.md)。
 
 默认把当前目录以读写方式挂在它自己的路径上：
 
@@ -249,11 +250,11 @@ claude mcp add ply -- /path/to/ply/target/debug/ply mcp --record /tmp/ply-fibers
 - `--mount SPEC`：`AT=disk:PATH[:ro]`、`AT=sqlite:PATH[:ro]`、`AT=memory`，或者 `disk:PATH[:ro]`（挂在它自己的绝对路径上），可以重复多次。
 - `--plugin DIR`：加载一个插件目录，可以重复多次。
 - `--plugin-options NAME=JSON`：把 JSON 传给对应插件的 onLoad；不同插件可重复，参数由插件解释。
-- `--jev`：启用 Jev bash 安全订阅插件，配置见 docs/jev.md。
+- `--jev`：启用 Jev bash 安全订阅插件，配置见 rfcs/0010-jev.md。
 - `--model MODEL`：选择 `deepseek-*` 或 `mimo-*` 模型；使用默认插件时自动选择对应接入，未指定则保持 DeepSeek。
 - `--mimo-provider PROVIDER`：MiMo 的服务/地区，需同时指定 `--model mimo-*`，默认中国区 Token Plan。
 - `--no-default-plugins`：不加载默认插件。
-- `--record FILE`：把每个 fiber 事件（spawn / record / exit / cleanup / plugin）以 JSON lines 追加到文件。
+- `--record FILE`：把每个 fiber 事件（spawn / exit / cleanup / plugin）以 JSON lines 追加到文件。
 
 ## crate
 
@@ -262,19 +263,27 @@ claude mcp add ply -- /path/to/ply/target/debug/ply mcp --record /tmp/ply-fibers
 | `ply-storage` | 磁盘 / 内存 / SQLite 后端，同一套行为测试同时跑三种 |
 | `ply-io` | 挂载表（mount / unmount / swap，只有挂载的路径存在）；在磁盘挂载上启动真实进程 |
 | `ply-libc` | errno / path / fs / glob / time |
-| `ply-jsc` | 内嵌 JavaScriptCore，直接运行 TS；每个插件一个 realm、一个线程；Node 风格 API、ply 模块和 ctx/fiber |
+| `ply-jsc` | 内嵌 JavaScriptCore，直接运行 TS；每个插件一个 realm、一个线程；Node 风格 API、ply 模块，以及调用归属、取消清理的续体调度 |
 | `ply-core` | 描述层：插件、输入输出的类型、`onLoad` 的挂载、fiber、fiber 事件和 hook |
-| `ply-kernel` | 加载插件（读出签名、后台运行 `onLoad`、`ready`）、调度 fiber、维护插件目录/ctx/命令注册表、发出 fiber 事件、默认插件 |
+| `ply-kernel` | 加载插件（读出签名与具名导入、按依赖后台运行 `onLoad`、`ready`、`close`）、调度 fiber、维护插件目录/命令注册表、发出 fiber 事件、默认插件 |
 | `ply-cli` | tools/call/mcp/run、commands、插件注册的顶层命令，内置 ply tui |
 | `ply-sh` | 内部 shell 解释器及工具集，通过 Ply IO 执行模型 bash tool 的脚本 |
 
-## 测试
+## 开发与检查
+
+根 `tsconfig.json` 自动加载 SDK 声明，编辑器打开仓库即可检查所有插件和示例。已知插件句柄具有具体参数和返回类型；动态插件返回 unknown，使用前需要收窄。
 
 ```bash
-cargo test --workspace
+npm ci --ignore-scripts --registry=https://registry.npmjs.org
+npm run check
+cargo test --workspace --locked --offline
 ```
+
+`check` 同时执行严格类型、ESLint 和规范链接检查。检查包含 SDK 声明、插件、示例与 [类型契约反例](type-tests/plugins.ts)，不跳过声明检查。
+
+插件按职责组织。例如 [agent](plugins/agent/) 的 main.ts 仅作入口，types.ts 声明契约，run/model/tools/policy/report/recovery/usage 分担实现；[context](plugins/context/) 拆分配置、块、归属、会话、消息、压缩与 provider；[tui](plugins/tui/) 拆分输入、按键、文本、渲染与会话状态。每个插件都有 types.ts。内置插件的完整模块目录由 Rust 构建期收集，不增加运行时 Node 依赖。
 
 目前只支持 macOS（系统 JavaScriptCore）。
 
 
-审批环境按插件接入：真实终端使用 [TUI 插件](docs/tui.md)，其他环境模板为 [examples/plugins/approval-adapter](examples/plugins/approval-adapter/main.ts)，模板只返回 pending。尚未得到批准时，agent 以 status:approval_required 和 approval_requests 向宿主返回，不把待审命令当作完成，也不暴露模型自我批准入口。
+审批环境按插件接入：真实终端使用 [TUI 插件](rfcs/0005-tui.md)，其他环境模板为 [examples/plugins/approval-adapter](examples/plugins/approval-adapter/main.ts)，模板只返回 pending。尚未得到批准时，agent 以 status:approval_required 和 approval_requests 向宿主返回，不把待审命令当作完成，也不暴露模型自我批准入口。

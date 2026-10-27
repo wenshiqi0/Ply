@@ -1,11 +1,11 @@
 //! Plugin imports and native command registration/lifecycle; no model calls.
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
 use ply_kernel::{
-    DiskStorage, Exit, FiberEvent, FiberHook, Io, Kernel, KernelConfig, MountMode, PluginSource,
+    CleanupStatus, DiskStorage, Exit, FiberEvent, FiberHook, Io, Kernel, KernelConfig, MountMode, PluginSource,
 };
 
 #[derive(Default)]
@@ -44,19 +44,19 @@ async fn commands_use_the_registered_realm_and_preserve_call_ancestry() {
 import plugins from "ply:plugins";
 import * as commands from "ply:commands";
 export async function onLoad() {
-  await commands.register({name:"greet",description:"Say hello",handler:async input => ({text:"hello "+input.name,owner:await fiber.info(),legacy:typeof globalThis.tools,implicit:typeof globalThis.plugins,names:Object.keys(plugins)})});
-  await commands.register({name:"chain",handler:async input => ({owner:await fiber.info(),child:await plugins.worker(input)})});
+  await commands.register({name:"greet",description:"Say hello",handler:async input => ({text:"hello "+input.name,legacy:typeof globalThis.tools,implicit:typeof globalThis.plugins,names:Object.keys(plugins)})});
+  await commands.register({name:"chain",handler:async input => ({child:await plugins.worker(input)})});
 }
 "#)).await.unwrap();
     k.load(source(
         "worker",
-        "export async function onHandle() { return await fiber.info(); }",
+        "export async function onHandle(input: { n: number }) { return input.n + 1; }",
     ))
     .await
     .unwrap();
     k.load(source("caller",r#"
 import * as commands from "ply:commands";
-export async function onHandle(input: {}) { return {owner:await fiber.info(),result:await commands.run("chain",input)}; }
+export async function onHandle(input: { n: number }) { return {result:await commands.run("chain",input)}; }
 "#)).await.unwrap();
     k.ready().await.unwrap();
     assert_eq!(
@@ -85,14 +85,29 @@ export async function onHandle(input: {}) { return {owner:await fiber.info(),res
             .contains(&json!("worker")),
         "import must reflect plugins loaded later"
     );
-    assert_eq!(result["owner"]["parent"], Value::Null);
-    let chained = k.call("caller", json!({})).await.unwrap();
-    assert_eq!(chained["result"]["owner"]["parent"], chained["owner"]["id"]);
-    assert_eq!(
-        chained["result"]["child"]["parent"],
-        chained["result"]["owner"]["id"]
-    );
-    assert!(records.0.lock().unwrap().iter().any(|event|matches!(event,FiberEvent::Spawn{fiber,..} if fiber.plugin=="provider"&&fiber.event.as_deref()==Some("command:greet"))));
+    let chained = k.call("caller", json!({"n":1})).await.unwrap();
+    assert_eq!(chained, json!({"result":{"child":2}}));
+    // Ancestry is the kernel's: (id, parent, plugin, event) of every spawn.
+    let spawns: Vec<(String, Option<String>, String, Option<String>)> = records
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            FiberEvent::Spawn { fiber, .. } => Some((fiber.id.clone(), fiber.parent.clone(), fiber.plugin.clone(), fiber.event.clone())),
+            _ => None,
+        })
+        .collect();
+    let find = |event: Option<&str>, plugin: &str| spawns.iter().find(|s| s.3.as_deref() == event && s.2 == plugin).unwrap().clone();
+    let greet = find(Some("command:greet"), "provider");
+    assert_eq!(greet.1, None);
+    let caller = find(None, "caller");
+    // The command runs in the realm that registered it, as a child of its runner.
+    let chain = find(Some("command:chain"), "provider");
+    assert_eq!(chain.1.as_deref(), Some(caller.0.as_str()));
+    let worker = find(None, "worker");
+    assert_eq!(worker.1.as_deref(), Some(chain.0.as_str()));
+    assert_eq!(spawns.len(), 4);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -153,7 +168,7 @@ export async function onLoad() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn command_success_and_parent_cancel_reclaim_pending_callback_work() {
+async fn command_success_reclaims_pending_callback_work_and_parent_cancel_runs_its_cleanup() {
     let work = tempfile::tempdir().unwrap();
     let (k, records) = kernel(work.path());
     k.load(source("provider",r#"
@@ -161,7 +176,7 @@ import fs from "node:fs";
 import * as commands from "ply:commands";
 export async function onLoad() {
  await commands.register({name:"background",handler:()=>{setTimeout(()=>fs.writeFileSync("stray","bad"),60);return "done";}});
- await commands.register({name:"slow",handler:async()=>{fs.writeFileSync("entered","yes");await new Promise(resolve=>setTimeout(resolve,150));fs.writeFileSync("late","bad");}});
+ await commands.register({name:"slow",handler:async()=>{try{fs.writeFileSync("entered","yes");await new Promise(resolve=>setTimeout(resolve,150));fs.writeFileSync("late","bad");}finally{fs.writeFileSync("slow-finally","yes");}}});
 }
 "#)).await.unwrap();
     k.load(source(
@@ -191,6 +206,8 @@ export async function onHandle() {return await commands.run("slow");}
     assert!(k.cancel_fiber(&root));
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert!(!work.path().join("late").exists());
+    // The cancelled callback's finally still ran, as its cleanup.
+    assert_eq!(std::fs::read_to_string(work.path().join("slow-finally")).unwrap(), "yes");
     let events = records.0.lock().unwrap();
     let child = events
         .iter()
@@ -204,42 +221,12 @@ export async function onHandle() {return await commands.run("slow");}
     assert!(events.iter().any(
         |event| matches!(event,FiberEvent::Exit{id,exit:Exit::Cancelled{..},..} if id==child)
     ));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn command_callbacks_do_not_spend_plugin_onhandle_quotas() {
-    let work = tempfile::tempdir().unwrap();
-    let (k, _) = kernel(work.path());
-    k.load(source(
-        "provider",
-        r#"
-import * as commands from "ply:commands";
-export function onHandle() {return "tool";}
-export async function onLoad() {await commands.register({name:"ping",handler:()=>"pong"});}
-"#,
-    ))
-    .await
-    .unwrap();
-    k.load(source(
-        "caller",
-        r#"
-import plugins from "ply:plugins";
-import * as commands from "ply:commands";
-export async function onHandle() {
- await fiber.limitChildren("provider",1);
- await commands.run("ping");await commands.run("ping");
- const before=await fiber.childBudget("provider");
- await plugins.provider({});
- let rejected=false;try{await plugins.provider({});}catch{rejected=true;}
- return {before,after:await fiber.childBudget("provider"),rejected};
-}
-"#,
-    ))
-    .await
-    .unwrap();
-    k.ready().await.unwrap();
-    let output = k.call("caller", json!({})).await.unwrap();
-    assert_eq!(output["before"]["started"], 0);
-    assert_eq!(output["after"]["started"], 1);
-    assert_eq!(output["rejected"], true);
+    let cleanup: Vec<CleanupStatus> = events
+        .iter()
+        .filter_map(|event| match event {
+            FiberEvent::Cleanup { owner, status, .. } if owner.as_ref() == Some(child) => Some(*status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cleanup, [CleanupStatus::Started, CleanupStatus::Done]);
 }

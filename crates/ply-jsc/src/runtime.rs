@@ -24,6 +24,10 @@
 //!   (a watchdog checks both every 100 ms of CPU). A turn over either is
 //!   terminated and its owning invocation fails; siblings remain runnable.
 //!   The memory ceiling measures the process, not individual fibers.
+//! - An interrupted call (cancelled, or over budget) is reported at once
+//!   and then cleans up: what it awaits rejects with an AbortError, so its
+//!   catch/finally run, within a two-second deadline. Then its scope is
+//!   retired. Fibers stay native: JS never sees one.
 //! - Plugin source is read through the IO layer (a namespace of its own),
 //!   so plugins can live on any storage.
 
@@ -66,6 +70,10 @@ const BUILTINS: &[&str] = &[
     "child_process",
 ];
 const WATCHDOG_TICK: f64 = 0.1;
+/// How long an interrupted call's catch/finally, or `onDispose`, may take.
+const CLEANUP_DEADLINE: Duration = Duration::from_secs(2);
+/// Across all realms cleanup event ids occupy their own JS-safe range.
+static NEXT_CLEANUP: AtomicU64 = AtomicU64::new(1_u64 << 52);
 
 /// Where a realm's own code comes from: a directory in a (read-only)
 /// namespace of its own.
@@ -181,7 +189,12 @@ enum Msg {
     Timer(u64),
     Continuation(u64),
     CancelCall(u64),
-    DiscardDisposals(Vec<u64>),
+    /// Reject what an interrupted call is awaiting, starting its cleanup.
+    Abort(u64),
+    /// An interrupted call's cleanup ran out of time.
+    CleanupExpired(u64),
+    /// Resolves once no call is running or cleaning up.
+    Quiet(Reply<()>),
     Shutdown,
 }
 
@@ -274,7 +287,11 @@ impl JsRuntime {
     }
 
     async fn api(&self, realm: RealmId, method: &'static str, args: Vec<String>, fiber: Option<String>) -> Result<Value, JsError> {
-        let (reply, rx) = oneshot::channel();
+        self.api_with(realm, method, args, fiber, CallCancellation::new()).await
+    }
+
+    async fn api_with(&self, realm: RealmId, method: &'static str, args: Vec<String>, fiber: Option<String>, cancel: CallCancellation) -> Result<Value, JsError> {
+        let (reply, mut rx) = oneshot::channel();
         let (id, tx) = {
             let realms = self.realms.lock().expect("realm table poisoned");
             let realm = realms.get(&realm).ok_or_else(gone)?;
@@ -283,10 +300,22 @@ impl JsRuntime {
         let args = if method == "eval" {
             vec![lower_async(&args[0], Path::new("ply:eval")).map_err(|message| JsError { message, ..JsError::default() })?]
         } else { args };
-        let cancel = Arc::new(CallCancellation::new());
+        let cancel = Arc::new(cancel);
         let mut guard = CallGuard { tx: tx.clone(), id: Some(id), cancel: cancel.clone() };
-        tx.send(Msg::Api { id, method, args, fiber, cancel, reply }).map_err(|_| gone())?;
-        let result = rx.await.unwrap_or_else(|_| Err(gone()));
+        tx.send(Msg::Api { id, method, args, fiber, cancel: cancel.clone(), reply }).map_err(|_| gone())?;
+        let result = match cancel.deadline {
+            // The flag interrupts CPU and synchronous waits; the message
+            // ends a call that is only awaiting.
+            Some(deadline) => tokio::select! {
+                result = &mut rx => result,
+                _ = tokio::time::sleep_until(deadline.into()) => {
+                    cancel.expire();
+                    let _ = tx.send(Msg::CancelCall(id));
+                    rx.await
+                }
+            },
+            None => rx.await,
+        }.unwrap_or_else(|_| Err(gone()));
         guard.id = None;
         result
     }
@@ -334,9 +363,23 @@ impl JsRuntime {
         method: &str,
         args: &[Value],
         fiber: Option<String>,
-        origin: Value,
     ) -> Result<Value, JsError> {
-        self.api(realm, "method", vec![module.into(), method.into(), Value::Array(args.to_vec()).to_string(), origin.to_string()], fiber).await
+        self.api(realm, "method", vec![module.into(), method.into(), Value::Array(args.to_vec()).to_string()], fiber).await
+    }
+
+    /// Run the module's exported `onDispose` (if it has one), once, before
+    /// its realm is retired. Bounded by the cleanup deadline.
+    pub async fn dispose(&self, realm: RealmId, module: &str) -> Result<(), JsError> {
+        let cancel = CallCancellation::with_deadline(Instant::now() + CLEANUP_DEADLINE);
+        self.api_with(realm, "dispose", vec![module.into()], None, cancel).await.map(|_| ())
+    }
+
+    /// Resolves once the realm runs no call and no cleanup.
+    pub async fn quiet(&self, realm: RealmId) {
+        let (reply, rx) = oneshot::channel();
+        if self.send(realm, Msg::Quiet(reply)) {
+            let _ = rx.await;
+        }
     }
 
     /// Evaluate a plain-JS script in the realm (awaiting a promise result).
@@ -427,10 +470,30 @@ impl Drop for CallGuard {
 }
 
 #[derive(Debug)]
-struct Invocation { id: u64, fiber: Option<String>, cancel: Arc<CallCancellation>, origin: Value }
+struct Invocation { id: u64, fiber: Option<String>, cancel: Arc<CallCancellation>, cleanup: OnceLock<Arc<CallCancellation>>, retired: AtomicBool }
+impl Invocation {
+    fn new(id: u64, fiber: Option<String>, cancel: Arc<CallCancellation>) -> Self {
+        Invocation { id, fiber, cancel, cleanup: OnceLock::new(), retired: AtomicBool::new(false) }
+    }
+    /// What governs this call now: its own cancellation, or once it was
+    /// interrupted, the bounded cleanup in which its catch/finally run.
+    fn control(&self) -> &CallCancellation { self.cleanup.get().map_or(&*self.cancel, |cleanup| &**cleanup) }
+    /// Interrupt JS and refuse host work.
+    fn stopped(&self) -> bool { self.control().is_stopped() }
+    fn cleaning(&self) -> bool { self.cleanup.get().is_some() }
+    /// No more of its JS may run. A cancellation request alone is not
+    /// enough: the continuation that runs its finally must still run.
+    fn dead(&self) -> bool { self.retired.load(Ordering::Relaxed) || self.cleanup.get().is_some_and(|cleanup| cleanup.is_stopped()) }
+}
 type Scope = Option<Arc<Invocation>>;
-struct ActiveCall { reply: Reply<Result<Value, JsError>>, scope: Arc<Invocation>, disposals: Vec<u64>, method: &'static str }
-struct CleanupRun { owner: Option<String>, watches: Vec<u64>, deadline: tokio::task::AbortHandle }
+struct ActiveCall { reply: Reply<Result<Value, JsError>>, scope: Arc<Invocation>, method: &'static str }
+/// A bounded cleanup: an interrupted call finishing its catch/finally
+/// (`scope` set), or an `onDispose` call.
+struct CleanupRun { event: u64, owner: Option<String>, scope: Scope, reason: String, deadline: Option<tokio::task::AbortHandle>, aborts: Aborts }
+/// What an interrupted call was waiting on when it was interrupted. Work its
+/// cleanup starts afterwards is not aborted.
+#[derive(Default)]
+struct Aborts { ops: Vec<u64>, timers: Vec<u64>, http: Vec<u64>, handlers: Vec<u64> }
 struct Binding { scope: Scope, fatal: bool }
 struct Continuation {
     scope: Scope, fatal: bool, callback: RootedValue, receiver: RootedValue,
@@ -449,6 +512,7 @@ struct Engine {
     bridge: Option<Arc<dyn HostBridge>>,
     http: Arc<Http>,
     checkpoints: Arc<Checkpoints>,
+    memory: Arc<crate::memory::MemoryStore>,
     terminal: Arc<crate::terminal::Terminal>,
     terminal_owner: Option<u64>,
     /// The plugins the imported directory and `ctx` reflect, as last described
@@ -462,7 +526,9 @@ struct Engine {
     binding_class: JSClassRef,
     continuations: HashMap<u64, Continuation>,
     http_owners: HashMap<u64, Scope>,
-    cancel_handlers: HashMap<u64, HashMap<u64, RootedValue>>,
+    /// Per call: what to reject with an AbortError when it is cancelled —
+    /// `immediate` waits and leaf promises at once, the rest on retirement.
+    cancel_handlers: HashMap<u64, HashMap<u64, (RootedValue, bool)>>,
     /// Module ids ply resolved for this realm, and those it loaded.
     resolved: HashSet<String>,
     loaded: HashSet<String>,
@@ -475,6 +541,7 @@ struct Engine {
     calls: HashMap<u64, ActiveCall>,
     cleanups: HashMap<u64, CleanupRun>,
     idle_waiters: Vec<Reply<()>>,
+    quiet_waiters: Vec<Reply<()>>,
     next_id: u64,
     tx: Sender<Msg>,
     handle: tokio::runtime::Handle,
@@ -489,7 +556,11 @@ impl Engine {
     }
 
     fn is_idle(&self) -> bool {
-        self.timers.is_empty() && self.pending_ops.is_empty() && self.calls.is_empty() && self.cleanups.is_empty() && self.continuations.is_empty()
+        self.timers.is_empty() && self.pending_ops.is_empty() && self.is_quiet() && self.continuations.is_empty()
+    }
+
+    fn is_quiet(&self) -> bool {
+        self.calls.is_empty() && self.cleanups.is_empty()
     }
 }
 
@@ -512,9 +583,9 @@ fn with<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
 unsafe extern "C" fn should_terminate(_ctx: JSContextRef, _context: *mut c_void) -> bool {
     let ticks = TICKS.get() + 1;
     TICKS.set(ticks);
-    let stopping = with(|e| *e.cancelled.borrow() || e.current.as_ref().is_some_and(|scope| scope.cancel.is_stopped()));
+    let stopping = with(|e| *e.cancelled.borrow() || e.current.as_ref().is_some_and(|scope| scope.stopped()));
     let reason = if stopping {
-        Some((FailureKind::Cancelled, "fiber cancelled by host".into()))
+        Some((FailureKind::Cancelled, "call cancelled by host".into()))
     } else if ticks >= BUDGET_TICKS.get() {
         Some((FailureKind::CpuLimit, format!("used more than {:.1}s of CPU in one turn", f64::from(BUDGET_TICKS.get()) * WATCHDOG_TICK)))
     } else {
@@ -546,6 +617,7 @@ fn footprint() -> u64 {
 
 /// Run `f`, which enters JS, as fiber `fiber` with a fresh CPU budget.
 fn enter<T>(scope: Scope, f: impl FnOnce() -> T) -> T {
+    if let Some(scope) = &scope { begin_cleanup_if_cancelled(scope); }
     let previous = with(|e| std::mem::replace(&mut e.current, scope));
     TICKS.set(0);
     let result = f();
@@ -575,13 +647,10 @@ fn engine_main(
             Msg::Shutdown => break,
             Msg::Api { id, method, args, fiber, cancel, reply } => start_call(id, method, args, fiber, cancel, reply),
             Msg::Continuation(id) => run_continuation(id),
-            Msg::CancelCall(id) => fail_call(id, FailureKind::Cancelled, "the awaiting fiber call was cancelled".into()),
-            Msg::DiscardDisposals(ids) => unsafe {
-                let (ctx, api) = with(|e| (e.ctx, e.api));
-                let callback = get_property(ctx, api, "discardDisposals");
-                let ids = RootedValue::new(ctx, json_value(ctx, &json!(ids).to_string()));
-                let _ = enter(None, || call(ctx, callback as JSObjectRef, &[ids.get()]));
-            },
+            Msg::CancelCall(id) => fail_call(id, FailureKind::Cancelled, "the awaiting call was cancelled".into()),
+            Msg::Abort(id) => abort_scope(id),
+            Msg::CleanupExpired(id) => finish_cleanup(id, CleanupStatus::TimedOut, Some("cleanup exceeded its two-second deadline".into())),
+            Msg::Quiet(reply) => with(|e| e.quiet_waiters.push(reply)),
             Msg::TakeOutput(reply) => {
                 let out = with(|e| Output {
                     stdout: std::mem::take(&mut e.stdout),
@@ -634,6 +703,7 @@ fn init(id: RealmId, config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtim
                 bridge: config.bridge,
                 http: Arc::new(Http::default()),
                 checkpoints: Arc::new(Checkpoints::default()),
+                memory: Arc::new(crate::memory::MemoryStore::default()),
                 terminal: Arc::new(crate::terminal::Terminal::default()),
                 terminal_owner: None,
                 directory: json!([]),
@@ -654,6 +724,7 @@ fn init(id: RealmId, config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtim
                 calls: HashMap::new(),
                 cleanups: HashMap::new(),
                 idle_waiters: Vec::new(),
+                quiet_waiters: Vec::new(),
                 next_id: 0,
                 tx,
                 handle,
@@ -664,8 +735,10 @@ fn init(id: RealmId, config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtim
         let binder = RootedValue::new(ctx, JSObjectMakeFunctionWithCallback(ctx, JsStr::new("bindContinuation").0, bind_continuation) as JSValueRef);
         let cancel_hook = RootedValue::new(ctx, JSObjectMakeFunctionWithCallback(ctx, JsStr::new("registerPromiseCancel").0, register_promise_cancel) as JSValueRef);
         let unregister_hook = RootedValue::new(ctx, JSObjectMakeFunctionWithCallback(ctx, JsStr::new("unregisterPromiseCancel").0, unregister_promise_cancel) as JSValueRef);
+        let current_hook = RootedValue::new(ctx, JSObjectMakeFunctionWithCallback(ctx, JsStr::new("currentCall").0, current_call) as JSValueRef);
+        let cancelled_hook = RootedValue::new(ctx, JSObjectMakeFunctionWithCallback(ctx, JsStr::new("callCancelled").0, call_cancelled) as JSValueRef);
         let bootstrap = RootedValue::new(ctx, eval(ctx, ASYNC, "ply:async").map_err(fail)?);
-        let helpers = RootedValue::new(ctx, call(ctx, bootstrap.get() as JSObjectRef, &[binder.get(), cancel_hook.get(), unregister_hook.get()]).map_err(fail)?);
+        let helpers = RootedValue::new(ctx, call(ctx, bootstrap.get() as JSObjectRef, &[binder.get(), cancel_hook.get(), unregister_hook.get(), current_hook.get(), cancelled_hook.get()]).map_err(fail)?);
         let lowered = lower_async(PRELUDE, Path::new("ply:prelude")).map_err(fail)?;
         let factory = RootedValue::new(ctx, eval(ctx, "(function(eval, babelHelpers, code) { return eval(code); })", "ply:prelude").map_err(fail)?);
         let intrinsic_eval = RootedValue::new(ctx, eval(ctx, "eval", "ply:prelude").map_err(fail)?);
@@ -689,8 +762,11 @@ fn init(id: RealmId, config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtim
 }
 
 fn teardown() {
-    let cleanups = ENGINE.with(|e| e.borrow().as_ref().map(|e| e.cleanups.keys().copied().collect::<Vec<_>>()).unwrap_or_default());
-    for id in cleanups { finish_cleanup(id, CleanupStatus::Cancelled, Some("realm closed before cleanup completed".into())); }
+    let cleanups = ENGINE.with(|e| e.borrow_mut().as_mut().map(|e| e.cleanups.drain().map(|(_, run)| run).collect::<Vec<_>>()).unwrap_or_default());
+    for run in cleanups {
+        if let Some(deadline) = run.deadline { deadline.abort(); }
+        cleanup_event(run.event, run.owner, CleanupStatus::Cancelled, Some("realm closed before cleanup completed".into()));
+    }
     let Some(mut engine) = ENGINE.with(|e| e.borrow_mut().take()) else { return };
     engine.http.abort_all();
     for job in engine.pending_jobs.values().chain(engine.timer_jobs.values()) { job.abort(); }
@@ -718,9 +794,23 @@ fn after_turn() {
         let ctx = with(|e| e.ctx);
         let _ = enter(None, || unsafe { eval(ctx, "void 0", "ply:recover") });
         TERMINATED.with(|t| t.borrow_mut().take());
-        if let Some(scope) = scope { fail_call(scope.id, kind, format!("{name}: script terminated: {reason}")); }
+        let message = format!("{name}: script terminated: {reason}");
+        if let Some(scope) = &scope { fail_call(scope.id, kind, message.clone()); }
+        // The frames the terminated turn left mid-execution never unwind;
+        // rejecting their promises lets the frames awaiting them clean up.
+        let target = scope.filter(|scope| !scope.dead());
+        unsafe {
+            let api = with(|e| e.api);
+            let abort = get_property(ctx, api, "abortRunning");
+            let message = RootedValue::new(ctx, string_value(ctx, &message));
+            let _ = enter(target, || call(ctx, abort as JSObjectRef, &[message.get()]));
+        }
     }
-    let waiters = with(|e| if e.is_idle() { std::mem::take(&mut e.idle_waiters) } else { Vec::new() });
+    let waiters = with(|e| {
+        let mut waiters = if e.is_quiet() { std::mem::take(&mut e.quiet_waiters) } else { Vec::new() };
+        if e.is_idle() { waiters.append(&mut e.idle_waiters); }
+        waiters
+    });
     for w in waiters {
         let _ = w.send(());
     }
@@ -750,10 +840,12 @@ unsafe extern "C" fn register_promise_cancel(ctx: JSContextRef, _f: JSObjectRef,
             if !JSValueIsObject(ctx, reject) || !JSObjectIsFunction(ctx, JSValueToObject(ctx, reject, null_mut())) { return JSValueMakeNumber(ctx, 0.0); }
             let scope = with(|e| e.current.clone());
             if let Some(scope) = scope {
-                let active = with(|e| e.calls.contains_key(&scope.id));
+                // Running or cleaning up: retiring it rejects these promises.
+                let active = with(|e| e.calls.contains_key(&scope.id) || e.cleanups.get(&scope.id).is_some_and(|run| run.scope.is_some()));
                 if active {
                     let root = RootedValue::new(ctx, reject);
-                    let id = with(|e| { let id = e.next(); e.cancel_handlers.entry(scope.id).or_default().insert(id, root); id });
+                    let immediate = argc > 1 && JSValueToBoolean(ctx, *argv.add(1));
+                    let id = with(|e| { let id = e.next(); e.cancel_handlers.entry(scope.id).or_default().insert(id, (root, immediate)); id });
                     return JSValueMakeNumber(ctx, id as f64);
                 }
             }
@@ -769,6 +861,18 @@ unsafe extern "C" fn unregister_promise_cancel(ctx: JSContextRef, _f: JSObjectRe
         }
         JSValueMakeUndefined(ctx)
     }
+}
+/// The call the running JS belongs to, as an opaque number (0: none).
+unsafe extern "C" fn current_call(ctx: JSContextRef, _f: JSObjectRef, _this: JSObjectRef, _argc: usize, _argv: *const JSValueRef, _exc: *mut JSValueRef) -> JSValueRef {
+    let id = with(|e| e.current.as_ref().map_or(0, |scope| scope.id));
+    unsafe { JSValueMakeNumber(ctx, id as f64) }
+}
+/// Whether the running JS belongs to a call that is cleaning up after a
+/// cancellation. (A request not yet seen by the engine does not count:
+/// code still running in that turn is the call's own work.)
+unsafe extern "C" fn call_cancelled(ctx: JSContextRef, _f: JSObjectRef, _this: JSObjectRef, _argc: usize, _argv: *const JSValueRef, _exc: *mut JSValueRef) -> JSValueRef {
+    let cancelled = with(|e| e.current.as_ref().is_some_and(|scope| scope.cleaning()));
+    unsafe { JSValueMakeBoolean(ctx, cancelled) }
 }
 unsafe extern "C" fn bind_continuation(ctx: JSContextRef, _f: JSObjectRef, _this: JSObjectRef, argc: usize, argv: *const JSValueRef, _exc: *mut JSValueRef) -> JSValueRef {
     unsafe {
@@ -787,7 +891,7 @@ unsafe extern "C" fn enqueue_continuation(ctx: JSContextRef, function: JSObjectR
         let private = JSObjectGetPrivate(function) as *const Binding;
         if private.is_null() { return JSValueMakeUndefined(ctx); }
         let binding = &*private;
-        if binding.scope.as_ref().is_some_and(|s| s.cancel.is_stopped()) { return JSValueMakeUndefined(ctx); }
+        if binding.scope.as_ref().is_some_and(|s| s.dead()) { return JSValueMakeUndefined(ctx); }
         let callback = RootedValue::new(ctx, get_property(ctx, function, "callback"));
         let receiver = RootedValue::new(ctx, receiver as JSValueRef);
         let args = (0..argc).map(|i| RootedValue::new(ctx, *argv.add(i))).collect();
@@ -798,7 +902,7 @@ unsafe extern "C" fn enqueue_continuation(ctx: JSContextRef, function: JSObjectR
 }
 fn run_continuation(id: u64) {
     let Some((ctx, work)) = with(|e| e.continuations.remove(&id).map(|work| (e.ctx, work))) else { return };
-    if work.scope.as_ref().is_some_and(|s| s.cancel.is_stopped()) { return; }
+    if work.scope.as_ref().is_some_and(|s| s.dead()) { return; }
     unsafe {
         let args: Vec<_> = work.args.iter().map(RootedValue::get).collect();
         let mut exception = std::ptr::null();
@@ -815,28 +919,151 @@ fn run_continuation(id: u64) {
 fn fail_call(id: u64, kind: FailureKind, message: String) {
     fail_call_error(id, JsError { kind, message, ..JsError::default() });
 }
-fn fail_call_error(id: u64, mut error: JsError) {
+fn fail_call_error(id: u64, error: JsError) {
+    if let Some(scope) = with(|e| e.cleanups.get(&id).and_then(|run| run.scope.clone())) {
+        // The interruption that started this cleanup is not a second one.
+        // Running out of time or budget ends the cleanup; failures inside
+        // it do not change the exit already reported.
+        scope.control().is_stopped();
+        if scope.control().timed_out.load(Ordering::Relaxed) {
+            finish_cleanup(id, CleanupStatus::TimedOut, Some("cleanup exceeded its two-second deadline".into()));
+        } else if matches!(error.kind, FailureKind::CpuLimit | FailureKind::MemoryLimit) {
+            finish_cleanup(id, CleanupStatus::Failed, Some(error.message));
+        }
+        return;
+    }
     let Some(active) = with(|e| e.calls.remove(&id)) else { return };
+    if error.kind != FailureKind::Failed && active.method != "dispose" {
+        interrupt(active, error);
+    } else {
+        end_call(id, active, error);
+    }
+}
+
+/// A call that failed (its own catch/finally already ran as the error
+/// unwound), never started, or was an `onDispose` call: retire its scope.
+fn end_call(id: u64, active: ActiveCall, mut error: JsError) {
     active.scope.cancel.is_stopped();
     let timed_out = active.scope.cancel.timed_out.load(Ordering::Relaxed);
     if timed_out { error.message = "onDispose exceeded its two-second deadline".into(); }
-    let message = error.message.clone();
-    retire_scope(&active.scope, &message);
+    retire_scope(&active.scope, &error.message);
     let status = if timed_out { CleanupStatus::TimedOut } else if error.kind == FailureKind::Cancelled { CleanupStatus::Cancelled } else { CleanupStatus::Failed };
     finish_cleanup(id, status, Some(error.message.clone()));
-    if !active.disposals.is_empty() { start_disposal(active.disposals, active.scope.fiber.clone()); }
     let _ = active.reply.send(Err(error));
 }
 
-// Stop every resource owned by this invocation, including work a cleanup
-// callback started without awaiting. Ordinary successful calls retain their
-// Node-style timers; disposal invocations always retire their whole scope.
+/// Report an interrupted call (cancelled, or over its CPU/memory budget)
+/// at once, then give it a bounded cleanup: what it awaits rejects with an
+/// AbortError and its catch/finally run, until it settles or the deadline.
+fn interrupt(active: ActiveCall, error: JsError) {
+    let scope = active.scope.clone();
+    let deadline_at = Instant::now() + CLEANUP_DEADLINE;
+    let cleanup = Arc::new(CallCancellation::with_deadline(deadline_at));
+    let _ = scope.cleanup.set(cleanup.clone());
+    let (tx, handle) = with(|e| (e.tx.clone(), e.handle.clone()));
+    let id = scope.id;
+    // Armed before any cleanup JS runs: a finally block can block before
+    // its first await. The flag interrupts CPU and synchronous waits.
+    let deadline = handle.spawn(async move {
+        tokio::time::sleep_until(deadline_at.into()).await;
+        cleanup.expire();
+        let _ = tx.send(Msg::CleanupExpired(id));
+    });
+    let event = NEXT_CLEANUP.fetch_add(1, Ordering::Relaxed);
+    with(|e| {
+        let owned = |owner: &Scope| owner.as_ref().is_some_and(|owner| owner.id == id);
+        let aborts = Aborts {
+            ops: e.pending_ops.iter().filter(|(_, (_, owner))| owned(owner)).map(|(op, _)| *op).collect(),
+            timers: e.timers.iter().filter(|(_, (_, owner))| owned(owner)).map(|(timer, _)| *timer).collect(),
+            http: e.http_owners.iter().filter(|(_, owner)| owned(owner)).map(|(http, _)| *http).collect(),
+            handlers: e.cancel_handlers.get(&id).map(|handlers| handlers.iter().filter(|(_, (_, immediate))| *immediate).map(|(token, _)| *token).collect()).unwrap_or_default(),
+        };
+        e.cleanups.insert(id, CleanupRun { event, owner: scope.fiber.clone(), scope: Some(scope.clone()), reason: error.message.clone(), deadline: Some(deadline.abort_handle()), aborts });
+        // Reject on the next engine turn, after the interrupted entry has
+        // left the JS stack.
+        let _ = e.tx.send(Msg::Abort(id));
+    });
+    cleanup_event(event, scope.fiber.clone(), CleanupStatus::Started, None);
+    let _ = active.reply.send(Err(error));
+}
+
+/// The cancellation of a running call is requested from another thread;
+/// the engine starts its cleanup the next time it enters that call's JS.
+fn begin_cleanup_if_cancelled(scope: &Arc<Invocation>) {
+    if scope.cleaning() || !scope.cancel.is_stopped() { return; }
+    let active = with(|e| match e.calls.get(&scope.id) {
+        Some(call) if call.method != "dispose" => e.calls.remove(&scope.id),
+        _ => None,
+    });
+    if let Some(active) = active {
+        interrupt(active, JsError { kind: FailureKind::Cancelled, message: "the awaiting call was cancelled".into(), ..JsError::default() });
+    }
+}
+
+/// Start an interrupted call's cleanup: stop the timers and HTTP it had, and
+/// reject the host operations and waits it had pending with an AbortError.
+fn abort_scope(id: u64) {
+    let Some((scope, reason, aborts)) = with(|e| {
+        let run = e.cleanups.get_mut(&id)?;
+        Some((run.scope.clone()?, run.reason.clone(), std::mem::take(&mut run.aborts)))
+    }) else { return };
+    let (ctx, api, ops, timers, rejects) = with(|e| {
+        for http in &aborts.http { if e.http_owners.remove(http).is_some() { e.http.abort(*http); } }
+        let mut ops = Vec::new();
+        for op in &aborts.ops {
+            if let Some(job) = e.pending_jobs.remove(op) { job.abort(); }
+            if let Some((resolve, _)) = e.pending_ops.remove(op) { ops.push(resolve); }
+        }
+        let timers: Vec<_> = aborts.timers.iter().copied().filter(|timer| {
+            if let Some(job) = e.timer_jobs.remove(timer) { job.abort(); }
+            e.timers.remove(timer).is_some()
+        }).collect();
+        let rejects: Vec<_> = e.cancel_handlers.get_mut(&id)
+            .map(|handlers| aborts.handlers.iter().filter_map(|token| handlers.remove(token)).map(|(handler, _)| handler).collect())
+            .unwrap_or_default();
+        (e.ctx, e.api, ops, timers, rejects)
+    });
+    unsafe {
+        discard_timers(ctx, api, &timers);
+        for resolve in ops {
+            let value = RootedValue::new(ctx, result_value(ctx, cancelled(&reason)));
+            let _ = enter(Some(scope.clone()), || call(ctx, resolve, &[value.get()]));
+            JSValueUnprotect(ctx, resolve as JSValueRef);
+        }
+        let error = abort_error(ctx, api, &reason);
+        for reject in rejects { let _ = enter(Some(scope.clone()), || call(ctx, reject.get() as JSObjectRef, &[error.get()])); }
+    }
+}
+
+/// An `AbortError` (code `ERR_PLY_CANCELLED`) carrying `reason`.
+unsafe fn abort_error(ctx: JSContextRef, api: JSObjectRef, reason: &str) -> RootedValue {
+    unsafe {
+        let make = get_property(ctx, api, "abortError");
+        let message = RootedValue::new(ctx, string_value(ctx, reason));
+        let value = enter(None, || call(ctx, make as JSObjectRef, &[message.get()])).unwrap_or_else(|_| message.get());
+        RootedValue::new(ctx, value)
+    }
+}
+
+unsafe fn discard_timers(ctx: JSContextRef, api: JSObjectRef, timers: &[u64]) {
+    if timers.is_empty() { return; }
+    unsafe {
+        let discard = get_property(ctx, api, "discardTimers");
+        let ids = RootedValue::new(ctx, json_value(ctx, &json!(timers).to_string()));
+        let _ = enter(None, || call(ctx, discard as JSObjectRef, &[ids.get()]));
+    }
+}
+
+// Stop every resource owned by this invocation, including work it started
+// without awaiting. Ordinary successful calls retain their Node-style
+// timers; failed, cleaned-up and callback invocations retire their scope.
 fn retire_scope(scope: &Invocation, message: &str) {
     scope.cancel.stop();
+    if let Some(cleanup) = scope.cleanup.get() { cleanup.stop(); }
+    scope.retired.store(true, Ordering::Relaxed);
     let id = scope.id;
-    let ctx = with(|e| e.ctx);
     let owned = |scope: &Scope| scope.as_ref().is_some_and(|scope| scope.id == id);
-    let (resolves, timers, rejects) = with(|e| {
+    let (ctx, api, resolves, timers, rejects) = with(|e| {
         if e.terminal_owner == Some(id) { e.terminal.release(); e.terminal_owner = None; }
         let op_ids: Vec<_> = e.pending_ops.iter().filter(|(_, (_, scope))| owned(scope)).map(|(id, _)| *id).collect();
         let mut resolves = Vec::new();
@@ -849,27 +1076,23 @@ fn retire_scope(scope: &Invocation, message: &str) {
         e.continuations.retain(|_, work| !owned(&work.scope));
         let http_ids: Vec<_> = e.http_owners.iter().filter(|(_, scope)| owned(scope)).map(|(id, _)| *id).collect();
         for http in http_ids { e.http_owners.remove(&http); e.http.abort(http); }
-        (resolves, timer_ids, e.cancel_handlers.remove(&id).unwrap_or_default())
+        (e.ctx, e.api, resolves, timer_ids, e.cancel_handlers.remove(&id).unwrap_or_default())
     });
     unsafe {
         for resolve in resolves { JSValueUnprotect(ctx, resolve as JSValueRef); }
-        let error = RootedValue::new(ctx, string_value(ctx, message));
-        for reject in rejects.into_values() { let _ = enter(None, || call(ctx, reject.get() as JSObjectRef, &[error.get()])); }
-        if !timers.is_empty() {
-            let api = with(|e| e.api);
-            let discard = get_property(ctx, api, "discardTimers");
-            let ids = RootedValue::new(ctx, json_value(ctx, &json!(timers).to_string()));
-            let _ = enter(None, || call(ctx, discard as JSObjectRef, &[ids.get()]));
+        if !rejects.is_empty() {
+            // Other consumers of this scope's promises see the rejection.
+            let error = abort_error(ctx, api, message);
+            for (reject, _) in rejects.into_values() { let _ = enter(None, || call(ctx, reject.get() as JSObjectRef, &[error.get()])); }
         }
+        discard_timers(ctx, api, &timers);
     }
 }
 
-// Cleanup has its own bounded invocation, so an interrupted generator's
-// finally block is not required to release plugin-owned session state.
 fn cleanup_event(id: u64, owner: Option<String>, status: CleanupStatus, error: Option<String>) {
     let (realm, bridge) = with(|e| {
         if matches!(status, CleanupStatus::Failed | CleanupStatus::TimedOut | CleanupStatus::Cancelled) {
-            e.stderr.push_str(&format!("ply: onDispose {id}: {status:?}: {}\n", error.as_deref().unwrap_or("")));
+            e.stderr.push_str(&format!("ply: cleanup {id}: {status:?}: {}\n", error.as_deref().unwrap_or("")));
         }
         (e.name.clone(), e.bridge.clone())
     });
@@ -881,52 +1104,32 @@ fn cleanup_event(id: u64, owner: Option<String>, status: CleanupStatus, error: O
         }
     }
 }
+
+/// End a cleanup: an interrupted call's scope is retired with it.
 fn finish_cleanup(id: u64, status: CleanupStatus, error: Option<String>) {
-    let Some(cleanup) = with(|e| e.cleanups.remove(&id)) else { return };
-    cleanup.deadline.abort();
-    // A timeout can happen before dispose has removed its JS callbacks.
-    // Defer bookkeeping until JSC's termination bit has been cleared.
-    with(|e| { let _ = e.tx.send(Msg::DiscardDisposals(cleanup.watches)); });
-    cleanup_event(id, cleanup.owner, status, error);
-}
-fn start_disposal(ids: Vec<u64>, owner: Option<String>) {
-    // Across all realms these private call ids occupy their own JS-safe range.
-    static NEXT_CLEANUP: AtomicU64 = AtomicU64::new(1_u64 << 52);
-    let id = NEXT_CLEANUP.fetch_add(1, Ordering::Relaxed);
-    let (tx, handle) = with(|e| (e.tx.clone(), e.handle.clone()));
-    let deadline_at = Instant::now() + Duration::from_secs(2);
-    let cancel = Arc::new(CallCancellation::with_deadline(deadline_at));
-    let deadline_cancel = cancel.clone();
-    // Arm before calling JS: a callback can block before its first await.
-    let deadline = handle.spawn(async move {
-        tokio::time::sleep_until(deadline_at.into()).await;
-        // The flag/watch interrupts CPU and synchronous waits without
-        // requiring the busy realm to consume this message first.
-        deadline_cancel.expire();
-        let _ = tx.send(Msg::CancelCall(id));
-    });
-    with(|e| { e.cleanups.insert(id, CleanupRun { owner: owner.clone(), watches: ids.clone(), deadline: deadline.abort_handle() }); });
-    cleanup_event(id, owner, CleanupStatus::Started, None);
-    let (reply, _result) = oneshot::channel();
-    // Enter on the next engine turn, after the failed invocation has left
-    // the JS stack. Nested JS entry would drain lazy thenable jobs under
-    // the failed caller's scope instead of this cleanup's scope.
-    with(|e| { let _ = e.tx.send(Msg::Api { id, method: "dispose", args: vec![json!(ids).to_string()], fiber: None, cancel, reply }); });
+    let Some(run) = with(|e| e.cleanups.remove(&id)) else { return };
+    if let Some(deadline) = run.deadline { deadline.abort(); }
+    if let Some(scope) = &run.scope { retire_scope(scope, error.as_deref().unwrap_or("cleanup finished; pending work cancelled")); }
+    cleanup_event(run.event, run.owner, status, error);
 }
 
 fn start_call(id: u64, method: &'static str, args: Vec<String>, fiber: Option<String>, cancel: Arc<CallCancellation>, reply: Reply<Result<Value, JsError>>) {
     let (ctx, api, scope) = with(|e| {
-        let origin = if method == "method" {
-            args.get(3).and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null)
-        } else {
-            json!({ "plugin": e.name, "loading": method == "load", "host": false, "client": format!("{:?}", e.id),
-                "fiber": fiber, "ancestors": [] })
-        };
-        let scope = Arc::new(Invocation { id, fiber, cancel, origin });
-        e.calls.insert(id, ActiveCall { reply, scope: scope.clone(), disposals: Vec::new(), method });
+        let scope = Arc::new(Invocation::new(id, fiber, cancel));
+        e.calls.insert(id, ActiveCall { reply, scope: scope.clone(), method });
         (e.ctx, e.api, scope)
     });
-    if scope.cancel.is_stopped() { fail_call(id, FailureKind::Cancelled, "call cancelled before execution".into()); return; }
+    if method == "dispose" {
+        let event = NEXT_CLEANUP.fetch_add(1, Ordering::Relaxed);
+        with(|e| { e.cleanups.insert(id, CleanupRun { event, owner: None, scope: None, reason: String::new(), deadline: None, aborts: Aborts::default() }); });
+        cleanup_event(event, None, CleanupStatus::Started, None);
+    }
+    if scope.cancel.is_stopped() {
+        if let Some(active) = with(|e| e.calls.remove(&id)) {
+            end_call(id, active, JsError { kind: FailureKind::Cancelled, message: "call cancelled before execution".into(), ..JsError::default() });
+        }
+        return;
+    }
     unsafe {
         let f = RootedValue::new(ctx, JSValueToObject(ctx, get_property(ctx, api, method), null_mut()) as JSValueRef);
         // A Vec's storage is on the Rust heap, outside JSC's root scan. Root
@@ -1019,9 +1222,10 @@ unsafe extern "C" fn host_sync(
         // call; rejecting console/settle here could recursively reject the
         // unhandled-rejection reporter while a realm is shutting down.
         let cleanup = matches!(op.as_str(), "settle" | "console.write" | "timer.clear" | "http.abort" | "terminal.close" | "kernel.directory" | "clock.now");
-        let result = if !cleanup && with(|e| *e.cancelled.borrow() || e.current.as_ref().is_some_and(|scope| scope.cancel.is_stopped())) {
-            OpResult::error("ERR_PLY_CANCELLED", "fiber or realm cancelled")
-        } else { sync_op(&op, args, bytes) };
+        let result = match refusal() {
+            Some(refused) if !cleanup => refused,
+            _ => sync_op(&op, args, bytes),
+        };
         result_value(ctx, result)
     }
 }
@@ -1049,8 +1253,11 @@ unsafe extern "C" fn host_async(
         });
         let completion = HostCompletion { tx, id, completed: false };
         let finish = move |result: OpResult| completion.finish(result);
-        let job = if with(|e| *e.cancelled.borrow() || e.current.as_ref().is_some_and(|scope| scope.cancel.is_stopped())) {
-            finish(closed_realm());
+        let job = if let Some(refused) = refusal() {
+            finish(refused);
+            None
+        } else if matches!(op.as_str(), "kernel.spawn" | "kernel.command_run") && fiber.as_ref().is_some_and(|scope| scope.cleaning()) {
+            finish(cancelled("a cancelled call cannot start new calls while it cleans up"));
             None
         } else if op.starts_with("fs.") {
             Some(handle.spawn(async move { finish(fs_op(fs, &op, args, bytes).await) }))
@@ -1069,6 +1276,20 @@ unsafe extern "C" fn host_async(
         } else if op.starts_with("checkpoint.") {
             let checkpoints = with(|e| e.checkpoints.clone());
             Some(handle.spawn_blocking(move || finish(checkpoints.call(&op, args))))
+        } else if op.starts_with("memory.") {
+            let memory = with(|e| e.memory.clone());
+            Some(handle.spawn(async move {
+                let result = async {
+                    if realm != "memory" || op == "memory.configure" && !loading || loading && matches!(op.as_str(),"memory.remember"|"memory.forget") { return OpResult::error("ERR_PLY_MEMORY", "private memory storage belongs to the memory plugin; configure in onLoad and mutate only in explicit calls"); }
+                    let origin = json!({"kind":"explicit","plugin":realm});
+                    let scope = fiber;
+                    match tokio::task::spawn_blocking(move || memory.call(&fs, &op, args, origin, &|| scope.as_ref().is_some_and(|scope| scope.stopped()))).await {
+                        Ok(value) => value,
+                        Err(error) => OpResult::error("ERR_PLY_MEMORY", error.to_string()),
+                    }
+                }.await;
+                finish(result);
+            }))
         } else if op.starts_with("http.") {
             let http = with(|e| e.http.clone());
             Some(handle.spawn(async move { finish(http.call(&op, args).await) }))
@@ -1094,34 +1315,51 @@ unsafe extern "C" fn host_async(
     }
 }
 
+/// Why the running JS may not start host work, if it may not. The call that
+/// notices its cancellation this way starts its cleanup at once: this host
+/// call throws the AbortError, and its catch/finally may then do IO.
+fn refusal() -> Option<OpResult> {
+    let (closing, scope) = with(|e| (*e.cancelled.borrow(), e.current.clone()));
+    if closing { return Some(closed_realm()); }
+    let scope = scope.filter(|scope| scope.stopped())?;
+    begin_cleanup_if_cancelled(&scope);
+    Some(cancelled("call cancelled by host"))
+}
+
 fn invalid(what: &str) -> OpResult {
     OpResult::error("ERR_PLY_INVALID_CALL", format!("invalid {what} in host call"))
 }
 
 fn closed_realm() -> OpResult { OpResult::error("ERR_PLY_REALM_CLOSED", "the realm is closing") }
 
+/// What JS sees when its call was cancelled: an AbortError.
+fn cancelled(message: &str) -> OpResult {
+    OpResult::Error(json!({ "code": "ERR_PLY_CANCELLED", "name": "AbortError", "message": message }))
+}
+
 fn blocking<T>(future: impl std::future::Future<Output = T>) -> Result<T, OpResult> {
-    let (handle, mut cancelled, scope) = with(|e| (e.handle.clone(), e.cancelled.clone(), e.current.clone()));
+    let (handle, mut closing, scope) = with(|e| (e.handle.clone(), e.cancelled.clone(), e.current.clone()));
     handle.block_on(async move {
         let stop_scope = async {
             match scope {
-                Some(scope) => { let _ = scope.cancel.signal.subscribe().wait_for(|stopped| *stopped).await; }
+                Some(scope) => { let _ = scope.control().signal.subscribe().wait_for(|stopped| *stopped).await; }
                 None => std::future::pending::<()>().await,
             }
         };
+        // An operation that already finished reports its result, even if
+        // the call was cancelled meanwhile: the IO did happen.
         tokio::select! {
             biased;
-            _ = cancelled.wait_for(|closed| *closed) => Err(closed_realm()),
-            _ = stop_scope => Err(OpResult::error("ERR_PLY_CANCELLED", "fiber cancelled by host")),
+            _ = closing.wait_for(|closed| *closed) => Err(closed_realm()),
             result = future => Ok(result),
+            _ = stop_scope => Err(cancelled("call cancelled by host")),
         }
-    })
+    }).inspect_err(|_| { if let Some(scope) = with(|e| e.current.clone()) { begin_cleanup_if_cancelled(&scope); } })
 }
 
 fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
     let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     match op {
-        "invocation.info" => with(|e| OpResult::Json(e.current.as_ref().map(|s| s.origin.clone()).unwrap_or(Value::Null))),
         "markdown.parse" => crate::markdown::parse(args),
         "skills.parse" => crate::skills::parse(args),
         "markdown.source" => OpResult::Json(json!(include_str!("markdown.js"))),
@@ -1140,21 +1378,7 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
                 Ok(code) => OpResult::Json(json!(code)), Err(error) => OpResult::error("ERR_SYNTAX", error),
             }
         },
-        "fiber.watch" => with(|e| {
-            let Some(scope) = e.current.clone() else { return invalid("cleanup owner"); };
-            if e.cleanups.contains_key(&scope.id) { return invalid("cleanup cannot register nested cleanup"); }
-            let id = e.next();
-            let Some(call) = e.calls.get_mut(&scope.id) else { return invalid("cleanup owner"); };
-            call.disposals.push(id);
-            OpResult::Json(json!(id))
-        }),
-        "fiber.unwatch" => with(|e| {
-            let Some(scope) = e.current.clone() else { return invalid("cleanup owner"); };
-            let id = args.get("id").and_then(Value::as_u64).unwrap_or(0);
-            if let Some(call) = e.calls.get_mut(&scope.id) { call.disposals.retain(|watch| *watch != id); }
-            OpResult::Json(Value::Null)
-        }),
-        "fiber.unhandled" => {
+        "call.unhandled" => {
             if let Some(scope) = with(|e| e.current.clone()) { fail_call(scope.id, FailureKind::Failed, s("error")); }
             OpResult::Json(Value::Null)
         }
@@ -1239,31 +1463,32 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
         "module.load" => load_module(&s("id")),
         "settle" => {
             let id = args.get("id").and_then(Value::as_u64).unwrap_or(0);
-            let owner = with(|e| e.current.as_ref().map(|scope| scope.id));
-            if owner != Some(id) { return invalid("settle owner"); }
-            if with(|e| e.current.as_ref().is_some_and(|scope| scope.cancel.is_stopped())) {
-                fail_call(id, FailureKind::Cancelled, "call cancelled before completion".into());
+            let current = with(|e| e.current.clone());
+            let Some(scope) = current.filter(|scope| scope.id == id) else { return invalid("settle owner"); };
+            let ok = args.get("ok").and_then(Value::as_bool) == Some(true);
+            if scope.cleaning() {
+                // The interrupted call's own code has finished: rethrowing
+                // its AbortError is the expected way to end.
+                let error = s("error");
+                let aborted = ok || error.starts_with("AbortError:");
+                finish_cleanup(id, if aborted { CleanupStatus::Done } else { CleanupStatus::Failed }, (!aborted).then_some(error));
                 return OpResult::Json(Value::Null);
             }
             let Some(reply) = with(|e| e.calls.remove(&id)) else {
-                let expected = with(|e| e.current.as_ref().is_some_and(|scope| scope.id == id && scope.cancel.is_stopped()));
-                return if expected { OpResult::Json(Value::Null) } else { invalid("settle id") };
+                return if scope.dead() { OpResult::Json(Value::Null) } else { invalid("settle id") };
             };
-            let result = if args.get("ok").and_then(Value::as_bool) == Some(true) {
-                Ok(args.get("value").cloned().unwrap_or(Value::Null))
-            } else {
-                Err(JsError {
+            if scope.cancel.is_stopped() && reply.method != "dispose" {
+                // Cancelled as it finished: nothing is left to clean up.
+                end_call(id, reply, JsError { kind: FailureKind::Cancelled, message: "call cancelled before completion".into(), ..JsError::default() });
+                return OpResult::Json(Value::Null);
+            }
+            if !ok {
+                end_call(id, reply, JsError {
                     kind: FailureKind::Failed,
                     message: s("error"),
                     exit_code: args.get("exit").and_then(Value::as_i64).map(|c| c as i32),
                     stack: args.get("stack").and_then(Value::as_str).filter(|st| !st.is_empty()).map(str::to_string),
-                })
-            };
-            if result.is_err() {
-                // Put it back so the common cleanup path retires this scope.
-                let error = result.unwrap_err();
-                with(|e| { e.calls.insert(id, reply); });
-                fail_call_error(id, error);
+                });
             } else {
                 with(|e| { if e.terminal_owner == Some(id) { e.terminal.release(); e.terminal_owner = None; } });
                 if matches!(reply.method, "event" | "command") || with(|e| e.cleanups.contains_key(&id)) {
@@ -1271,15 +1496,7 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
                 }
                 finish_cleanup(id, CleanupStatus::Done, None);
                 with(|e| { e.cancel_handlers.remove(&id); });
-                if !reply.disposals.is_empty() {
-                    unsafe {
-                        let (ctx, api) = with(|e| (e.ctx, e.api));
-                        let callback = get_property(ctx, api, "discardDisposals");
-                        let ids = RootedValue::new(ctx, json_value(ctx, &json!(reply.disposals).to_string()));
-                        let _ = call(ctx, callback as JSObjectRef, &[ids.get()]);
-                    }
-                }
-                let _ = reply.reply.send(result);
+                let _ = reply.reply.send(Ok(args.get("value").cloned().unwrap_or(Value::Null)));
             }
             OpResult::Json(Value::Null)
         }
@@ -1290,7 +1507,7 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
 // -------------------------------------------------------------- modules
 
 fn resolve_module(spec: &str, from: Option<&Value>) -> OpResult {
-    if matches!(spec, "ply:models" | "ply:checkpoints" | "ply:lifecycle" | "ply:sh" | "ply:events" | "ply:http" | "ply:terminal" | "ply:plugins" | "ply:commands" | "ply:markdown" | "ply:skills") || spec.strip_prefix("ply:async/helpers/").is_some_and(|name|
+    if matches!(spec, "ply:models" | "ply:checkpoints" | "ply:memory-store" | "ply:sh" | "ply:events" | "ply:http" | "ply:terminal" | "ply:plugins" | "ply:commands" | "ply:markdown" | "ply:skills") || spec.strip_prefix("ply:async/helpers/").is_some_and(|name|
         ["asyncToGenerator", "wrapAsyncGenerator", "awaitAsyncGenerator", "asyncGeneratorDelegate", "asyncIterator"].contains(&name)) {
         return OpResult::Json(json!({ "builtin": spec }));
     }

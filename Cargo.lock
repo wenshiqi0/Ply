@@ -1470,6 +1470,107 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "ply-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "ply-kernel",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "ply-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ply-io"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "ply-storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "ply-jsc"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "oxc",
+ "oxc_ecmascript",
+ "ply-core",
+ "ply-libc",
+ "ply-sh",
+ "pulldown-cmark",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "ply-kernel"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "oxc",
+ "ply-core",
+ "ply-jsc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "unicode-width",
+]
+
+[[package]]
+name = "ply-libc"
+version = "0.1.0"
+dependencies = [
+ "ply-io",
+ "tokio",
+]
+
+[[package]]
+name = "ply-sh"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ply-io",
+ "ply-libc",
+ "ply-storage",
+ "regex",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "ply-storage"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rusqlite",
+ "serde",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "postcard"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2404,107 +2505,6 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "ply-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "serde_json",
- "tempfile",
- "tokio",
- "ply-kernel",
-]
-
-[[package]]
-name = "ply-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ply-io"
-version = "0.1.0"
-dependencies = [
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "ply-storage",
-]
-
-[[package]]
-name = "ply-jsc"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "libc",
- "oxc",
- "oxc_ecmascript",
- "pulldown-cmark",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "tempfile",
- "tokio",
- "ply-core",
- "ply-libc",
- "ply-sh",
-]
-
-[[package]]
-name = "ply-kernel"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "oxc",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "unicode-width",
- "ply-core",
- "ply-jsc",
-]
-
-[[package]]
-name = "ply-libc"
-version = "0.1.0"
-dependencies = [
- "tokio",
- "ply-io",
-]
-
-[[package]]
-name = "ply-sh"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "regex",
- "serde_json",
- "tempfile",
- "tokio",
- "ply-io",
- "ply-libc",
- "ply-storage",
-]
-
-[[package]]
-name = "ply-storage"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "rusqlite",
- "serde",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

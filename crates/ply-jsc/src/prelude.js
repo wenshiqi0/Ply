@@ -21,16 +21,18 @@
   const evaluate = indirectEval("(function(eval, babelHelpers, code) { return eval(code); })");
   const compile = code => evaluate(indirectEval, asyncHelpers, code);
   const EXIT = Symbol("ply.exit");
-  const disposals = new Map();
 
   // ---------------------------------------------------------------- host ops
   function makeError(e) {
     const err = new Error(e.message);
-    for (const k of ["code", "errno", "syscall", "path", "dest"]) if (e[k] !== undefined && e[k] !== null) err[k] = e[k];
+    for (const k of ["name", "code", "errno", "syscall", "path", "dest"]) if (e[k] !== undefined && e[k] !== null) err[k] = e[k];
     return err;
   }
   function unwrap(r) {
-    if (r !== null && typeof r === "object" && !(r instanceof Uint8Array) && r.__error) throw makeError(r.__error);
+    if (r !== null && typeof r === "object" && !(r instanceof Uint8Array) && r.__error) {
+      if (r.__error.code === "ERR_PLY_CANCELLED") asyncHelpers.observeCancel();
+      throw makeError(r.__error);
+    }
     return r;
   }
   // Null-prototype copies: a plugin-defined Object.prototype.toJSON cannot
@@ -661,26 +663,16 @@
       );
   }
 
-  // ------------------------------------------------------------------ fiber
-  // The kernel attaches identity from the caller, never from plugin input.
-  const fiber = objectFreeze({
-    info: () => opAsync("kernel.fiber_info", {}),
-    record: (data) => opAsync("kernel.record", { data }),
-    limitChildren: (plugin, limit, started = 0) => opAsync("kernel.limit_children", { plugin, limit, started }),
-    childBudget: (plugin) => opAsync("kernel.child_budget", { plugin }),
-  });
-
   // --------------------------------------------------------------- plugins
   // Imported from ply:plugins; kept current by the kernel.
   //
-  // - `await plugins.bash(input)` runs its `onHandle` as a lazy fiber: nothing
-  //   runs until it is awaited, `then` is the call, and the kernel runs it
-  //   as a child of the fiber doing the awaiting. Awaiting a handle twice
-  //   runs it once, like a promise.
-  // - `await plugins.context.loaded` waits until its `onLoad` has returned.
+  // - `await plugins.bash(input)` runs its `onHandle` lazily: nothing runs
+  //   until it is awaited, `then` is the call, and the kernel schedules it
+  //   under the caller. Awaiting a handle twice runs it once, like a promise.
+  // - What its `onLoad` returned; the kernel loads named imports first.
   // - `description`, and for plugins with `onHandle` `parameters` (JSON
   //   Schema of its tool arguments) and `wrapsInput`.
-  function fiberHandle(plugin, input) {
+  function callHandle(plugin, input) {
     let started = null;
     const start = () => (started ??= opAsync("kernel.spawn", { plugin, input: input === undefined ? null : input }));
     return objectFreeze({
@@ -694,12 +686,11 @@
   const pluginEntries = new Map();
   function pluginEntry(name) {
     if (pluginEntries.has(name)) return pluginEntries.get(name);
-    const entry = (input) => fiberHandle(name, input);
+    const entry = (input) => callHandle(name, input);
     const methods = new Map();
-    const metadata = ["loaded", "description", "parameters", "wrapsInput"];
+    const metadata = ["description", "parameters", "wrapsInput"];
     const read = (key) => {
       if (key === "then") return undefined;
-      if (key === "loaded") return opAsync("kernel.loaded", { plugin: name });
       if (methods.has(key)) return methods.get(key);
       const known = findPlugin(name);
       if (key === "description") return known?.description;
@@ -728,7 +719,7 @@
     return handle;
   }
   const plugins = new Proxy(objectCreate(null), {
-    // `then` is excluded so `await plugins` is not mistaken for a fiber.
+    // `then` is excluded so `await plugins` is not mistaken for a call.
     get: (_, name) => (typeof name === "string" && name !== "then" ? pluginEntry(name) : undefined),
     has: (_, name) => typeof name === "string" && findPlugin(name) !== undefined,
     ownKeys: () => directory().map((p) => p.name),
@@ -741,37 +732,9 @@
     deleteProperty: () => false,
   });
 
-  // -------------------------------------------------------------------- ctx
-  // What every plugin's `onLoad` returned, side by side: plain members as a
-  // copy, functions as async calls into the realm of the plugin that
-  // mounted them (`await ctx.registerTool("bash")`). When two plugins mount
-  // the same name, the later mount wins.
-  function ctxMember(name) {
-    for (const plugin of directory().slice().sort((a, b) => b.mounted - a.mounted)) {
-      if (objectHasOwn(plugin.mounts.data, name)) return plugin.mounts.data[name];
-      if (plugin.mounts.methods.includes(name)) {
-        return (...args) => opAsync("kernel.method", { plugin: plugin.name, method: name, args });
-      }
-    }
-    return undefined;
-  }
-  const ctxNames = () => [...new Set(directory().flatMap((p) => [...Object.keys(p.mounts.data), ...p.mounts.methods]))];
-  const ctx = new Proxy(objectCreate(null), {
-    get: (_, name) => (typeof name === "string" && name !== "then" ? ctxMember(name) : undefined),
-    has: (_, name) => typeof name === "string" && ctxNames().includes(name),
-    ownKeys: () => ctxNames(),
-    getOwnPropertyDescriptor: (_, name) =>
-      typeof name === "string" && ctxNames().includes(name)
-        ? { value: ctxMember(name), enumerable: true, configurable: true, writable: false }
-        : undefined,
-    set: () => false,
-    defineProperty: () => false,
-    deleteProperty: () => false,
-  });
-
   // --------------------------------------------------------------- globals
   Object.assign(G, {
-    console, process, Buffer, TextEncoder, TextDecoder, ctx, fiber,
+    console, process, Buffer, TextEncoder, TextDecoder,
     setTimeout, setInterval, setImmediate, clearTimeout, clearInterval: clearTimeout, clearImmediate: clearTimeout,
     queueMicrotask,
   });
@@ -820,15 +783,7 @@
         headers: (id) => opAsync("http.headers", { id }),
         read: (id) => opAsync("http.read", { id }),
         abort: (id) => op("http.abort", { id }),
-      }) : name === "ply:lifecycle" ? {
-        current: () => op("invocation.info", {}),
-        onDispose(callback) {
-          if (typeof callback !== "function") throw new TypeError("cleanup must be a function");
-          const id = op("fiber.watch", {});
-          disposals.set(id, callback);
-          return () => { disposals.delete(id); op("fiber.unwatch", { id }); };
-        },
-      } : name === "ply:http" ? {
+      }) : name === "ply:http" ? {
         hasCredentials: provider => op("http.auth_configured", { provider }),
         requestJson: request => opAsync("http.request_json", request),
       } : name === "ply:skills" ? {
@@ -873,6 +828,11 @@
         },
         emit: (name, data, options = {}) => opAsync("kernel.event_emit", { name, data, timeout_ms: options.timeout_ms ?? 30000 }),
         list: () => opAsync("kernel.event_list", {}),
+      } : name === "ply:memory-store" ? {
+        configure: options => opAsync("memory.configure", options ?? {}),
+        recall: options => opAsync("memory.recall", options ?? {}),
+        remember: options => opAsync("memory.remember", options),
+        forget: options => opAsync("memory.forget", options),
       } : name === "ply:checkpoints" ? {
         create: (snapshot) => opAsync("checkpoint.create", { snapshot }),
         claim: (id) => opAsync("checkpoint.claim", { id }),
@@ -957,10 +917,11 @@
     await rec.done;
     return rec.exports;
   }
-  asyncHelpers.setUnhandled(reason => op("fiber.unhandled", { error: describe(reason), stack: reason?.stack ?? null }));
+  asyncHelpers.setUnhandled(reason => op("call.unhandled", { error: describe(reason), stack: reason?.stack ?? null }));
   return {
     main: (id, file) => settle(id, async () => {
       const rec = load(file, null);
+      entries.set(file, rec);
       await rec.done;
       return Object.keys(rec.exports);
     }),
@@ -977,7 +938,7 @@
       return await target.apply(owner, jsonParse(argsJson));
     }),
     eval: (id, code) => settle(id, () => evaluate(indirectEval, asyncHelpers, code)),
-    // One fiber: the host has tagged this entry with its id.
+    // One call; the host has tagged this entry with its scope.
     run: (id, file, inputJson) => settle(id, async () => {
       const exports = await entry(file);
       if (typeof exports.onHandle !== "function") throw new TypeError(`${file} does not export an onHandle function`);
@@ -999,7 +960,7 @@
       loadedMounts.set(file, mounted ?? {});
       return { data, methods };
     }),
-    // Callback stays in its subscribing realm; the kernel creates the child fiber.
+    // Callback stays in its subscribing realm; the kernel schedules the call.
     event: (id, callback, inputJson) => settle(id, async () => {
       const handler = eventCallbacks.get(Number(callback));
       if (typeof handler !== "function") throw new Error("event subscription was removed");
@@ -1010,7 +971,7 @@
       if (typeof handler !== "function") throw new Error("command registration was removed");
       return await handler(jsonParse(inputJson));
     }),
-    // A function onLoad returned (on ctx), called from another realm.
+    // A function onLoad returned, called from another realm.
     method: (id, file, name, argsJson) => settle(id, async () => {
       const mounted = loadedMounts.get(file);
       if (!mounted || !objectHasOwn(mounted, name) || typeof mounted[name] !== "function") {
@@ -1019,27 +980,23 @@
       return await mounted[name](...jsonParse(argsJson));
     }),
     onUnhandledRejection(promise, reason) {
-      const text = describe(reason) + (reason instanceof Error && reason.stack ? "\n" + reason.stack : "");
-      write(2, "Uncaught (in promise) " + text + "\n");
+      // A cancelled call rejects everything it was awaiting; that is not news.
+      if (reason?.code !== "ERR_PLY_CANCELLED") {
+        const text = describe(reason) + (reason instanceof Error && reason.stack ? "\n" + reason.stack : "");
+        write(2, "Uncaught (in promise) " + text + "\n");
+      }
       asyncHelpers.onUnhandled(promise, reason);
     },
-    dispose: (id, idsJson) => settle(id, async () => {
-      const errors = [];
-      // Detach the whole batch before invoking any callback. If the first
-      // callback blocks, later callbacks must not stay rooted in this Map.
-      const callbacks = jsonParse(idsJson).map(watch => {
-        const callback = disposals.get(watch);
-        disposals.delete(watch);
-        return callback;
-      });
-      for (const callback of callbacks) {
-        if (callback) {
-          try { await callback(); } catch (error) { reportUncaught(error); errors.push(describe(error)); }
-        }
-      }
-      if (errors.length) throw new Error("onDispose cleanup failed: " + errors.join("; "));
+    // onDispose, once, as the realm is retired; only after its entry evaluated.
+    dispose: (id, file) => settle(id, async () => {
+      const rec = entries.get(file);
+      if (!rec) return;
+      try { await rec.done; } catch { return; }
+      if (typeof rec.exports.onDispose === "function") await rec.exports.onDispose();
     }),
-    discardDisposals(ids) { for (const id of ids) disposals.delete(id); },
+    // What an interrupted call's pending promises reject with.
+    abortError: (message) => objectAssign(new Error(message), { name: "AbortError", code: "ERR_PLY_CANCELLED" }),
+    abortRunning: (message) => asyncHelpers.abortRunning(objectAssign(new Error(message), { name: "AbortError", code: "ERR_PLY_CANCELLED" })),
     discardTimers(ids) { for (const id of ids) timers.delete(id); },
     fire,
   };

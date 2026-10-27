@@ -1,12 +1,9 @@
-import plugins from "ply:plugins";
 import * as events from "ply:events";
 
 /** Adapter template: replace this pending response with your environment's UI/service. */
 export async function onLoad() {
-  await plugins.approval.loaded;
   const pending = async (event: events.Event<PlyApprovalRequest | PlyToolApprovalRequest>): Promise<PlyApprovalResponse> => {
-    await fiber.record({ type: "environment_approval_needed", request_id: event.data.id, tool: event.data.tool, cwd: event.data.cwd,
-      ...("command" in event.data ? { command: event.data.command } : { input: event.data.input }) });
+    console.log(`approval needed: ${event.data.id} ${event.data.tool} in ${event.data.cwd}`);
     // An actual adapter must await an authenticated user's/service's answer.
     // Do not approve based on model output or command-supplied flags.
     return { request_id: event.data.id, decision: "pending", reason: "approval environment is not connected" };

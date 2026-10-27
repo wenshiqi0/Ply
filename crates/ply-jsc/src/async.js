@@ -1,8 +1,8 @@
-// Promise scheduling for fiber ownership. Helpers below are from
+// Promise scheduling for call ownership. Helpers below are from
 // @oxc-project/runtime 0.155.0 (MIT); see vendor/oxc-async.LICENSE.
 // Native await bypasses Promise.prototype.then, so every evaluated module,
 // prelude and model bundle is lowered by OXC before entering JSC.
-(function (hostBind, registerCancel, unregisterCancel) {
+(function (hostBind, registerCancel, unregisterCancel, currentCall, callCancelled) {
   "use strict";
   const NativePromise = globalThis.Promise;
   const nativeThen = NativePromise.prototype.then;
@@ -10,6 +10,18 @@
   const apply = Reflect.apply;
   const owners = new WeakMap();
   let unhandled = () => {};
+  // Promises that settle through their own chain (`then` results, async
+  // function results) are rejected only when a cancelled call is retired;
+  // what a cancelled call awaits is interrupted at once instead.
+  let deriving = false;
+  const derived = executor => { deriving = true; return new Promise(executor); };
+  // Which call created a promise. A cancelled call's waits on promises it
+  // did not create are interrupted; its own settle through their chain.
+  const creators = new WeakMap();
+  // Async frames executing in this turn: { reject, observed }. A terminated
+  // turn never unwinds them, so their promises are rejected for them.
+  const running = [];
+  const cancelledError = () => Object.assign(new Error("the call was cancelled"), { name: "AbortError", code: "ERR_PLY_CANCELLED" });
   const own = promise => {
     owners.set(promise, hostBind(reason => unhandled(reason), true));
     return promise;
@@ -17,10 +29,12 @@
   const Promise = new Proxy(NativePromise, {
     construct(target, args, newTarget) {
       const executor = args[0];
+      const leaf = !deriving;
+      deriving = false;
       if (typeof executor !== "function") throw new TypeError("Promise resolver is not a function");
       let promise;
       promise = Reflect.construct(target, [(resolve, reject) => {
-        const token = registerCancel(reject);
+        const token = registerCancel(reject, leaf);
         let locked = false;
         const fulfilled = value => { unregisterCancel(token); resolve(value); };
         const rejected = error => { unregisterCancel(token); reject(error); };
@@ -32,28 +46,43 @@
             // Keep the outer Promise cancellable while adopting a pending
             // value. These intrinsic reactions only settle it; user code
             // still runs exclusively through the continuation scheduler.
-            apply(nativeThen, nativeResolve(value), [fulfilled, rejected]);
+            const adopted = nativeResolve(value);
+            deriving = true;
+            try { apply(nativeThen, adopted, [fulfilled, rejected]); } finally { deriving = false; }
           } else fulfilled(value);
         };
         const fail = error => { if (!locked) { locked = true; rejected(error); } };
         try { executor(accept, fail); } catch (error) { fail(error); }
       }], newTarget);
+      creators.set(promise, currentCall());
       return own(promise);
     },
   });
   // Registering a reaction captures its consumer's identity. The native
   // callback queues a Rust continuation instead of running plugin JS in
   // JSC's shared microtask drain; a terminated turn cannot drop siblings.
+  // Cancelling the consumer interrupts the wait with an AbortError; the
+  // reaction is one-shot, so a source settling later is ignored.
   NativePromise.prototype.then = function (done, failed) {
-    return new Promise((resolve, reject) => {
-      apply(nativeThen, this, [
-        hostBind(value => {
-          try { resolve(typeof done === "function" ? done(value) : value); } catch (error) { reject(error); }
-        }, false),
-        hostBind(error => {
-          try { if (typeof failed === "function") resolve(failed(error)); else reject(error); } catch (error) { reject(error); }
-        }, false),
-      ]);
+    const source = this;
+    return derived((resolve, reject) => {
+      let settled = false;
+      let token = 0;
+      const fulfilled = value => {
+        if (settled) return;
+        settled = true;
+        unregisterCancel(token);
+        try { resolve(typeof done === "function" ? done(value) : value); } catch (error) { reject(error); }
+      };
+      const rejected = error => {
+        if (settled) return;
+        settled = true;
+        unregisterCancel(token);
+        try { if (typeof failed === "function") resolve(failed(error)); else reject(error); } catch (error) { reject(error); }
+      };
+      if (creators.get(source) !== currentCall()) token = registerCancel(rejected, true);
+      deriving = true;
+      try { apply(nativeThen, source, [hostBind(fulfilled, false), hostBind(rejected, false)]); } finally { deriving = false; }
     });
   };
   Object.defineProperty(NativePromise.prototype, "constructor", { value: Promise });
@@ -66,12 +95,15 @@ function OverloadYield(e, d) {
   this.v = e, this.k = d;
 }
 
-function asyncGeneratorStep(n, t, e, r, o, a, c) {
+function asyncGeneratorStep(n, t, e, r, o, a, c, f) {
+  running.push(f);
   try {
     var i = n[a](c),
       u = i.value;
   } catch (n) {
     return void e(n);
+  } finally {
+    running.pop();
   }
   i.done ? t(u) : Promise.resolve(u).then(r, o);
 }
@@ -79,13 +111,23 @@ function asyncToGenerator(n) {
   return function () {
     var t = this,
       e = arguments;
-    return new Promise(function (r, o) {
+    return derived(function (r, o) {
       var a = n.apply(t, e);
+      // A frame that existed when its call was cancelled sees an AbortError
+      // once: on its first resumption after that, or as a host call throws
+      // it. A frame started during the call's cleanup never does, so cleanup
+      // code awaits normally.
+      var f = { reject: o, observed: callCancelled() };
       function _next(n) {
-        asyncGeneratorStep(a, r, o, _next, _throw, "next", n);
+        if (!f.observed && callCancelled()) {
+          f.observed = true;
+          return void asyncGeneratorStep(a, r, o, _next, _throw, "throw", cancelledError(), f);
+        }
+        asyncGeneratorStep(a, r, o, _next, _throw, "next", n, f);
       }
       function _throw(n) {
-        asyncGeneratorStep(a, r, o, _next, _throw, "throw", n);
+        f.observed = f.observed || callCancelled();
+        asyncGeneratorStep(a, r, o, _next, _throw, "throw", n, f);
       }
       _next(void 0);
     });
@@ -143,7 +185,7 @@ function AsyncGenerator(e) {
     (r = r.next) ? resume(r.key, r.arg) : t = null;
   }
   this._invoke = function (e, n) {
-    return new Promise(function (o, u) {
+    return derived(function (o, u) {
       var i = {
         key: e,
         arg: n,
@@ -173,7 +215,7 @@ function asyncGeneratorDelegate(t) {
   var e = {},
     n = !1;
   function pump(e, r) {
-    return n = !0, r = new Promise(function (n) {
+    return n = !0, r = derived(function (n) {
       n(t[e](r));
     }), {
       done: !1,
@@ -248,6 +290,10 @@ function AsyncFromSyncIterator(r) {
   return Object.freeze({
     asyncToGenerator, wrapAsyncGenerator, awaitAsyncGenerator, asyncGeneratorDelegate, asyncIterator,
     bind: hostBind,
+    // After a terminated turn: reject the async frames it left mid-execution.
+    abortRunning(error) { for (const frame of running.splice(0).reverse()) frame.reject(error); },
+    // A host call threw this turn's AbortError through the running frames.
+    observeCancel() { for (const frame of running) frame.observed = true; },
     setUnhandled(fn) { unhandled = fn; },
     onUnhandled(promise, reason) { const report = owners.get(promise); if (report) report(reason); },
   });

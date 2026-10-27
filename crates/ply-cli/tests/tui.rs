@@ -210,12 +210,17 @@ fn project() -> PathBuf {
 fn fixture_agent(work: &Path) -> PathBuf {
     let dir = work.join("agent");
     std::fs::create_dir_all(&dir).unwrap();
-    let source = include_str!("../../../plugins/agent/main.ts").replacen(
-        "import { request as modelRequest } from \"ply:models\";",
-        include_str!("../../ply-kernel/tests/fixtures/approval-model.js"),
-        1,
-    );
-    std::fs::write(dir.join("main.ts"), source).unwrap();
+    let ply_kernel::PluginSource::Bundled { files, .. } = ply_kernel::PluginSource::builtin("agent").unwrap() else { unreachable!() };
+    let import = "import { request as modelRequest } from \"ply:models\";";
+    let mut replaced = 0;
+    for (name, source) in files {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        if source.contains(import) { replaced += 1; }
+        let source = source.replacen(import, include_str!("../../ply-kernel/tests/fixtures/approval-model.js"), 1);
+        std::fs::write(path, source).unwrap();
+    }
+    assert_eq!(replaced, 2, "fixture must replace describe and complete modules");
     dir
 }
 
@@ -234,6 +239,68 @@ fn tui_command(work: &Path) -> Command {
 
 fn tool_prompt(name: &str, input: Value) -> String {
     format!("call:{}\r", json!({"tool":name,"input":input}))
+}
+
+fn journal(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+fn plugin_events<'a>(events: &'a [Value], name: &str) -> Vec<&'a Value> {
+    events
+        .iter()
+        .filter(|e| e["event"] == "plugin" && e["name"] == name)
+        .collect()
+}
+/// The tools granted to the agent started with `prompt`, from its own policy event.
+fn granted_tools(events: &[Value], prompt: &str) -> Value {
+    let spawn = events
+        .iter()
+        .find(|e| e["event"] == "spawn" && e["fiber"]["plugin"] == "agent" && e["fiber"]["input"]["prompt"] == prompt)
+        .unwrap();
+    plugin_events(events, "agent.policy")
+        .into_iter()
+        .find(|e| e["fiber"] == spawn["fiber"]["id"])
+        .unwrap()["data"]["allowed_tools"]
+        .clone()
+}
+/// What the TUI's approval listeners answered: their exits.
+fn tui_decisions(events: &[Value]) -> Vec<Value> {
+    let listeners: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "spawn" && e["fiber"]["plugin"] == "tui" && e["fiber"]["event"].as_str().is_some_and(|name| name.starts_with("approval.")))
+        .map(|e| e["fiber"]["id"].clone())
+        .collect();
+    events
+        .iter()
+        .filter(|e| e["event"] == "exit" && listeners.contains(&e["id"]))
+        .map(|e| e["exit"]["output"].clone())
+        .collect()
+}
+/// The journal has no record lines; each agent model call start is paired
+/// with its result as plugin lines attributed to that agent's fiber.
+fn assert_model_calls_paired(events: &[Value]) {
+    assert!(!events.iter().any(|e| e["event"] == "record"));
+    let agents: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "spawn" && e["fiber"]["plugin"] == "agent")
+        .map(|e| e["fiber"]["id"].clone())
+        .collect();
+    assert!(!agents.is_empty());
+    for agent in agents {
+        let indices = |name: &str| -> Vec<Value> {
+            plugin_events(events, name)
+                .into_iter()
+                .filter(|e| e["fiber"] == agent && e["plugin"] == "agent")
+                .map(|e| e["data"]["call_index"].clone())
+                .collect()
+        };
+        let started = indices("agent.model_call_started");
+        assert!(!started.is_empty());
+        assert_eq!(started, indices("agent.model_call"));
+    }
 }
 
 #[test]
@@ -301,23 +368,20 @@ fn tui_approves_only_once_rejects_and_requires_viewing_long_commands() {
     assert!(work.path().join("long").exists());
     p.send("/quit\r");
     p.exit(true);
-    let events: Vec<Value> = std::fs::read_to_string(record)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    let approvals: Vec<_> = events
-        .iter()
-        .filter(|e| e["data"]["type"] == "tui_approval")
-        .collect();
-    assert_eq!(approvals.len(), 5);
+    let events = journal(&record);
+    let decisions = tui_decisions(&events);
+    assert_eq!(decisions.len(), 5);
     assert_eq!(
-        approvals
+        decisions
             .iter()
-            .filter(|e| e["data"]["decision"] == "approved")
+            .filter(|d| d["decision"] == "approved" && d["approver"] == "local-terminal")
             .count(),
         2
     );
+    assert!(events.iter().any(|e| e["event"] == "exit"
+        && e["exit"]["output"]["approved"] == 2
+        && e["exit"]["output"]["rejected"] == 3));
+    assert_model_calls_paired(&events);
     let root = events
         .iter()
         .find(|e| e["event"] == "spawn" && e["fiber"]["plugin"] == "agent")
@@ -329,12 +393,8 @@ fn tui_approves_only_once_rejects_and_requires_viewing_long_commands() {
             .keys()
             .all(|key| key == "prompt")
     );
-    let offered = events
-        .iter()
-        .find(|e| e["data"]["type"] == "fixture_offered_tools")
-        .unwrap();
     assert_eq!(
-        offered["data"]["names"],
+        granted_tools(&events, "/bash echo yes > approved"),
         json!(["agent", "bash", "create", "edit", "read", "remove"])
     );
 }
@@ -724,25 +784,13 @@ fn tui_reads_and_writes_require_approval_without_restricting_agent_tools() {
     p.wait("agent-done");
     p.send("/quit\r");
     p.exit(true);
-    let events: Vec<Value> = std::fs::read_to_string(record)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    let root = events
-        .iter()
-        .find(|e| e["data"]["type"] == "fixture_offered_tools" && e["data"]["prompt"] == "delegate")
-        .unwrap();
-    let child = events
-        .iter()
-        .find(|e| e["data"]["type"] == "fixture_offered_tools" && e["data"]["prompt"] == "child")
-        .unwrap();
+    let events = journal(&record);
     assert_eq!(
-        root["data"]["names"],
+        granted_tools(&events, "delegate"),
         json!(["agent", "bash", "create", "edit", "read", "remove"])
     );
     assert_eq!(
-        child["data"]["names"],
+        granted_tools(&events, "child"),
         json!(["bash", "create", "edit", "read", "remove"])
     );
 }
@@ -795,15 +843,8 @@ fn tui_bypass_skips_manual_prompts_and_keeps_jev_assessments_and_audit() {
     );
     p.send("/quit\r");
     p.exit(true);
-    let events: Vec<Value> = std::fs::read_to_string(record)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    let bypassed: Vec<_> = events
-        .iter()
-        .filter(|e| e["data"]["type"] == "approval_bypassed")
-        .collect();
+    let events = journal(&record);
+    let bypassed = plugin_events(&events, "approval.bypassed");
     assert_eq!(bypassed.len(), 5);
     assert!(
         bypassed
@@ -811,17 +852,13 @@ fn tui_bypass_skips_manual_prompts_and_keeps_jev_assessments_and_audit() {
             .all(|e| e["data"]["reason"] == "approval_bypassed"
                 && e["data"]["responses"] == json!([]))
     );
-    assert!(
-        !events
-            .iter()
-            .any(|e| e["data"]["type"] == "approval_requested"
-                || e["data"]["type"] == "tui_approval")
-    );
-    assert!(events.iter().any(|e| {
-        e["data"]["type"] == "jev_check"
-            && e["data"]["result"]["reason_codes"]
-                .as_array()
-                .is_some_and(|codes| codes.contains(&json!("missing_credentials")))
+    assert!(plugin_events(&events, "approval.request").is_empty());
+    assert!(plugin_events(&events, "approval.toolRequest").is_empty());
+    assert!(tui_decisions(&events).is_empty());
+    assert!(plugin_events(&events, "jev.check").iter().any(|e| {
+        e["data"]["result"]["reason_codes"]
+            .as_array()
+            .is_some_and(|codes| codes.contains(&json!("missing_credentials")))
     }));
 }
 
@@ -855,11 +892,7 @@ fn tui_bypass_keeps_read_only_mounts_delegation_caps_and_hard_hook_denials() {
     p.wait("tool-rejected");
     p.send("/quit\r");
     p.exit(true);
-    let events: Vec<Value> = std::fs::read_to_string(record)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    let events = journal(&record);
     assert_eq!(
         events
             .iter()
@@ -868,27 +901,20 @@ fn tui_bypass_keeps_read_only_mounts_delegation_caps_and_hard_hook_denials() {
         2,
         "only one child is allowed"
     );
-    let child = events
-        .iter()
-        .find(|e| e["data"]["type"] == "fixture_offered_tools" && e["data"]["prompt"] == "child")
-        .unwrap();
     assert_eq!(
-        child["data"]["names"],
+        granted_tools(&events, "child"),
         json!(["bash", "create", "edit", "read", "remove"])
     );
-    assert!(events.iter().any(|e| {
-        e["data"]["type"] == "agent_tool_error"
-            && e["data"]["reason"]
-                .as_str()
-                .is_some_and(|s| s.contains("child limit reached"))
-    }));
+    // The two refused delegations reached the model as tool errors.
+    let limit = "child limit reached for agent: 1 started, limit 1; replacements and resumes also consume this budget";
+    assert!(events.iter().any(|e| e["event"] == "exit"
+        && e["exit"]["output"]["text"] == format!("tool-rejected {}", json!([limit, limit]))));
 
     let guard = work.path().join("hard-guard");
     std::fs::create_dir(&guard).unwrap();
     std::fs::write(guard.join("main.ts"),r#"
-import plugins from "ply:plugins";
 import * as events from "ply:events";
-export async function onLoad(){await plugins.bash.loaded;await events.on("bash.beforeExecute",()=>({allow:false,reason:"hard denial"}));}
+export async function onLoad(){await events.on("bash.beforeExecute",()=>({allow:false,reason:"hard denial"}));}
 "#).unwrap();
     let mut c = tui_command(work.path());
     c.args(["--bypass", "--plugin"]).arg(guard);
@@ -944,4 +970,38 @@ fn chat_renders_markdown_styles_and_code_boxes_without_changing_raw_reports() {
                     && s.contains("**加粗**"))),
         "raw reports must stay markdown in the journal"
     );
+}
+
+#[test]
+fn approval_requests_stay_pending_without_an_active_tui_session() {
+    // The TUI answers only while its session is active; otherwise a request
+    // stays pending. No PTY: the session never starts.
+    let work = tempfile::tempdir().unwrap();
+    let guard = work.path().join("review-guard");
+    std::fs::create_dir(&guard).unwrap();
+    std::fs::write(guard.join("main.ts"), r#"import * as events from "ply:events";
+export async function onLoad(){await events.on("bash.beforeExecute",()=>({allow:false,requires_approval:true,decision:"review",reason:"needs review"}));}
+"#).unwrap();
+    let mut c = command(work.path());
+    c.args(["call", "--no-default-plugins"]);
+    for name in ["context", "bash", "approval", "tui"] {
+        c.arg("--plugin").arg(project().join("plugins").join(name));
+    }
+    let output = c
+        .arg("--plugin")
+        .arg(&guard)
+        .arg("bash")
+        .arg(json!({"command":"echo no > pending.txt"}).to_string())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let pending: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(pending["status"], "approval_required");
+    assert_eq!(pending["approval"]["status"], "pending");
+    assert_eq!(
+        pending["approval"]["responses"],
+        json!([{"request_id":"approval-1","decision":"pending","reason":"no active TUI session"}])
+    );
+    assert!(pending["approval"]["request"].get("source").is_none());
+    assert!(!work.path().join("pending.txt").exists());
 }

@@ -22,6 +22,7 @@ compile_error!("ply-jsc currently supports macOS only (system JavaScriptCore)");
 
 mod ffi;
 mod checkpoints;
+mod memory;
 mod http;
 mod runtime;
 mod sh;
