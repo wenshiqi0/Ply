@@ -1,9 +1,9 @@
 import type { Session } from "./types";
 
-export function keys(s: Session, data: string): { key: string; paste?: boolean }[] {
+export function keys(s: Session, data: string): { key: string; paste?: boolean; text?: boolean }[] {
   s.pendingKeys += data;
   if (data) s.lastKey = Date.now();
-  const result: { key: string; paste?: boolean }[] = [];
+  const result: { key: string; paste?: boolean; text?: boolean }[] = [];
   const names: Record<string, string> = { "\x1b[A": "up", "\x1b[B": "down", "\x1b[C": "right", "\x1b[D": "left", "\x1b[5~": "pageup", "\x1b[6~": "pagedown", "\x1b[H": "home", "\x1b[F": "end", "\x1b[1~": "home", "\x1b[4~": "end", "\x1b[3~": "delete", "\x1b[13;2u": "newline", "\x1b[27;2;13~": "newline", "\x1bOA": "up", "\x1bOB": "down", "\x1bOC": "right", "\x1bOD": "left", "\x1bOH": "home", "\x1bOF": "end" };
   while (s.pendingKeys) {
     if (s.paste) {
@@ -20,6 +20,10 @@ export function keys(s: Session, data: string): { key: string; paste?: boolean }
       if (Date.now() - s.lastKey < 150) break;
       result.push({ key: "escape" }); s.pendingKeys = s.pendingKeys.slice(1); continue;
     }
+    // Typed text outside a review is one run: an edit per character would
+    // rebuild the whole input each time. Reviews keep per-key handling.
+    const run = s.reviews.length ? undefined : /^[^\x00-\x1f\x7f]+/u.exec(s.pendingKeys)?.[0];
+    if (run) { result.push({ key: run, text: true }); s.pendingKeys = s.pendingKeys.slice(run.length); continue; }
     const c = String.fromCodePoint(s.pendingKeys.codePointAt(0)!);
     s.pendingKeys = s.pendingKeys.slice(c.length);
     result.push({ key: c === "\r" ? "enter" : c === "\n" ? "newline" : c === "\x03" ? "interrupt" : c === "\x04" ? "eof" : c === "\x7f" || c === "\b" ? "backspace" : c });

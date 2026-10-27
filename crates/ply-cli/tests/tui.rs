@@ -405,6 +405,26 @@ fn tui_approves_only_once_rejects_and_requires_viewing_long_commands() {
 }
 
 #[test]
+fn typed_text_is_inserted_as_text_even_when_it_spells_a_key_name() {
+    let work = tempfile::tempdir().unwrap();
+    let mut c = tui_command(work.path());
+    c.arg("--record").arg(work.path().join("typed.jsonl"));
+    let mut p = Pty::spawn(c, 24);
+    p.wait("输入消息，按 Enter 发送…");
+    // Each write arrives as its own run. On an empty composer the eof key
+    // quits, and the interrupt key always does; typed letters must not.
+    p.send("eof");
+    p.wait("eof");
+    p.send("interrupt");
+    p.wait("eofinterrupt");
+    assert!(p.child.try_wait().unwrap().is_none(), "typed text acted as a key");
+    p.send("\r");
+    p.wait("agent-chat: eofinterrupt");
+    p.send("/quit\r");
+    p.exit(true);
+}
+
+#[test]
 fn composer_backspace_at_start_never_inserts_the_key_name() {
     let work = tempfile::tempdir().unwrap();
     let record = work.path().join("backspace.jsonl");

@@ -40,7 +40,9 @@ export async function onHandle(input: TuiInput): Promise<TuiResult> {
       const event = await terminal.read(s.id, 100);
       if (event.columns !== s.columns || event.rows !== s.rows) { s.columns = event.columns; s.rows = event.rows; s.dirty = true; }
       let quit = false;
-      for (const { key, paste } of keys(s, event.data)) {
+      for (const { key, paste, text } of keys(s, event.data)) {
+        // Typed text is never a key name, whatever its letters spell.
+        if (text) { if (s.columns >= 40 && s.rows >= 10) { edit(s, key, true); s.dirty = true; } continue; }
         if (key === "interrupt" || key === "eof" && !s.input) { if (s.busy) throw new Error("TUI interrupted by user; active task cancelled"); quit = true; break; }
         if (s.columns < 40 || s.rows < 10) continue;
         if (key === "\x0c") { s.screenKey = ""; s.dirty = true; continue; }
