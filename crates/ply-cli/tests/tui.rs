@@ -129,11 +129,16 @@ impl Pty {
     fn send(&mut self, text: &str) {
         self.drain();
         self.bytes.clear();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // The PTY input queue is small and the TUI drains it as fast as it
+        // repaints: only a full five seconds without progress is a stall.
+        let mut deadline = Instant::now() + Duration::from_secs(5);
         let mut bytes = text.as_bytes();
         while !bytes.is_empty() {
             match self.master.write(bytes) {
-                Ok(n) => bytes = &bytes[n..],
+                Ok(n) => {
+                    bytes = &bytes[n..];
+                    deadline = Instant::now() + Duration::from_secs(5);
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     self.drain();
                     std::thread::sleep(Duration::from_millis(10));
