@@ -13,5 +13,5 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true
   },
-  "include": ["plugins/**/*.ts", "packages/sdk/**/*.d.ts", "examples/plugins/**/*.ts", "type-tests/**/*.ts"]
+  "include": ["plugins/**/*.ts", "packages/sdk/**/*.d.ts", "examples/plugins/**/*.ts", "type-tests/**/*.ts", "crates/ply-jsc/src/node/**/*.ts"]
 }

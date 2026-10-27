@@ -1,0 +1,21 @@
+writes {"offsets":[1,2,4,6,10,14,16],"hex":"fffe3412fed4efbeaddeffffff123456"}
+reads [255,-2,4660,13330,-300,3735928559,-238,1193046,5649426]
+floats and bigints [1.5,-0.25,"-1099511627776n","16777215n"]
+range {"name":"RangeError","code":"ERR_OUT_OF_RANGE","message":"The value of \"offset\" is out of range. It must be >= 0 and <= 12. Received 14"}
+range {"name":"RangeError","code":"ERR_OUT_OF_RANGE","message":"The value of \"value\" is out of range. It must be >= 0 and <= 255. Received 256"}
+range {"name":"RangeError","code":"ERR_OUT_OF_RANGE","message":"The value of \"offset\" is out of range. It must be an integer. Received 1.5"}
+range {"name":"RangeError","code":"ERR_OUT_OF_RANGE","message":"The value of \"byteLength\" is out of range. It must be >= 1 and <= 6. Received 7"}
+write [5,"héll",2,0]
+copy [2,".cd.",2]
+compare [-1,1,["a","b","c"]]
+search [0,13,13,6,4,false,13,0]
+fill ["ababa","hihi",[1,1,1]]
+swap [[2,1,4,3],[4,3,2,1]]
+slice is a view ["vEew","Ee",true]
+encodings [[104,233],[104,0,105,0],"iA","hi",0]
+isEncoding [true,true,true,true,false,false]
+atob and btoa ["UGx5","Ply","Ply"]
+invalid {"name":"InvalidCharacterError","isDOMException":true}
+invalid {"name":"InvalidCharacterError","isDOMException":true}
+utf8 and ascii checks [true,false,false,true,false]
+limits {"kMaxLength":9007199254740991,"max":9007199254740991,"string":536870888}

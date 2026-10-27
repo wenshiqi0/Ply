@@ -1,0 +1,4 @@
+inherited readable {"seen":[0,1,2],"instance":true,"emitter":true}
+class extends ["CLASS"]
+module shape {"stream":true,"keys":true,"hwm":[65536,16]}
+legacy stream {"pipe":"function","emitter":true}

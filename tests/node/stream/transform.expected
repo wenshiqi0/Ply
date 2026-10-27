@@ -1,0 +1,6 @@
+transform ["A","B","C","!","end"]
+one to many ["x","y","z"]
+passthrough ["p","q"]
+allowHalfOpen false {"events":["end","finish","close"],"writableEnded":true}
+pipe chain ["<1>","<2>","<3>","finish"]
+instanceof {"duplexIsWritable":true,"transformIsDuplex":true,"readableIsWritable":false}

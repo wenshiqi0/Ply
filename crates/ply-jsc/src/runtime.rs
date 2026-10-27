@@ -56,6 +56,10 @@ use crate::transpile::{has_module_syntax, lower_async, transpile, transpile_cjs}
 const PRELUDE: &str = include_str!("prelude.js");
 const ASYNC: &str = include_str!("async.js");
 const WEB: &str = include_str!("web.js");
+// The runtime's own Node modules (RFC 0015): TypeScript ES modules under
+// src/node, collected by build.rs, transpiled once per process and evaluated
+// by the prelude on first use.
+include!(concat!(env!("OUT_DIR"), "/node_modules.rs"));
 /// The Node version the runtime aligns with (RFC 0014), defined once.
 const NODE_VERSION: &str = include_str!("../../../.node-version");
 const BUILTINS: &[&str] = &[
@@ -71,6 +75,10 @@ const BUILTINS: &[&str] = &[
     "timers",
     "timers/promises",
     "child_process",
+    "stream",
+    "stream/promises",
+    "string_decoder",
+    "util/types",
 ];
 const WATCHDOG_TICK: f64 = 0.1;
 /// How long an interrupted call's catch/finally, or `onDispose`, may take.
@@ -749,7 +757,8 @@ fn init(id: RealmId, config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtim
         let cancelled_hook = RootedValue::new(ctx, JSObjectMakeFunctionWithCallback(ctx, JsStr::new("callCancelled").0, call_cancelled) as JSValueRef);
         let bootstrap = RootedValue::new(ctx, eval(ctx, ASYNC, "ply:async").map_err(fail)?);
         let helpers = RootedValue::new(ctx, call(ctx, bootstrap.get() as JSObjectRef, &[binder.get(), cancel_hook.get(), unregister_hook.get(), current_hook.get(), cancelled_hook.get()]).map_err(fail)?);
-        let lowered = lower_async(PRELUDE, Path::new("ply:prelude")).map_err(fail)?;
+        static LOWERED: OnceLock<Result<String, String>> = OnceLock::new();
+        let lowered = LOWERED.get_or_init(|| lower_async(PRELUDE, Path::new("ply:prelude"))).clone().map_err(fail)?;
         let factory = RootedValue::new(ctx, eval(ctx, "(function(eval, babelHelpers, code) { return eval(code); })", "ply:prelude").map_err(fail)?);
         let intrinsic_eval = RootedValue::new(ctx, eval(ctx, "eval", "ply:prelude").map_err(fail)?);
         let lowered = RootedValue::new(ctx, string_value(ctx, &(lowered + "\n//# sourceURL=ply:prelude")));
@@ -1389,6 +1398,16 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
             static COMPILED: OnceLock<Result<String, String>> = OnceLock::new();
             match COMPILED.get_or_init(|| lower_async(WEB, Path::new("ply:web"))) {
                 Ok(code) => OpResult::Json(json!(code)), Err(error) => OpResult::error("ERR_SYNTAX", error),
+            }
+        },
+        "node.source" => {
+            static COMPILED: OnceLock<Vec<Result<String, String>>> = OnceLock::new();
+            let compiled = COMPILED.get_or_init(|| NODE_MODULES.iter()
+                .map(|(name, source)| transpile(source, Path::new(&format!("node/{name}.ts")))).collect());
+            match NODE_MODULES.iter().position(|(name, _)| *name == s("name")).map(|i| &compiled[i]) {
+                Some(Ok(code)) => OpResult::Json(json!(code)),
+                Some(Err(error)) => OpResult::error("ERR_SYNTAX", error.clone()),
+                None => OpResult::error("ERR_PLY_INVALID_CALL", format!("no runtime module node:{}", s("name"))),
             }
         },
         _ if op.starts_with("url.") => crate::whatwg::op(op, &args),

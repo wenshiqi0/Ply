@@ -1,0 +1,10 @@
+push returns [true,true]
+paused mode ["read:abcd","end","close"]
+flowing mode {"events":["resume","data:1","pause","resume","data:2","end"],"paused":false,"flowing":true,"ended":true}
+object mode {"first":{"a":1},"second":2,"length":0,"hwm":16}
+read(n) ["abc","defg",null,1,65536]
+setEncoding {"pieces":[["string","€"]],"encoding":"utf8"}
+unshift "hello world"
+destroy with error {"order":["sync:true","error:boom","close"],"errored":"boom","readable":false}
+emitClose false []
+push after EOF "ERR_STREAM_PUSH_AFTER_EOF"

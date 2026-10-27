@@ -36,6 +36,15 @@ npm run compat:check
 - 改变已提供的 Node API 行为时，补充或修改对应类别的用例，再重新录制；不要通过改期望值让 Ply 通过。
 - Ply 有意不同于 Node 的用例另写 `<名称>.ply.expected`，并在用例第一行写 `// ply-divergence: <理由>`；只有进程模型与沙箱（pid、argv[0]、环境、`HOME`、挂载、原生扩展、插件根与包边界）可以造成差异。`npm run check` 拒绝没有理由的差异，并核对 `@types/node` 与 `.node-version` 一致。
 
+## 运行时的 Node 模块
+
+`crates/ply-jsc/src/node/` 下是运行时自己实现的 Node 模块（[RFC 0015](rfcs/0015-node-io-and-net.md)），每个文件是一个 TypeScript ES 模块，文件路径去掉 `.ts` 就是模块名。
+
+- build.rs 收集这个目录，不需要另外登记。
+- 模块之间用相对路径导入；公开的内置模块写作 `node:x`；prelude 的内部函数（编码、`inspect`、`format` 等）从 `ply:runtime` 导入，类型在同目录的 `runtime.d.ts` 中声明。
+- 导出用 `@types/node` 的类型约束，例如 `typeof import("node:buffer").atob`、`satisfies Partial<...>`、`implements`，签名与 Node 的声明不符时 `npm run check` 失败。
+- 根 tsconfig、ESLint 和 250 行规则都覆盖这个目录；行为由 `tests/node` 的对照用例保障。
+
 ## 提交钩子
 
 克隆后启用：

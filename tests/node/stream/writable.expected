@@ -1,0 +1,11 @@
+write returns [true,false,3,true]
+drain order ["write:ab:buffer","write:c:buffer","cb:ab","drain","cb:c"]
+end order {"events":["write:last","final","prefinish","sync ended:true finished:false","end callback","finish","close"],"finished":true,"writable":false}
+corked 1
+writev [["writev",["a","b","c"]]]
+write callback "ERR_STREAM_WRITE_AFTER_END"
+write after end {"code":"ERR_STREAM_WRITE_AFTER_END","message":"write after end"}
+object mode [{"n":1},2]
+decodeStrings false [["string","latin1"],["object","buffer"]]
+write error {"failures":["cb:nope","error:nope","close"],"destroyed":true}
+null chunk "ERR_STREAM_NULL_VALUES"

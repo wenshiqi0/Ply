@@ -2,7 +2,8 @@ import js from "@eslint/js";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["**/node_modules/**", "target/**", "crates/**"] },
+  // Of the crates, only the runtime's TypeScript Node modules are linted.
+  { ignores: ["**/node_modules/**", "target/**", "crates/*", "!crates/ply-jsc/", "crates/ply-jsc/*", "!crates/ply-jsc/src/", "crates/ply-jsc/src/*", "!crates/ply-jsc/src/node/"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {

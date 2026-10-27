@@ -16,11 +16,16 @@ const walk = dir => {
   }
 };
 for (const dir of ["plugins", "examples/plugins", "packages/sdk"]) walk(dir);
+// "ply:runtime" is the prelude's internals for the runtime's own modules
+// (RFC 0015); nothing plugin code is given may name it.
+const pluginVisible = new Set(files);
+walk("crates/ply-jsc/src/node");
 files.push("crates/ply-jsc/src/prelude.js", "crates/ply-jsc/src/async.js", "crates/ply-jsc/src/web.js");
 const failures = [];
 for (const file of files) {
   fs.readFileSync(path.join(root, file), "utf8").split("\n").forEach((line, index) => {
     for (const pattern of forbidden) if (pattern.test(line)) failures.push(`${file}:${index + 1}: ${pattern} ${line.trim()}`);
+    if (pluginVisible.has(file) && /ply:runtime/.test(line)) failures.push(`${file}:${index + 1}: /ply:runtime/ ${line.trim()}`);
   });
 }
 if (failures.length) {

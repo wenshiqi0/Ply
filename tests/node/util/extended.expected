@@ -1,0 +1,13 @@
+inherits ["hi",true,true]
+deprecate [4,6]
+callbackify [[null,2],["neg",null]]
+debuglog [false,"function"]
+styleText ["plain","ESC[1mESC[31mxESC[39mESC[22m"]
+styleText invalid "ERR_INVALID_ARG_VALUE"
+strip "red text"
+toUSVString "a�b"
+isArray [true,false]
+formatWithOptions "n=4"
+custom symbols [true,true]
+promisify custom "custom"
+types {"map":true,"set":true,"weak":true,"typed":true,"dataView":true,"view":true,"buffer":true,"boxed":[true,false,true],"error":true,"generator":true,"iterator":true,"args":true,"same":true}

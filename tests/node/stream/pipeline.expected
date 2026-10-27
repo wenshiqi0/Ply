@@ -1,0 +1,8 @@
+pipeline ok {"err":null,"collected":["a","b"]}
+pipeline failure {"message":"bad transform","source":true,"target":true}
+premature close "ERR_STREAM_PREMATURE_CLOSE"
+finished "ok"
+generator stage ["3","3"]
+promise value 6
+promises.finished "resolved"
+addAbortSignal {"name":"AbortError","code":"ABORT_ERR"}

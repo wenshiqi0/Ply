@@ -20,6 +20,8 @@
   // cannot replace it, and the native callback stores identity privately.
   const evaluate = indirectEval("(function(eval, babelHelpers, code) { return eval(code); })");
   const compile = code => evaluate(indirectEval, asyncHelpers, code);
+  // Runtime modules evaluated in this realm, by name (see internal()).
+  const internals = new Map();
   const EXIT = Symbol("ply.exit");
 
   // ---------------------------------------------------------------- host ops
@@ -117,11 +119,21 @@
       case "utf8": case "utf-8": return utf8Encode(str);
       case "base64": case "base64url": return base64Decode(str);
       case "hex": {
+        // Node stops at the first pair that is not hex.
         const out = new Uint8Array(str.length >> 1);
-        for (let i = 0; i < out.length; i++) out[i] = parseInt(str.substr(i * 2, 2), 16);
+        for (let i = 0; i < out.length; i++) {
+          const pair = str.substr(i * 2, 2);
+          if (!/^[0-9a-fA-F]{2}$/.test(pair)) return out.subarray(0, i);
+          out[i] = parseInt(pair, 16);
+        }
         return out;
       }
       case "latin1": case "binary": case "ascii": return Uint8Array.from(str, (c) => c.charCodeAt(0) & 255);
+      case "utf16le": case "utf-16le": case "ucs2": case "ucs-2": {
+        const out = new Uint8Array(str.length * 2);
+        for (let i = 0; i < str.length; i++) { const c = str.charCodeAt(i); out[2 * i] = c & 255; out[2 * i + 1] = c >> 8; }
+        return out;
+      }
       default: throw new TypeError(`Unknown encoding: ${enc}`);
     }
   }
@@ -131,9 +143,21 @@
       case "base64": return base64Encode(bytes);
       case "base64url": return base64Encode(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
       case "hex": return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-      case "latin1": case "binary": case "ascii": return String.fromCharCode(...bytes);
+      case "latin1": case "binary": return charCodes(bytes, (b) => b);
+      case "ascii": return charCodes(bytes, (b) => b & 0x7f);
+      case "utf16le": case "utf-16le": case "ucs2": case "ucs-2": {
+        const units = new Array(bytes.length >> 1);
+        for (let i = 0; i < units.length; i++) units[i] = bytes[2 * i] | (bytes[2 * i + 1] << 8);
+        return charCodes(units, (u) => u);
+      }
       default: throw new TypeError(`Unknown encoding: ${enc}`);
     }
+  }
+  // String.fromCharCode in slices: spreading a large buffer overflows the stack.
+  function charCodes(codes, map) {
+    let s = "";
+    for (let i = 0; i < codes.length; i += 8192) s += String.fromCharCode(...Array.from(codes.slice(i, i + 8192), map));
+    return s;
   }
 
   class TextEncoder {
@@ -576,39 +600,9 @@
     return ka.length === kb.length && ka.every((k) => enumerable.call(b, k) && deepEqual(a[k], b[k], memo));
   }
 
-  // ---------------------------------------------------------------- events
-  class EventEmitter {
-    constructor() { this._events = new Map(); }
-    on(name, fn) { (this._events.get(name) ?? this._events.set(name, []).get(name)).push(fn); return this; }
-    addListener(name, fn) { return this.on(name, fn); }
-    once(name, fn) { const w = (...a) => { this.off(name, w); fn.apply(this, a); }; w.listener = fn; return this.on(name, w); }
-    off(name, fn) { const l = this._events.get(name); if (l) this._events.set(name, l.filter((x) => x !== fn && x.listener !== fn)); return this; }
-    removeListener(name, fn) { return this.off(name, fn); }
-    removeAllListeners(name) { name === undefined ? this._events.clear() : this._events.delete(name); return this; }
-    emit(name, ...args) {
-      const l = this._events.get(name);
-      if (!l || l.length === 0) { if (name === "error") throw args[0]; return false; }
-      for (const fn of [...l]) fn.apply(this, args);
-      return true;
-    }
-    listenerCount(name) { return (this._events.get(name) ?? []).length; }
-    listeners(name) { return [...(this._events.get(name) ?? [])]; }
-  }
-  EventEmitter.EventEmitter = EventEmitter;
-
-  // ------------------------------------------------------------ util / os
+  // ----------------------------------------------------------------- os
+  // events and util are runtime modules (node/events.ts, node/util.ts).
   const promisifyCustom = Symbol.for("nodejs.util.promisify.custom");
-  const promisify = (fn) => fn[promisifyCustom] ?? ((...args) => new Promise((res, rej) => fn(...args, (e, v) => (e ? rej(e) : res(v)))));
-  promisify.custom = promisifyCustom;
-  const util = {
-    format,
-    inspect,
-    promisify,
-    isDeepStrictEqual: (a, b) => deepEqual(a, b, new Map()),
-    types: { isPromise: (p) => p instanceof Promise, isDate: (d) => d instanceof Date, isRegExp: (r) => r instanceof RegExp },
-    TextEncoder,
-    TextDecoder,
-  };
   const os = {
     EOL: "\n",
     platform: () => config.platform,
@@ -668,7 +662,7 @@
     return [String(file), args, options ?? {}, callback];
   }
   function startAsync(cmd, argv, options, callback) {
-    const child = new EventEmitter();
+    const child = new (internal("events").default)();
     const enc = options.encoding ?? "utf8";
     processCall(opAsync, argv, options).then(
       (raw) => {
@@ -809,13 +803,27 @@
   // fetch and the Web objects around it (RFC 0013), part of the environment
   // like Buffer; compiled once per process, evaluated per realm.
   Object.assign(G, compile(op("web.source"))(op, opAsync, plain));
+  // What runtime modules import as "ply:runtime".
+  const runtime = objectFreeze(objectAssign(objectCreate(null), { toBuffer, encode, decode, inspect, format, deepEqual }));
+  // Buffer's methods are part of the global; atob/btoa and global are Node's.
+  const bufferModule = internal("buffer");
+  objectAssign(G, { global: G, atob: bufferModule.atob, btoa: bufferModule.btoa });
 
   // ---------------------------------------------------------------- modules
   const BUILTIN = {
-    fs, "fs/promises": promises, path, "path/posix": path, process, buffer: { Buffer }, events: EventEmitter, util, os,
+    fs, "fs/promises": promises, path, "path/posix": path, process, buffer: bufferModule, os,
     timers: { setTimeout, setInterval, setImmediate, clearTimeout, clearInterval: clearTimeout },
     "timers/promises": { setTimeout: (ms, v) => new Promise((r) => setTimeout(() => r(v), ms)) },
     child_process: childProcess,
+  };
+  // Modules evaluated when first imported.
+  const LAZY = {
+    events: () => internal("events").default,
+    stream: () => internal("stream").default,
+    "stream/promises": () => internal("stream/promises"),
+    string_decoder: () => internal("string_decoder"),
+    util: () => internal("util"),
+    "util/types": () => internal("util/types"),
   };
   const namespaces = new Map();
   const eventCallbacks = new Map();
@@ -900,7 +908,7 @@
         claim: (id) => opAsync("checkpoint.claim", { id }),
         update: (lease, snapshot) => opAsync("checkpoint.update", { lease, snapshot }),
         finish: (lease, remove) => opAsync("checkpoint.finish", { lease, remove }),
-      } : BUILTIN[name];
+      } : BUILTIN[name] ?? LAZY[name]?.();
       const ns = Object.assign(Object.create(null), m);
       ns.default = m;
       namespaces.set(name, ns);
@@ -908,6 +916,38 @@
     return namespaces.get(name);
   }
   const modules = new Map();
+  // An ES module's exports are getters installed before its body runs.
+  function exporter(exports) {
+    const one = (name, get) => objectDefineProperty(exports, name, { enumerable: true, configurable: true, get });
+    const star = (m) => { for (const key of objectKeys(m)) if (key !== "default" && !objectHasOwn(exports, key)) one(key, () => m[key]); };
+    return { one, star };
+  }
+  // The runtime's own Node modules (RFC 0015): TypeScript ES modules from
+  // src/node, evaluated once per realm on first use. They import each other
+  // by relative path, public builtins as "node:x", and the prelude's
+  // internals as "ply:runtime", which plugin code cannot resolve.
+  function internal(name) {
+    if (internals.has(name)) return internals.get(name);
+    const exports = objectCreate(null);
+    internals.set(name, exports);
+    const base = name.includes("/") ? name.slice(0, name.lastIndexOf("/")) : ".";
+    const require = (spec) => {
+      if (spec === "ply:runtime") return runtime;
+      // The transpiler's async helpers.
+      if (spec.startsWith("ply:async/")) return builtinNamespace(spec);
+      if (spec.startsWith("node:")) return builtinNamespace(spec.slice(5));
+      return internal(path.normalize(path.join(base, spec)));
+    };
+    const noImport = (spec) => Promise.reject(new Error(`runtime module node:${name} cannot import(${spec})`));
+    const { one, star } = exporter(exports);
+    try {
+      compile(op("node.source", { name }) + "\n//# sourceURL=node:" + name)(exports, require, noImport, { url: "node:" + name }, one, star);
+    } catch (e) {
+      internals.delete(name);
+      throw e;
+    }
+    return exports;
+  }
   // An ES module importing CommonJS sees `module.exports` as `default`, plus
   // the own enumerable properties it has at import time, as in Node.
   function namespaceOf(rec) {
@@ -968,11 +1008,8 @@
         rec.exports = Object.create(null);
         const fn = compile(code + "\n//# sourceURL=" + r.id);
         const meta = { url: "file://" + r.id, filename: r.id, dirname: r.dir, main: from === null };
-        const exportOne = (name, get) => objectDefineProperty(rec.exports, name, { enumerable: true, configurable: true, get });
-        const exportStar = (m) => {
-          for (const key of objectKeys(m)) if (key !== "default" && !objectHasOwn(rec.exports, key)) exportOne(key, () => m[key]);
-        };
-        const result = fn(rec.exports, (s, type) => namespaceOf(attributed(load(s, r.id), s, type)), dynamicImport, meta, exportOne, exportStar);
+        const { one, star } = exporter(rec.exports);
+        const result = fn(rec.exports, (s, type) => namespaceOf(attributed(load(s, r.id), s, type)), dynamicImport, meta, one, star);
         if (result && typeof result.then === "function") { rec.done = result; rec.async = true; }
       } else {
         const module = rec.module = { id: r.id, filename: r.id, path: r.dir, exports: {}, loaded: false, children: [], paths: [] };

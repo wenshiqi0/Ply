@@ -1,0 +1,13 @@
+bookkeeping ["new:removeListener","new:x","new:x","new:x","new:y"]
+names ["newListener","removeListener","x","y"]
+raw vs unwrapped {"raw":["undefined","undefined","function"],"unwrapped":3,"count":3,"countOf":1}
+after removeAll {"bookkeeping":["removed:x","removed:x","removed:x"],"names":["newListener","removeListener","y"]}
+max listeners [10,1,10]
+negative max "ERR_OUT_OF_RANGE"
+errorMonitor ["monitor:unhandled","thrown:unhandled","monitor:undefined","ERR_UNHANDLED_ERROR:Unhandled error. ('text')"]
+events.once [1,2]
+events.once error "failed"
+events.once abort ["AbortError","ABORT_ERR"]
+events.on {"got":[1,2,3],"left":0}
+EventEmitter.call {"heard":1,"instance":true,"superOf":true}
+module {"isClass":true,"helpers":["function","function","function"],"listeners":1}

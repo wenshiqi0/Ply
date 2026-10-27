@@ -1,0 +1,8 @@
+utf8 split ["a","é","","€","😀"]
+utf8 incomplete end ["�","�A"]
+utf16le ["","a","😀","b"]
+base64 ["aGVs","bG8g","d29ybGQ="]
+hex and latin1 ["01ff","é"]
+encoding names ["utf8","utf16le","latin1","base64url"]
+unknown "ERR_UNKNOWN_ENCODING"
+strings pass through "already text"

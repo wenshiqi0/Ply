@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "typecheck": "tsc --noEmit && node scripts/check-sdk-types.mjs",
-    "lint": "eslint plugins packages/sdk examples/plugins type-tests --max-warnings 0",
+    "lint": "eslint plugins packages/sdk examples/plugins type-tests crates/ply-jsc/src/node --max-warnings 0",
     "check:docs": "node scripts/check-docs.mjs",
     "check": "npm run typecheck && npm run lint && npm run check:docs && npm run check:surface && npm run compat:lint",
     "compat:lint": "node scripts/node-compat.mjs lint",
