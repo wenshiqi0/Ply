@@ -306,6 +306,11 @@ async fn kernel(setup: &Setup, ui: UiMode) -> Result<Kernel> {
         }
     }
     if let Ok(value) = std::env::var("PLY_APPROVAL_TIMEOUT_MS") { config.env.insert("PLY_APPROVAL_TIMEOUT_MS".into(), value); }
+    // Model keys reach the agent through process.env (RFC 0013); the bash
+    // tool drops them from the model's commands.
+    for name in ["DEEPSEEK_API_KEY", "MIMO_API_KEY"] {
+        if let Ok(value) = std::env::var(name) { config.env.insert(name.into(), value); }
+    }
     let kernel = Kernel::new(config);
     if let Some(path) = &setup.record {
         kernel.add_hook(JsonlRecorder::open(path).with_context(|| format!("opening record file {}", path.display()))?);

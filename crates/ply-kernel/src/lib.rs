@@ -616,27 +616,50 @@ impl Kernel {
                 let root = format!("/ply/plugins/{name}");
                 let storage = MemoryStorage::with_files(files.iter().map(|(path, source)| (path.as_str(), source.as_bytes())));
                 self.inner.code.mount(&root, Arc::new(storage), MountMode::ReadOnly).map_err(|e| load_err(e.to_string()))?;
+                self.mount_dependencies()?;
                 Ok((name, root.clone(), format!("{root}/main.ts")))
             }
             PluginSource::Embedded { name, source } => {
                 let root = format!("/ply/plugins/{name}");
                 let storage = MemoryStorage::with_files([("main.ts", source.as_bytes())]);
                 self.inner.code.mount(&root, Arc::new(storage), MountMode::ReadOnly).map_err(|e| load_err(e.to_string()))?;
+                self.mount_dependencies()?;
                 Ok((name, root.clone(), format!("{root}/main.ts")))
             }
         }
     }
 
     /// Mount a host directory, read-only, at its own path in the code
-    /// namespace (once).
+    /// namespace (once), with the `node_modules` directories above it that
+    /// Node's lookup walks through.
     fn mount_dir(&self, dir: &Path) -> Result<String, KernelError> {
         let root = dir.display().to_string();
-        let code = &self.inner.code;
-        if !code.mounts().iter().any(|m| m.at == root) {
-            let storage = DiskStorage::open(dir).map_err(|e| KernelError::Load(format!("{root}: {e}")))?;
-            code.mount(&root, Arc::new(storage), MountMode::ReadOnly).map_err(|e| KernelError::Load(e.to_string()))?;
+        self.mount_read_only(&root, dir)?;
+        for modules in dir.ancestors().skip(1).map(|ancestor| ancestor.join("node_modules")).filter(|m| m.is_dir()) {
+            self.mount_read_only(&modules.display().to_string(), &modules)?;
         }
         Ok(root)
+    }
+
+    /// Built-in plugins import npm packages from this repository's
+    /// `node_modules` (development mode, RFC 0013). It appears at
+    /// `/ply/node_modules`, where the lookup from `/ply/plugins/<name>` finds
+    /// it; without it, such an import reports the missing package.
+    fn mount_dependencies(&self) -> Result<(), KernelError> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../node_modules");
+        if dir.is_dir() { self.mount_read_only("/ply/node_modules", &dir)?; }
+        Ok(())
+    }
+
+    fn mount_read_only(&self, at: &str, dir: &Path) -> Result<(), KernelError> {
+        let code = &self.inner.code;
+        if code.mounts().iter().any(|m| m.at == at) { return Ok(()); }
+        let storage = DiskStorage::open(dir).map_err(|e| KernelError::Load(format!("{}: {e}", dir.display())))?;
+        match code.mount(at, Arc::new(storage), MountMode::ReadOnly) {
+            // Another load mounted it first.
+            Err(_) if code.mounts().iter().any(|m| m.at == at) => Ok(()),
+            result => result.map(|_| ()).map_err(|e| KernelError::Load(e.to_string())),
+        }
     }
 
     pub fn plugins(&self) -> Vec<PluginSpec> {

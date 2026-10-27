@@ -327,17 +327,14 @@ impl Http {
     }
 }
 
-/// Credentials stay on the host for JSON APIs and in pi-ai's private scope
-/// for its model requests. Public plugin env and records never contain keys.
+/// The key `ply:http` injects for jev's JSON API, read on the host. Model
+/// providers read theirs from `process.env` (RFC 0013); jev follows when it
+/// moves to `fetch`.
 pub(crate) fn credentials(args: &Value) -> OpResult {
     let provider = args.get("provider").and_then(Value::as_str).unwrap_or("");
     let expected = match provider {
-        "deepseek" => "DEEPSEEK_API_KEY",
         "jev" => "TYPESAFE_API_KEY",
-        "xiaomi" | "xiaomi-token-plan-cn" | "xiaomi-token-plan-sgp" | "xiaomi-token-plan-ams" => {
-            "MIMO_API_KEY"
-        }
-        _ => return failure("model provider is not supported by the embedded runtime"),
+        _ => return failure("provider has no host-injected key"),
     };
     if let Some(configured) = args.get("apiKeyEnv").and_then(Value::as_str)
         && configured != expected

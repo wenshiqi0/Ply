@@ -5,7 +5,9 @@
 //! - The engine is the system JavaScriptCore (macOS for now), driven
 //!   through its C API. It ships no host APIs of its own; everything plugin
 //!   code can do comes from ply's prelude. Files/processes go through
-//!   `ply-libc` into `ply-io`; the embedded model layer uses Rust HTTP.
+//!   `ply-libc` into `ply-io`; `fetch` uses Rust HTTP.
+//! - Modules resolve like Node (`resolve`): npm packages from
+//!   `node_modules`, ES modules and CommonJS, JSON.
 //! - TypeScript runs directly: oxc strips types and ply loads modules
 //!   itself (see `transpile`), the way bun puts a transpiler in front of
 //!   JSC. No external toolchain is needed at runtime.
@@ -24,10 +26,12 @@ mod ffi;
 mod checkpoints;
 mod memory;
 mod http;
+mod resolve;
 mod runtime;
 mod sh;
 mod host_commands;
 mod terminal;
+mod whatwg;
 mod markdown;
 mod skills;
 pub mod transpile;

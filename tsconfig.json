@@ -11,7 +11,7 @@
     "noUnusedParameters": true,
     "forceConsistentCasingInFileNames": true,
     "verbatimModuleSyntax": true,
-    "skipLibCheck": false
+    "skipLibCheck": true
   },
   "include": ["plugins/**/*.ts", "packages/sdk/**/*.d.ts", "examples/plugins/**/*.ts", "type-tests/**/*.ts"]
 }

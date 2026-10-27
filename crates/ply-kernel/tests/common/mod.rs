@@ -4,7 +4,7 @@ use ply_kernel::PluginSource;
 pub fn mock_model(plugin: PluginSource, fixture: &str) -> PluginSource {
     match plugin {
         PluginSource::Bundled { name, mut files } if name == "agent" => {
-            let import = "import { request as modelRequest } from \"ply:models\";";
+            let import = "import { request as modelRequest } from \"./pi\";";
             let mut replaced = 0;
             for (_, source) in &mut files {
                 if source.contains(import) {

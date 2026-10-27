@@ -7,6 +7,12 @@ import { exec } from "ply:sh";
 
 let beforeExecute: string;
 
+// The model's commands never see API keys: the plugin environment carries
+// them only for model calls (RFC 0013).
+function commandEnv(): Record<string, string | undefined> {
+  return Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.endsWith("_API_KEY")));
+}
+
 /**
  * Run a script with Ply sh in the mounted workspace. Supports its shell
  * syntax, builtins and bundled utilities (cat, ls, grep, sed, find, sort,
@@ -50,7 +56,7 @@ export async function onHandle(input: BashInput): Promise<BashResult> {
       return { status: "approval_required", approval, exit_code: null, signal: null, timed_out: false, stdout: "", stderr: "" };
     }
   }
-  const output = await exec({ ...request, timeout_ms: remaining });
+  const output = await exec({ ...request, timeout_ms: remaining, env: commandEnv() });
   return approval ? { ...output, approval } : output;
 }
 

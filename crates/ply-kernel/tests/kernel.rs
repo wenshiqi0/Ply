@@ -558,6 +558,31 @@ async fn bash_runs_ply_sh_over_virtual_storage_and_resolves_host_programs() {
     assert_eq!(w.kernel.call("bash", json!({ "command": "echo alive" })).await.unwrap()["stdout"], "alive\n");
 }
 
+/// Model keys are in the plugins' environment for model calls (RFC 0013);
+/// the model's shell commands run without them.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_keys_reach_plugins_but_not_the_model_shell() {
+    let work = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(work.path()).unwrap().display().to_string();
+    let io = Io::new();
+    io.mount(&root, Arc::new(DiskStorage::open(work.path()).unwrap()), MountMode::ReadWrite).unwrap();
+    let mut config = KernelConfig::new(io, root);
+    config.env.insert("DEEPSEEK_API_KEY".into(), "plugin-only-secret".into());
+    config.env.insert("PLY_VISIBLE".into(), "shown".into());
+    let kernel = Kernel::new(config);
+    let plugins = tempfile::tempdir().unwrap();
+    let probe = plugins.path().join("probe");
+    std::fs::create_dir(&probe).unwrap();
+    std::fs::write(probe.join("main.ts"), "export async function onHandle() { return process.env.DEEPSEEK_API_KEY ?? null; }").unwrap();
+    for plugin in [PluginSource::builtin("context").unwrap(), PluginSource::builtin("bash").unwrap(), PluginSource::Dir(probe)] {
+        kernel.load(plugin).await.unwrap();
+    }
+    kernel.ready().await.unwrap();
+    assert_eq!(kernel.call("probe", json!({})).await.unwrap(), json!("plugin-only-secret"));
+    let shell = kernel.call("bash", json!({ "command": "echo \"[$DEEPSEEK_API_KEY][$PLY_VISIBLE]\"" })).await.unwrap();
+    assert_eq!(shell["stdout"], "[][shown]\n");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bash_before_hook_is_awaited_can_veto_and_has_its_own_fiber() {
     let w = world_with(PluginSource::defaults()).await;

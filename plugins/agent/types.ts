@@ -1,7 +1,7 @@
-import type { ModelProfile } from "ply:models";
+import type { ModelProfile } from "ply:plugins";
 
-// The loop and pi-ai model calls run in this plugin's JSC realm. The host
-// supplies HTTP/TLS and streams; no external model process is started.
+// The loop and pi-ai model calls run in this plugin's JSC realm, over the
+// runtime's fetch; no external model process is started.
 export type Block = { type: string; text?: string; id?: string; name?: string; arguments?: Record<string, unknown> };
 
 export type Message = {

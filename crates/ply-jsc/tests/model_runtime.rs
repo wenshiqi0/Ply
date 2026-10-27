@@ -1,5 +1,7 @@
-//! The real embedded SDK and HTTP/SSE path, against a loopback fixture.
-//! No provider request, external runtime, or billable tokens.
+//! The agent's model connection end to end: its pi.ts, pi-ai from the
+//! repository's node_modules, the runtime's fetch and Rust HTTP/SSE, against
+//! a loopback fixture. No provider request, external runtime, or billable
+//! tokens.
 use std::{collections::BTreeMap, io::{Read, Write}, net::TcpListener, sync::{Arc, Mutex}, time::{Duration, Instant}};
 use serde_json::{Value, json};
 use ply_jsc::{Caller, DiskStorage, HostBridge, Io, JsRuntime, Limits, ModuleSource, MountMode, RealmConfig};
@@ -17,15 +19,13 @@ impl HostBridge for Records {
 }
 
 #[test]
-fn embedded_deepseek_and_mimo_stream_concurrently_with_their_own_identity() {
-    let keys = ["DEEPSEEK_API_KEY", "MIMO_API_KEY", "NO_PROXY", "no_proxy"];
+fn deepseek_and_mimo_stream_concurrently_with_their_own_identity() {
+    let keys = ["NO_PROXY", "no_proxy"];
     let previous: Vec<_> = keys.iter().map(|key| std::env::var_os(key)).collect();
     // This binary has one synchronous test; set env before creating threads.
     unsafe {
-        std::env::set_var(keys[0], "offline-fixture-secret");
-        std::env::set_var(keys[1], "offline-fixture-secret");
-        std::env::set_var(keys[2], "127.0.0.1,localhost");
-        std::env::set_var(keys[3], "127.0.0.1,localhost");
+        std::env::set_var(keys[0], "127.0.0.1,localhost");
+        std::env::set_var(keys[1], "127.0.0.1,localhost");
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -56,7 +56,12 @@ fn embedded_deepseek_and_mimo_stream_concurrently_with_their_own_identity() {
             }
             let input: Value = serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
             assert_eq!(input["stream"], true);
-            models.push(input["model"].as_str().unwrap().to_owned());
+            // Each provider sends the key from its profile's variable.
+            let header = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            let model = input["model"].as_str().unwrap().to_owned();
+            let expected = if model.starts_with("deepseek") { "authorization: bearer deepseek-fixture-secret" } else { "api-key: mimo-fixture-secret" };
+            assert!(header.contains(expected), "{model}: {header}");
+            models.push(model);
             let chunks = [
                 json!({"id":"offline","choices":[{"index":0,"delta":{"role":"assistant","content":"你好，架构评审。"},"finish_reason":null}]}),
                 json!({"id":"offline","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"r1","type":"function","function":{"name":"read","arguments":"{\"path\":"}}]},"finish_reason":null}]}),
@@ -72,11 +77,17 @@ fn embedded_deepseek_and_mimo_stream_concurrently_with_their_own_identity() {
     });
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
+        // A directory plugin next to a node_modules, like the kernel mounts
+        // one, with the agent's own model module.
         let directory = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(directory.path()).unwrap().display().to_string();
-        let file = directory.path().join("model.ts");
+        let project = std::fs::canonicalize(directory.path()).unwrap();
+        let plugin = project.join("plugin");
+        std::fs::create_dir(&plugin).unwrap();
+        std::fs::copy(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/agent/pi.ts"), plugin.join("pi.ts")).unwrap();
+        let root = plugin.display().to_string();
+        let file = plugin.join("model.ts");
         std::fs::write(&file, r#"
-import { request } from "ply:models";
+import { request } from "./pi";
 import * as events from "ply:events";
 export async function onHandle(input) {
   const result = await request({ operation: "complete", profile: input.profile, purpose: "task", maxTokens: 128,
@@ -86,20 +97,25 @@ export async function onHandle(input) {
   return result;
 }
 "#).unwrap();
-        let io = Io::new(); io.mount(&root, Arc::new(DiskStorage::open(directory.path()).unwrap()), MountMode::ReadOnly).unwrap();
+        let io = Io::new(); io.mount(&root, Arc::new(DiskStorage::open(&plugin).unwrap()), MountMode::ReadOnly).unwrap();
+        let modules = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../node_modules");
+        io.mount(&project.join("node_modules").display().to_string(), Arc::new(DiskStorage::open(modules).unwrap()), MountMode::ReadOnly).unwrap();
         let records = Arc::new(Records::default()); let js = JsRuntime::start();
-        let realm = js.create_realm(RealmConfig { name: "models".into(), io: io.clone(), cwd: root.clone(), env: BTreeMap::new(), argv: vec![],
+        // Keys reach plugins through process.env (RFC 0013).
+        let env = BTreeMap::from([("DEEPSEEK_API_KEY".into(), "deepseek-fixture-secret".into()), ("MIMO_API_KEY".into(), "mimo-fixture-secret".into())]);
+        let realm = js.create_realm(RealmConfig { name: "models".into(), io: io.clone(), cwd: root.clone(), env, argv: vec![],
             modules: ModuleSource { io, root }, limits: Limits::default(), bridge: Some(records.clone()) }).await.unwrap();
-        let profile = |provider: &str, model: &str, key: &str| json!({ "profile": {
-            "provider": provider, "model": model, "apiKeyEnv": key,
+        let profile = |provider: &str, model: &str, key: &str, header: Option<&str>| json!({ "profile": {
+            "provider": provider, "model": model, "apiKeyEnv": key, "apiKeyHeader": header,
             "definition": { "id": model, "provider": provider, "name": model, "api": "openai-completions", "baseUrl": base,
                 "reasoning": false, "input": ["text"], "contextWindow": 4096, "maxTokens": 512,
                 "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 } } } });
-        let (ds, mimo) = (profile("deepseek", "deepseek-v4-flash", keys[0]), profile("xiaomi", "mimo-v2.6-pro", keys[1]));
+        let (ds, mimo) = (profile("deepseek", "deepseek-v4-flash", "DEEPSEEK_API_KEY", None),
+            profile("xiaomi", "mimo-v2.6-pro", "MIMO_API_KEY", Some("api-key")));
         let entry = std::fs::canonicalize(&file).unwrap().display().to_string();
         let (a,b) = tokio::time::timeout(Duration::from_secs(10), async {
             tokio::join!(js.run_fiber(realm, &entry, &ds, "ds"), js.run_fiber(realm, &entry, &mimo, "mimo"))
-        }).await.expect("embedded SDK hung");
+        }).await.expect("model call hung");
         for result in [a.unwrap(), b.unwrap()] {
             assert_eq!(result["stopReason"], "toolUse");
             let blocks = result["content"].as_array().unwrap();
@@ -107,7 +123,7 @@ export async function onHandle(input) {
             assert!(blocks.iter().any(|b| b["type"] == "toolCall" && b["name"] == "read" && b["arguments"]["path"] == "README.md"));
             assert_eq!(result["usage"]["input"], 32); assert_eq!(result["usage"]["cacheRead"], 96);
             assert_eq!(result["usage"]["output"], 32); assert_eq!(result["usage"]["totalTokens"], 160);
-            assert!(!result.to_string().contains("offline-fixture-secret"));
+            assert!(!result.to_string().contains("fixture-secret"));
         }
         let mut owners = records.0.lock().unwrap().clone(); owners.sort();
         assert_eq!(owners, [("ds".into(), "deepseek".into()), ("mimo".into(), "xiaomi".into())]);

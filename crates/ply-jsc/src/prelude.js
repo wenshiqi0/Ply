@@ -2,7 +2,7 @@
 //
 // Evaluated once per realm. The host functions arrive as parameters and are
 // never put on the global object, so plugin code can only reach the outside
-// world through the modules defined here (ply-io and the model HTTP host).
+// world through the modules and globals defined here (ply-io, Rust HTTP).
 //
 // This file is not a security boundary: plugin code runs in the same realm
 // and can replace globals. The Rust side validates every host call. The
@@ -13,7 +13,7 @@
   const jsonParse = JSON.parse;
   const jsonStringify = JSON.stringify;
   const indirectEval = eval;
-  const { create: objectCreate, assign: objectAssign, entries: objectEntries, freeze: objectFreeze, hasOwn: objectHasOwn } = Object;
+  const { create: objectCreate, assign: objectAssign, entries: objectEntries, freeze: objectFreeze, hasOwn: objectHasOwn, defineProperty: objectDefineProperty, keys: objectKeys } = Object;
   const config = jsonParse(configJson);
   const G = globalThis;
   // Only generated code sees the lexical helper binding. Module globals
@@ -324,8 +324,8 @@
     argv: ["ply", ...config.argv],
     argv0: "ply",
     execArgv: [],
-    platform: "linux",
-    arch: "x64",
+    platform: config.platform,
+    arch: config.arch,
     pid: 1,
     ppid: 0,
     title: "ply",
@@ -543,9 +543,9 @@
   };
   const os = {
     EOL: "\n",
-    platform: () => "linux",
-    type: () => "Linux",
-    arch: () => "x64",
+    platform: () => config.platform,
+    type: () => (config.platform === "darwin" ? "Darwin" : config.platform === "linux" ? "Linux" : config.platform),
+    arch: () => config.arch,
     release: () => "6.0.0-ply",
     hostname: () => env.HOSTNAME ?? "ply",
     homedir: () => env.HOME ?? "/",
@@ -738,6 +738,9 @@
     setTimeout, setInterval, setImmediate, clearTimeout, clearInterval: clearTimeout, clearImmediate: clearTimeout,
     queueMicrotask,
   });
+  // fetch and the Web objects around it (RFC 0013), part of the environment
+  // like Buffer; compiled once per process, evaluated per realm.
+  Object.assign(G, compile(op("web.source"))(op, opAsync, plain));
   if (!G.structuredClone) G.structuredClone = (v) => jsonParse(jsonStringify(v));
 
   // ---------------------------------------------------------------- modules
@@ -775,15 +778,7 @@
         namespaces.set(name, ns);
         return ns;
       }
-      // The browser bundle and its fetch/stream scope are instantiated once
-      // in this realm, only when a plugin imports the embedded model layer.
-      const m = name === "ply:models" ? compile(op("models.source"))({
-        credentials: (profile) => op("models.credentials", profile),
-        open: (args, body) => op("http.open", args, body && plain(body)),
-        headers: (id) => opAsync("http.headers", { id }),
-        read: (id) => opAsync("http.read", { id }),
-        abort: (id) => op("http.abort", { id }),
-      }) : name === "ply:http" ? {
+      const m = name === "ply:http" ? {
         hasCredentials: provider => op("http.auth_configured", { provider }),
         requestJson: request => opAsync("http.request_json", request),
       } : name === "ply:skills" ? {
@@ -795,7 +790,7 @@
         read: (id, timeout_ms = 100) => opAsync("terminal.read", { id, timeout_ms }),
         close: id => op("terminal.close", { id }),
       } : name === "ply:sh" ? {
-        exec: request => opAsync("sh.exec", { ...request, env: process.env }),
+        exec: request => opAsync("sh.exec", { ...request, env: request.env ?? process.env }),
       } : name === "ply:commands" ? {
         async register(command) {
           if (!command || typeof command.handler !== "function") throw new TypeError("command handler must be a function");
@@ -846,29 +841,72 @@
     return namespaces.get(name);
   }
   const modules = new Map();
-  function load(spec, from) {
-    const r = op("module.resolve", { spec, from });
-    if (r.builtin) return { exports: builtinNamespace(r.builtin), done: Promise.resolve() };
+  // An ES module importing CommonJS sees `module.exports` as `default`, plus
+  // the own enumerable properties it has at import time, as in Node.
+  function namespaceOf(rec) {
+    if (rec.format === "esm" || rec.format === "builtin") return rec.exports;
+    const value = rec.module.exports;
+    const ns = objectCreate(null);
+    if (value !== null && (typeof value === "object" || typeof value === "function")) {
+      for (const key of Object.keys(value)) if (key !== "default") ns[key] = value[key];
+    }
+    ns.default = value;
+    return ns;
+  }
+  // `require` returns `module.exports`, or an ES module's namespace when it
+  // finished evaluating synchronously.
+  function required(rec, spec) {
+    if (rec.format === "builtin") return rec.exports.default;
+    if (rec.format !== "esm") return rec.module.exports;
+    if (rec.async) {
+      const err = new Error(`require() of ${spec}: the module uses top-level await`);
+      err.code = "ERR_REQUIRE_ASYNC_MODULE";
+      throw err;
+    }
+    return rec.exports;
+  }
+  function load(spec, from, kind = "import") {
+    const r = op("module.resolve", { spec, from, kind });
+    if (r.builtin) return { format: "builtin", exports: builtinNamespace(r.builtin), done: Promise.resolve() };
     let rec = modules.get(r.id);
     if (rec) return rec;
-    const code = op("module.load", { id: r.id });
-    const fn = compile(code + "\n//# sourceURL=" + r.id);
-    const exports = Object.create(null);
-    rec = { exports, done: Promise.resolve() };
+    const { format, code } = op("module.load", { id: r.id });
+    rec = { format, done: Promise.resolve(), async: false };
     modules.set(r.id, rec);
-    const require = (s) => load(s, r.id).exports;
     const dynamicImport = (s) => {
       try {
         const m = load(String(s), r.id);
-        return m.done.then(() => m.exports);
+        return m.done.then(() => namespaceOf(m));
       } catch (e) {
         return Promise.reject(e);
       }
     };
-    const meta = { url: "file://" + r.id, filename: r.id, dirname: r.dir, main: from === null };
     try {
-      const result = fn(exports, require, dynamicImport, meta);
-      if (result && typeof result.then === "function") rec.done = result;
+      if (format === "esm") {
+        rec.exports = Object.create(null);
+        const fn = compile(code + "\n//# sourceURL=" + r.id);
+        const meta = { url: "file://" + r.id, filename: r.id, dirname: r.dir, main: from === null };
+        const exportOne = (name, get) => objectDefineProperty(rec.exports, name, { enumerable: true, configurable: true, get });
+        const exportStar = (m) => {
+          for (const key of objectKeys(m)) if (key !== "default" && !objectHasOwn(rec.exports, key)) exportOne(key, () => m[key]);
+        };
+        const result = fn(rec.exports, (s) => namespaceOf(load(s, r.id)), dynamicImport, meta, exportOne, exportStar);
+        if (result && typeof result.then === "function") { rec.done = result; rec.async = true; }
+      } else {
+        const module = rec.module = { id: r.id, filename: r.id, path: r.dir, exports: {}, loaded: false, children: [], paths: [] };
+        if (format === "json") {
+          module.exports = jsonParse(code);
+        } else {
+          const require = (s) => required(load(String(s), r.id, "require"), s);
+          require.resolve = (s) => {
+            const found = op("module.resolve", { spec: String(s), from: r.id, kind: "require" });
+            return found.builtin ?? found.id;
+          };
+          module.require = require;
+          compile(code + "\n//# sourceURL=" + r.id).call(module.exports, module.exports, require, module, r.id, r.dir, dynamicImport);
+        }
+        module.loaded = true;
+      }
     } catch (e) {
       modules.delete(r.id);
       throw e;
@@ -915,7 +953,7 @@
     if (!entries.has(file)) entries.set(file, load(file, null));
     const rec = entries.get(file);
     await rec.done;
-    return rec.exports;
+    return namespaceOf(rec);
   }
   asyncHelpers.setUnhandled(reason => op("call.unhandled", { error: describe(reason), stack: reason?.stack ?? null }));
   return {
@@ -923,12 +961,12 @@
       const rec = load(file, null);
       entries.set(file, rec);
       await rec.done;
-      return Object.keys(rec.exports);
+      return Object.keys(namespaceOf(rec));
     }),
     call: (id, file, exportPath, argsJson) => settle(id, async () => {
       const rec = load(file, null);
       await rec.done;
-      let target = rec.exports;
+      let target = namespaceOf(rec);
       let owner;
       for (const part of exportPath.split(".").filter(Boolean)) {
         owner = target;
@@ -992,7 +1030,8 @@
       const rec = entries.get(file);
       if (!rec) return;
       try { await rec.done; } catch { return; }
-      if (typeof rec.exports.onDispose === "function") await rec.exports.onDispose();
+      const exports = namespaceOf(rec);
+      if (typeof exports.onDispose === "function") await exports.onDispose();
     }),
     // What an interrupted call's pending promises reject with.
     abortError: (message) => objectAssign(new Error(message), { name: "AbortError", code: "ERR_PLY_CANCELLED" }),

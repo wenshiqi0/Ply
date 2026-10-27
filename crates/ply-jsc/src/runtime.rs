@@ -50,11 +50,12 @@ use ply_core::{CleanupStatus, FiberEvent};
 use crate::ffi::*;
 use crate::http::Http;
 use crate::checkpoints::Checkpoints;
-use crate::transpile::{lower_async, transpile};
+use crate::resolve::{Format, Kind, Manifests, Resolver};
+use crate::transpile::{has_module_syntax, lower_async, transpile, transpile_cjs};
 
 const PRELUDE: &str = include_str!("prelude.js");
 const ASYNC: &str = include_str!("async.js");
-const PI_AI: &str = include_str!("vendor/pi-ai.js");
+const WEB: &str = include_str!("web.js");
 const BUILTINS: &[&str] = &[
     "fs",
     "fs/promises",
@@ -529,9 +530,12 @@ struct Engine {
     /// Per call: what to reject with an AbortError when it is cancelled —
     /// `immediate` waits and leaf promises at once, the rest on retirement.
     cancel_handlers: HashMap<u64, HashMap<u64, (RootedValue, bool)>>,
-    /// Module ids ply resolved for this realm, and those it loaded.
-    resolved: HashSet<String>,
+    /// Module ids ply resolved for this realm, with their format, and those
+    /// it loaded.
+    resolved: HashMap<String, Format>,
     loaded: HashSet<String>,
+    /// `package.json` files the resolver has read.
+    manifests: Manifests,
     /// Armed timers: id → (repeat interval in ms, fiber that armed it).
     timers: HashMap<u64, (Option<f64>, Scope)>,
     /// Async host ops in flight: id → (resolve function, fiber).
@@ -715,7 +719,8 @@ fn init(id: RealmId, config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtim
                 continuations: HashMap::new(),
                 http_owners: HashMap::new(),
                 cancel_handlers: HashMap::new(),
-                resolved: HashSet::new(),
+                resolved: HashMap::new(),
+                manifests: Manifests::new(),
                 loaded: HashSet::new(),
                 timers: HashMap::new(),
                 pending_ops: HashMap::new(),
@@ -746,7 +751,10 @@ fn init(id: RealmId, config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtim
         let prelude = RootedValue::new(ctx, call(ctx, factory.get() as JSObjectRef, &[intrinsic_eval.get(), helpers.get(), lowered.get()]).map_err(fail)?);
         let host = RootedValue::new(ctx, JSObjectMakeFunctionWithCallback(ctx, JsStr::new("host").0, host_sync) as JSValueRef);
         let host_async_fn = RootedValue::new(ctx, JSObjectMakeFunctionWithCallback(ctx, JsStr::new("hostAsync").0, host_async) as JSValueRef);
-        let settings = json!({ "env": config.env, "argv": config.argv, "version": env!("CARGO_PKG_VERSION") }).to_string();
+        // Node's names for the host platform and architecture.
+        let platform = match std::env::consts::OS { "macos" => "darwin", other => other };
+        let arch = match std::env::consts::ARCH { "aarch64" => "arm64", "x86_64" => "x64", other => other };
+        let settings = json!({ "env": config.env, "argv": config.argv, "version": env!("CARGO_PKG_VERSION"), "platform": platform, "arch": arch }).to_string();
         let settings = RootedValue::new(ctx, string_value(ctx, &settings));
         let prelude_fn = JSValueToObject(ctx, prelude.get(), null_mut());
         let api = enter(None, || call(ctx, prelude_fn, &[host.get(), host_async_fn.get(), settings.get(), helpers.get()])).map_err(fail)?;
@@ -1372,17 +1380,17 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
             }
             result
         }),
-        "models.source" => {
+        "web.source" => {
             static COMPILED: OnceLock<Result<String, String>> = OnceLock::new();
-            match COMPILED.get_or_init(|| lower_async(PI_AI, Path::new("ply:pi-ai"))) {
+            match COMPILED.get_or_init(|| lower_async(WEB, Path::new("ply:web"))) {
                 Ok(code) => OpResult::Json(json!(code)), Err(error) => OpResult::error("ERR_SYNTAX", error),
             }
         },
+        _ if op.starts_with("url.") => crate::whatwg::op(op, &args),
         "call.unhandled" => {
             if let Some(scope) = with(|e| e.current.clone()) { fail_call(scope.id, FailureKind::Failed, s("error")); }
             OpResult::Json(Value::Null)
         }
-        "models.credentials" => crate::http::credentials(&args),
         "http.auth_configured" => crate::http::auth_configured(&args),
         "http.open" => with(|e| {
             let result = e.http.open(args, bytes);
@@ -1459,7 +1467,7 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
         "path.dirname" => OpResult::Json(json!(lpath::dirname(&s("path")))),
         "path.basename" => OpResult::Json(json!(lpath::basename(&s("path")))),
         "path.extname" => OpResult::Json(json!(lpath::extname(&s("path")))),
-        "module.resolve" => resolve_module(&s("spec"), args.get("from")),
+        "module.resolve" => resolve_module(&s("spec"), args.get("from"), if s("kind") == "require" { Kind::Require } else { Kind::Import }),
         "module.load" => load_module(&s("id")),
         "settle" => {
             let id = args.get("id").and_then(Value::as_u64).unwrap_or(0);
@@ -1506,8 +1514,8 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
 
 // -------------------------------------------------------------- modules
 
-fn resolve_module(spec: &str, from: Option<&Value>) -> OpResult {
-    if matches!(spec, "ply:models" | "ply:checkpoints" | "ply:memory-store" | "ply:sh" | "ply:events" | "ply:http" | "ply:terminal" | "ply:plugins" | "ply:commands" | "ply:markdown" | "ply:skills") || spec.strip_prefix("ply:async/helpers/").is_some_and(|name|
+fn resolve_module(spec: &str, from: Option<&Value>, kind: Kind) -> OpResult {
+    if matches!(spec, "ply:checkpoints" | "ply:memory-store" | "ply:sh" | "ply:events" | "ply:http" | "ply:terminal" | "ply:plugins" | "ply:commands" | "ply:markdown" | "ply:skills") || spec.strip_prefix("ply:async/helpers/").is_some_and(|name|
         ["asyncToGenerator", "wrapAsyncGenerator", "awaitAsyncGenerator", "asyncGeneratorDelegate", "asyncIterator"].contains(&name)) {
         return OpResult::Json(json!({ "builtin": spec }));
     }
@@ -1518,63 +1526,71 @@ fn resolve_module(spec: &str, from: Option<&Value>) -> OpResult {
     if spec.starts_with("node:") {
         return OpResult::error("ERR_UNKNOWN_BUILTIN_MODULE", format!("No such built-in module: {spec}"));
     }
-    if !(spec.starts_with("./") || spec.starts_with("../") || spec.starts_with('/')) {
-        return OpResult::error(
-            "ERR_MODULE_NOT_FOUND",
-            format!("Cannot find package '{spec}' (importing packages is not supported yet)"),
-        );
-    }
     let found = with(|e| {
-        let base = match from {
-            None | Some(Value::Null) => e.root.clone(),
-            Some(Value::String(f)) if e.loaded.contains(f) => lpath::dirname(f),
+        let importer = match from {
+            None | Some(Value::Null) => None,
+            Some(Value::String(f)) if e.loaded.contains(f) => Some(f.clone()),
             Some(_) => return Err(invalid("importer")),
         };
-        Ok((e.code.clone(), e.root.clone(), base, e.handle.clone()))
+        Ok((e.code.clone(), e.root.clone(), importer, e.handle.clone(), std::mem::take(&mut e.manifests)))
     });
-    let (code, root, base, handle) = match found {
+    let (code, root, importer, handle, mut manifests) = match found {
         Ok(found) => found,
         Err(invalid) => return invalid,
     };
-    // Decide containment on the path alone, before touching any storage, so
-    // a probe outside the root learns nothing about what exists there.
-    let target = lpath::resolve(&base, spec);
-    if !under(&target, &root) {
-        return OpResult::error("ERR_MODULE_OUTSIDE_ROOT", format!("'{spec}' resolves outside the plugin root {root}"));
-    }
-    let mut candidates = vec![target.clone()];
-    candidates.extend(["ts", "tsx", "mts", "js", "mjs"].iter().map(|ext| format!("{target}.{ext}")));
-    candidates.extend(["index.ts", "index.js"].iter().map(|index| lpath::join(&target, index)));
-    for candidate in candidates {
-        if handle.block_on(code.is_file(&candidate)) {
-            with(|e| e.resolved.insert(candidate.clone()));
-            return OpResult::Json(json!({ "id": candidate, "dir": lpath::dirname(&candidate) }));
+    let result = handle.block_on(Resolver { code: &code, manifests: &mut manifests }.resolve(spec, importer.as_deref(), &root, kind));
+    with(|e| e.manifests = manifests);
+    match result {
+        Ok((id, format)) => {
+            let dir = lpath::dirname(&id);
+            with(|e| e.resolved.insert(id.clone(), format));
+            OpResult::Json(json!({ "id": id, "dir": dir }))
         }
+        Err(failure) => OpResult::error(failure.code, failure.message),
     }
-    let shown_from = from.and_then(Value::as_str).unwrap_or("<entry>");
-    OpResult::error("ERR_MODULE_NOT_FOUND", format!("Cannot find module '{spec}' imported from {shown_from}"))
 }
 
+/// Transpiled modules by path and content, shared by every realm: the same
+/// `node_modules` file is parsed once per process.
+type Transpiled = Result<(&'static str, Arc<str>), String>;
+static TRANSPILED: OnceLock<Mutex<HashMap<(String, u64), Transpiled>>> = OnceLock::new();
+
 fn load_module(id: &str) -> OpResult {
-    let found = with(|e| e.resolved.contains(id).then(|| (e.code.clone(), e.handle.clone())));
-    let Some((code, handle)) = found else { return invalid("module id") };
+    let found = with(|e| e.resolved.get(id).map(|format| (*format, e.code.clone(), e.handle.clone())));
+    let Some((format, code, handle)) = found else { return invalid("module id") };
     let source = match handle.block_on(code.read(id)) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) => return OpResult::error("ERR_MODULE_NOT_FOUND", format!("{id}: {e}")),
     };
-    match transpile(&source, Path::new(id)) {
-        Ok(js) => {
+    let key = (id.to_string(), {
+        let mut hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&source, &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    });
+    let cache = TRANSPILED.get_or_init(Default::default);
+    let cached = cache.lock().expect("transpile cache poisoned").get(&key).cloned();
+    let result = cached.unwrap_or_else(|| {
+        let path = Path::new(id);
+        let result: Transpiled = match format {
+            Format::Esm => transpile(&source, path).map(|js| ("esm", js.into())),
+            Format::Cjs => transpile_cjs(&source, path).map(|js| ("cjs", js.into())),
+            Format::Json => Ok(("json", source.as_str().into())),
+            // Node 22: ES module syntax makes it a module; so does a
+            // CommonJS parse that fails where ES module parsing succeeds.
+            Format::Detect if has_module_syntax(&source) => transpile(&source, path).map(|js| ("esm", js.into())),
+            Format::Detect => transpile_cjs(&source, path).map(|js| ("cjs", js.into()))
+                .or_else(|error| transpile(&source, path).map(|js| ("esm", js.into())).map_err(|_| error)),
+        };
+        cache.lock().expect("transpile cache poisoned").insert(key, result.clone());
+        result
+    });
+    match result {
+        Ok((format, js)) => {
             with(|e| e.loaded.insert(id.to_string()));
-            OpResult::Json(json!(js))
+            OpResult::Json(json!({ "format": format, "code": &*js }))
         }
         Err(e) => OpResult::error("ERR_SYNTAX", e),
     }
-}
-
-/// `path` equals `root` or lies below it, compared by whole components.
-fn under(path: &str, root: &str) -> bool {
-    let root = root.trim_end_matches('/');
-    root.is_empty() || path == root || path.starts_with(&format!("{root}/"))
 }
 
 // ------------------------------------------------------------------- fs

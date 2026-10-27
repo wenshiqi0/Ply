@@ -1,6 +1,6 @@
 # RFC 0013: 运行时只提供资源，代码依赖走 npm
 
-状态：提议。
+状态：分步实施。第一步已实现（2026-10-27），第 2–4 步待实施（见"实施步骤"）。
 关联规范：SPEC-PLUGINS、SPEC-TYPES、SPEC-AGENT、SPEC-TOOLS、SPEC-SKILLS-MEMORY。
 
 ## 问题与证据
@@ -11,7 +11,7 @@
 |---|---|---|
 | 资源 | `ply:sh`、`ply:terminal`、`ply:http` | Rust 实现 |
 | 内核 | `ply:plugins`、`ply:events`、`ply:commands` | Rust 实现 |
-| 外部代码 | `ply:models` | [packages/pi-ai](../../packages/pi-ai/build.mjs) 用 esbuild 打成浏览器版 bundle（533 KB），检入 `crates/ply-jsc/src/vendor/pi-ai.js`，再用 `include_str!` 嵌入。fetch、Headers、URL、AbortController、ReadableStream 等只在这个 bundle 的私有作用域里用 polyfill 提供 |
+| 外部代码 | `ply:models` | `packages/pi-ai` 用 esbuild 打成浏览器版 bundle（533 KB），检入 `crates/ply-jsc/src/vendor/pi-ai.js`，再用 `include_str!` 嵌入。fetch、Headers、URL、AbortController、ReadableStream 等只在这个 bundle 的私有作用域里用 polyfill 提供 |
 | 外部代码 | `ply:markdown`、`ply:skills` | Rust 解析器（[markdown.rs](../../crates/ply-jsc/src/markdown.rs)、[skills.rs](../../crates/ply-jsc/src/skills.rs)）加 markdown.js |
 | 存储逻辑 | `ply:memory-store`、`ply:checkpoints` | [memory.rs](../../crates/ply-jsc/src/memory.rs)（946 行）和 [checkpoints.rs](../../crates/ply-jsc/src/checkpoints.rs) 在 Rust 里实现私有权限、flock、原子 generation 和 git common-dir 识别 |
 
@@ -47,6 +47,10 @@ Ply 运行时以 Node 为基线，可以作为 Node 的超集：Node 已有的 A
 - 包内的相对导入不能越出该包，插件内的相对导入不能越出插件目录；`node_modules` 只读。
 - 不支持原生扩展（`.node`）。导入运行时未实现的 node 内置模块时，报 `ERR_UNKNOWN_BUILTIN_MODULE`。
 - 内置插件、目录插件和脚本使用同一个解析器。
+- `.js` 的格式按最近的 package.json 的 `type` 判断；没有 `type` 时按 Node 22 的语法检测：含 `import`/`export` 语句、`import.meta` 或顶层 `await` 的视为 ESM，否则视为 CJS。CJS 按脚本（非严格模式）解析，同样经过 async 降级，fiber 才能跟踪它的 continuation。
+- ESM 导入 CJS 时，具名导出取导入那一刻 `module.exports` 自身的可枚举属性；CJS 可以 `require` 不含顶层 `await` 的 ESM。
+- 目录插件按 Node 规则从自己的目录逐级向上查找 `node_modules`，不回退到 Ply 自带的依赖。内核把找到的 `node_modules` 以只读方式挂载到代码命名空间中的同一路径。
+- `node_modules` 中的文件不可变，转译结果按"路径 + 内容哈希"在进程内缓存，多个 realm 共用。
 
 ### 2. 开发与打包
 
@@ -63,7 +67,8 @@ Ply 运行时以 Node 为基线，可以作为 Node 的超集：Node 已有的 A
 
 - 提供全局 `fetch`、`Headers`、`Request`、`Response`、`URL`、`URLSearchParams`、`AbortController`、`AbortSignal`、`ReadableStream` 和 `FormData`（即现在 pi-ai bundle 需要的那一组）。底层沿用 Rust HTTP/TLS 的流式读取和体积上限。
 - 请求归属发起它的那次调用；调用被取消时，请求以 `AbortError` 结束，与 RFC 0012 一致。
-- pi-ai 及其依赖实际用到的其他标准全局（例如 `crypto.getRandomValues`），按加载测试的结果补齐。这些 Web 对象的实现可以复用 npm 上的 polyfill，由运行时在构建期嵌入。
+- pi-ai 及其依赖实际用到的其他标准全局（例如 `crypto.getRandomValues`），按加载测试的结果补齐。
+- 这些对象由运行时原生实现，不使用 npm polyfill，构建期也不运行 Node：`URL`、`URLSearchParams` 由 Rust 的 `url` crate（WHATWG URL 标准）解析和序列化；`fetch`、`Headers`、`Request`、`Response`、`AbortController`、`AbortSignal`、`ReadableStream`、`FormData` 写在运行时的 JS 里，`fetch` 的网络读写走 Rust 的 http op。
 - 删除 `ply:http`（`requestJson`、`hasCredentials`），以及 http.open、http.headers、http.read、http.abort 这几个 op 的 JS 适配层。
 
 ### 4. 密钥：环境变量
@@ -71,6 +76,8 @@ Ply 运行时以 Node 为基线，可以作为 Node 的超集：Node 已有的 A
 - 插件从 `process.env` 读取密钥，默认变量为 `DEEPSEEK_API_KEY`、`MIMO_API_KEY`、`TYPESAFE_API_KEY`；provider 的 `apiKeyEnv` 选项可以改用其他变量名。读到的密钥作为参数交给 pi-ai，或写进 `fetch` 的请求头。
 - 删除 `models.credentials` 和 `http.auth_configured` 两个宿主 op。
 - 密钥会出现在插件的 JS 中。模型调用现在已经是这样；jev 原本"密钥经 `ply:http` 注入、不回到 JS"的保证随之取消。密钥仍然只来自宿主的进程环境，不从插件输入或模型输出读取。
+- 插件的 `process.env` 不是宿主环境的完整副本：CLI 只把宿主中已设置的密钥变量（`DEEPSEEK_API_KEY`、`MIMO_API_KEY`，jev 迁移后加上 `TYPESAFE_API_KEY`）传给插件。
+- 模型的 bash 命令不能读到密钥。`ply:sh` 的 `exec` 接受显式的 `env`（缺省仍为 `process.env`），bash 插件传给模型命令的环境去掉所有以 `_API_KEY` 结尾的变量。这是暴露 shell 的插件自己的策略，IO 层不加过滤。
 
 ### 5. 存储建在 fs 上，fs 提供文件锁
 
@@ -104,12 +111,26 @@ Ply 运行时以 Node 为基线，可以作为 Node 的超集：Node 已有的 A
 - `ply:markdown` 改为 tui 插件使用 npm 上的 markdown 解析包；`ply:skills` 改为 skill 插件自己解析 SKILL.md 的前置元数据。删除 markdown.rs 和 skills.rs 的宿主 op。具体选用哪个包在实现时确定，并在根锁文件中锁定版本。
 - 已经确认的导入情况：pi-ai 主入口在 Ply 的解析条件下会用到 `node:fs`（`utils/provider-env.js`），运行时已经提供；`node:http`、`node:readline` 只出现在 cli 和 OAuth 子路径中，内置插件不会导入这些路径。
 
+### 7. 第三方类型声明
+
+- 根 `tsconfig.json` 打开 `skipLibCheck`，不报告 `node_modules` 中 d.ts 内部的错误。pi-ai 主入口的声明会引入所有 provider 的类型，其中 `@anthropic-ai/sdk` 和 `@google/genai` 的声明需要 DOM 类型和未安装的可选 peer，在 Ply 的配置下无法通过检查。
+- 新增 `tsconfig.sdk.json`，对 `packages/sdk` 与 `type-tests` 保持 `skipLibCheck: false`，并纳入 `npm run check`。Ply 自己的声明仍然严格检查，插件对第三方 API 的使用也照常检查。
+
+### 实施步骤
+
+1. node 解析（ESM、CJS、`exports`、JSON）、原生 Web 全局与 `fetch`、密钥改走环境变量；agent 从 npm 导入 pi-ai，删除 `ply:models`、`vendor/pi-ai.js` 和 `packages/pi-ai`。这一步只有开发模式：debug 和 release 构建都在运行时读取仓库根目录的 `node_modules`（路径在编译期确定），二进制在第 3 步之前不能脱离仓库单独运行。`ply:http` 与 jev 不变。
+2. fs 的 FileHandle 与文件锁；memory、checkpoints 迁到插件。
+3. 打包模式：构建期按导入图嵌入可达文件。pi-ai 的 npm 包不含许可证文件（原 bundle 另存了一份 MIT 文本），收集许可证时要为它补上。
+4. jev 改用 `fetch`，删除 `ply:http`；`ply:markdown`、`ply:skills` 迁出。
+
 ### 不采用的方案
 
 - 继续把外部库包装成 `ply:` 模块。
 - 由 `fetch` 按目标主机注入密钥：这等于在 IO 层加策略；按用户决定，密钥走环境变量。
 - 用 `open(path, "wx")` 建锁文件来代替 OS 锁：进程崩溃后会留下失效的锁。
 - 打包整个生产 `node_modules`：AWS、Google 等 provider SDK 会全部进入二进制；改为只嵌入按导入图可达的文件。
+- 用 npm polyfill（headers-polyfill、whatwg-url、web-streams-polyfill 等）打成检入的 bundle 来提供 Web 全局：构建期仍要运行 Node，用户选择原生实现。
+- 为 pi-ai 手写一份 `declare module` 环境声明来绕过第三方 d.ts 的错误：这等于第二份手写定义，升级时需要同步。
 
 ## 兼容范围
 
@@ -121,8 +142,14 @@ Ply 运行时以 Node 为基线，可以作为 Node 的超集：Node 已有的 A
 - Ply 运行时可以作为 Node 的超集，文件锁以 Node 扩展的形式提供。
 - 以上原则写入 SPEC。
 
+用户决定（2026-10-27，第一步设计）：
+- 密钥进入插件环境；bash 插件给模型命令的环境去掉 `*_API_KEY`。
+- 第一步只做开发模式，打包放到第 3 步。
+- Web 全局由运行时原生实现，不用 npm polyfill。
+- 第三方 d.ts 跳过检查，SDK 声明单独严格检查。
+
 **破坏性变更**
-- 删除 `ply:models`、`ply:memory-store`、`ply:checkpoints`、`ply:http`、`ply:markdown`、`ply:skills`，以及 [packages/sdk/modules](../../packages/sdk/modules/models.d.ts) 中对应的声明。
+- 删除 `ply:models`、`ply:memory-store`、`ply:checkpoints`、`ply:http`、`ply:markdown`、`ply:skills`，以及 `packages/sdk/modules` 中对应的声明。
 - 新增全局 `fetch` 等 Web 对象；fs 新增 FileHandle、`mode`、`chmod`、`lock` 和 `unlock`；新增 `process.env.PLY_STATE_DIR`。
 - cargo 构建前必须先运行 `npm ci --ignore-scripts`。以前 vendor bundle 检入仓库，不需要这一步。
 - 检查点改存到 `~/.ply/agent/checkpoints`，旧位置的记录不迁移。
@@ -167,3 +194,13 @@ Ply 运行时以 Node 为基线，可以作为 Node 的超集：Node 已有的 A
 - **SPEC-TOOLS**：`fetch`；fs 的权限与文件锁。
 - **SPEC-SKILLS-MEMORY**：memory 改在插件内实现，锁与权限的要求保持不变。
 - **验收矩阵**：模型运行时、持久化记忆、失败恢复三行改为引用新的测试。
+
+## 验证记录（第一步，2026-10-27）
+
+- `npm ci --ignore-scripts`、`npm run check`（含 `scripts/check-sdk-types.mjs` 与可见面检查）通过；`cargo test --workspace --offline` 206 个测试全部通过，包括 CLI、MCP、真实 PTY 与目录插件。
+- [node_modules.rs](../../crates/ply-jsc/tests/node_modules.rs)：逐级查找与就近优先、`exports` 条件与模式、`null` 目标、CJS/ESM 互操作、require ESM 与顶层 await 拒绝、JSON、`.js` 语法检测（含只有顶层 await 的脚本）、包内越界、未知内置模块；真实 pi-ai 依赖图（838 个文件）在 debug 构建中首次加载约 0.7 秒，第二个 realm 用转译缓存约 0.3 秒。typebox 的循环导入要求 live binding，ESM 导入随之改为每次使用时读取。
+- [web.rs](../../crates/ply-jsc/tests/web.rs)：URL 解析与 setter、searchParams 同步、表单编码、Headers 合并与 set-cookie、fetch 的 JSON、跨源重定向去掉凭据、流读取与 clone、AbortSignal 中止、调用取消得到 `ERR_PLY_CANCELLED` 且 catch 运行、16 MiB 上限、连接失败与非 http 协议。
+- [model_runtime.rs](../../crates/ply-jsc/tests/model_runtime.rs)：agent 的 pi.ts 经 npm pi-ai 与运行时 fetch 并发调用 DeepSeek 和 MiMo 本地 SSE fixture，各自从 `process.env` 取密钥并以各自的头部发送，结果不含密钥。
+- [kernel.rs](../../crates/ply-kernel/tests/kernel.rs)：插件读得到密钥，模型的 bash 命令读不到。
+- `scripts/check-sdk-types.mjs` 对人为植入的 SDK 声明错误报错，根 `tsc` 在 `skipLibCheck` 下不报。
+- 未做：真实 DeepSeek/MiMo 调用。本步改变了模型连接路径，按 AGENTS.md 需另行取得授权后实测并保留轨迹。

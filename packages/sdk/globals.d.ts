@@ -1,7 +1,6 @@
 // JSC host declarations. Included automatically by the root tsconfig.
 import "./modules/commands";
 import "./modules/skills";
-import "./modules/models";
 import "./modules/checkpoints";
 import "./modules/terminal";
 import "./modules/markdown";

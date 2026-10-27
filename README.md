@@ -17,9 +17,10 @@ Ply 是一个 agent harness：Rust 内核负责调度、IO 和记录，插件用
 
 ## 快速开始
 
-需要 macOS 和 Rust 工具链。
+需要 macOS、Node/npm 和 Rust 工具链。npm 只用来安装插件的依赖（如 pi-ai），运行时不启动 Node。
 
 ```bash
+npm ci --ignore-scripts
 cargo build -p ply-cli
 ```
 

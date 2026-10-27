@@ -1,10 +1,9 @@
 import type { Block, Context, Message, PreparedContext, RunUsage } from "./types";
-import type { ModelProfile } from "ply:models";
-import { context } from "ply:plugins";
+import { context, type ModelProfile } from "ply:plugins";
 import { audit } from "./audit";
 import { delegationState } from "./policy";
 import { rememberUsage, tokenUsage } from "./usage";
-import { request as modelRequest } from "ply:models";
+import { request as modelRequest } from "./pi";
 
 export async function completeTurn(
   profile: ModelProfile, context: Context, model: string, turn: number, run: RunUsage,

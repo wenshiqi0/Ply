@@ -27,8 +27,28 @@ fn modules(root: &Path, directory: &Path, files: &mut Vec<(String, String)>) {
     }
 }
 
+/// Development mode reads the plugins' npm dependencies from the
+/// repository's node_modules at run time (RFC 0013): refuse to build
+/// without them.
+fn check_dependencies(workspace: &Path) {
+    println!("cargo:rerun-if-changed={}", workspace.join("package.json").display());
+    println!("cargo:rerun-if-changed={}", workspace.join("node_modules/.package-lock.json").display());
+    let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(workspace.join("package.json")).unwrap()).unwrap();
+    let missing: Vec<&String> = manifest["dependencies"]
+        .as_object()
+        .into_iter()
+        .flat_map(|dependencies| dependencies.keys())
+        .filter(|name| !workspace.join("node_modules").join(name).join("package.json").is_file())
+        .collect();
+    if !missing.is_empty() {
+        panic!("npm dependencies are not installed: {missing:?}; run `npm ci --ignore-scripts` in {}", workspace.display());
+    }
+}
+
 fn main() {
-    let root = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../plugins");
+    let workspace = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("../..");
+    check_dependencies(&workspace);
+    let root = workspace.join("plugins");
     println!("cargo:rerun-if-changed={}", root.display());
     let mut plugins: Vec<_> = fs::read_dir(&root)
         .unwrap()

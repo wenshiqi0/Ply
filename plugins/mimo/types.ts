@@ -1,4 +1,4 @@
-import type { ModelProfile } from "ply:models";
+import type { ModelProfile } from "ply:plugins";
 
 /** Model integrations select a host-authenticated profile during onLoad. */
 export type ModelSelection = ModelProfile;

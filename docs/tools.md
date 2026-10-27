@@ -9,6 +9,7 @@
 - 每次调用新建 shell，脚本内的状态和 cwd 独立。
 - 支持内部解释器的语法、builtin、自带工具（cat、ls、grep、sed、find、sort、head、tail、wc、du 等），以及 PATH 中的宿主可执行文件；不存在的命令返回 127，无法执行返回 126。
 - 默认保留启动进程 PATH 的目录顺序，再补齐系统、Homebrew 和常见用户 bin 目录；不加载 bash/zsh 配置、alias、函数或全量环境变量。
+- 命令的环境是插件的 `process.env` 去掉所有以 `_API_KEY` 结尾的变量：模型密钥只供 agent 调用模型，模型执行的命令读不到。
 - 内部工具和重定向使用挂载 IO；宿主程序需要磁盘 cwd，其自身的文件访问使用真实宿主文件系统，不受虚拟挂载权限隔离，参数中的虚拟绝对路径也不会自动重写。
 - 超时或调用取消会回收宿主进程组。Ply sh 没有 shell 进程信号，`signal` 为 null，超时通过 `timed_out` 表示。
 

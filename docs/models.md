@@ -1,12 +1,13 @@
 # 模型接入
 
-agent 在自己的 JSC realm 内运行内嵌的 [pi-ai](https://github.com/earendil-works/pi/tree/main/packages/ai) 模型层，当前接入 DeepSeek 和 MiMo。运行时不需要 Node、npm 或全局安装的 Pi。只用 pi-ai 的模型连接；会话、上下文和压缩都由 Ply 自己管理。
+agent 在自己的 JSC realm 内运行 [pi-ai](https://github.com/earendil-works/pi/tree/main/packages/ai) 模型层，当前接入 DeepSeek 和 MiMo。pi-ai 是根 `package.json` 里的普通 npm 依赖，由 [plugins/agent/pi.ts](../plugins/agent/pi.ts) 在第一次模型请求时导入。运行时不启动 Node，也不需要全局安装的 Pi。只用 pi-ai 的模型连接；会话、上下文和压缩都由 Ply 自己管理。
 
 ## 传输与密钥
 
-- 模型请求通过 Rust 的 HTTP/TLS 客户端发送，SSE 响应按需逐块读取并交给 pi-ai 解析。
+- pi-ai 调用运行时的全局 `fetch`，请求经 Rust 的 HTTP/TLS 客户端发送，SSE 响应按需逐块读取并交给 pi-ai 解析。
 - 每次调用有独立的取消信号和 10 分钟总超时；请求体和累计响应体各限 16 MiB；失败、取消或 realm 退出会释放响应。
-- 密钥在请求时从宿主读取，不加入插件的 `process.env`、上下文或用量记录。
+- 密钥来自 profile 的 `apiKeyEnv` 所指的环境变量：CLI 把宿主已设置的 `DEEPSEEK_API_KEY`、`MIMO_API_KEY` 传入插件的 `process.env`，agent 在请求时读取。pi-ai 自己的环境变量名和凭据文件不会被使用。
+- 密钥不进入上下文或用量记录；bash 工具运行模型的命令时去掉所有以 `_API_KEY` 结尾的变量，模型读不到密钥。
 
 ## DeepSeek
 
@@ -36,16 +37,12 @@ agent 在自己的 JSC realm 内运行内嵌的 [pi-ai](https://github.com/earen
 - 型号与协议依据 [官方型号说明](https://mimo.mi.com/docs/en-US/quick-start/model)、[API 文档](https://mimo.mi.com/docs/en-US/api/chat) 和 [套餐支持说明](https://mimo.mi.com/docs/en-US/quick-start/faq/token-plan/Plans%26Pricing)，核对于 2026-10-24；V2.5 模型 ID 已退役。
 - `--no-default-plugins` 下可用 `--plugin ./plugins/mimo` 手动加载，不要同时加载 deepseek 和 mimo。
 
-## 更新内嵌的 pi-ai
+## 更新 pi-ai
 
-pi-ai bundle 随源码保存，普通 `cargo build` 不运行 Node。只有更新 SDK 或 bundle 时才需要构建期 Node：
+pi-ai 固定为 `0.82.1`，写在根 `package.json` 的 `dependencies`，锁在根 `package-lock.json`。更新时改版本并重新安装：
 
 ```bash
-cd packages/pi-ai
-npm ci --ignore-scripts --registry=https://registry.npmjs.org
-npm run build
+npm install --save-exact --ignore-scripts @earendil-works/pi-ai@<version>
 ```
 
-pi-ai 固定为 `0.82.1`，依赖锁在 `packages/pi-ai/package-lock.json`，生成文件及第三方许可声明在 `crates/ply-jsc/src/vendor/`。OAuth、Bedrock 和其他 provider 尚未接入。
-
-把外部代码改为 npm 依赖、运行时只提供资源能力的调整见 [RFC 0013](rfcs/0013-resources-and-npm.md)（提议中）。
+当前是开发模式：内置插件在运行时读取仓库根目录的 `node_modules`，所以 cargo 构建前要先 `npm ci --ignore-scripts`，二进制也不能脱离仓库运行。构建期按导入图嵌入依赖的打包模式见 [RFC 0013](rfcs/0013-resources-and-npm.md) 的第 3 步。OAuth、Bedrock 和其他 provider 尚未接入。

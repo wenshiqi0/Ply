@@ -24,6 +24,7 @@ pulldown-cmark = { version = "=0.13.4", default-features = false }
 oxc = { version = "0.155", features = ["transformer", "codegen", "semantic", "ast_visit"] }
 oxc_ecmascript = "0.155"
 regex = "1"
+url = "2.5.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "gzip", "brotli", "deflate"] }
 rusqlite = { version = "0.33", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

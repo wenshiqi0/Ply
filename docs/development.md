@@ -15,7 +15,9 @@ npm run check
 cargo test --workspace --locked --offline
 ```
 
-- `npm run check` 执行严格类型检查、ESLint、文档链接检查和插件可见面检查（插件、示例、SDK 和运行时 prelude 中不能出现 fiber、`ply:lifecycle`、全局 `ctx` 或 `.loaded`），覆盖 SDK 声明、插件、示例与 [类型契约反例](../type-tests/plugins.ts)。
+- `npm ci` 必须在 cargo 构建之前：内置插件的 npm 依赖（如 pi-ai）在运行时从仓库根目录的 `node_modules` 读取，缺少时构建失败并提示（[RFC 0013](rfcs/0013-resources-and-npm.md)）。
+- `npm run check` 执行严格类型检查、ESLint、文档链接检查和插件可见面检查（插件、示例、SDK 和运行时 prelude 中不能出现 fiber、`ply:lifecycle`、全局 `ctx`、`.loaded` 或已删除的 `ply:models`），覆盖 SDK 声明、插件、示例与 [类型契约反例](../type-tests/plugins.ts)。
+- 根 `tsconfig.json` 打开 `skipLibCheck`，因为 `node_modules` 里的第三方 d.ts 在本仓库的配置下无法通过；`packages/sdk` 的声明由 [check-sdk-types.mjs](../scripts/check-sdk-types.mjs) 单独严格检查。
 - 根 `tsconfig.json` 自动加载 SDK 声明，编辑器打开仓库即可检查所有插件和示例。
 - 涉及内置模块加载的改动要跑完整的 workspace 测试，包括 CLI、MCP、真实 PTY 与目录插件。
 - 自动化测试只用 fixture 和本地 HTTP；真实供应商调用需要另行取得授权并保留轨迹。
@@ -36,4 +38,4 @@ git config core.hooksPath .githooks
 - 一个插件一个目录：`main.ts` 只放钩子入口，`types.ts` 声明输入、输出、`onLoad` 参数和导出接口，策略、存储、渲染、统计等放进按职责拆分的模块。例如 [agent](../plugins/agent/) 由 run / model / tools / policy / report / recovery / usage 分担实现。
 - 每个 TS 文件最多 250 个非空、非注释行；类型文件也参与严格检查，不用 `any`、`@ts-ignore` 或跳过声明检查。
 - 公共插件类型从 `packages/sdk` 的 `ply:plugins` 暴露。
-- 内置插件的模块目录由 Rust 在构建期收集并嵌入二进制，普通构建和运行不依赖外部 Node。
+- 内置插件的模块目录由 Rust 在构建期收集并嵌入二进制；它们的 npm 依赖目前在运行时从仓库的 `node_modules` 读取。构建和运行都不启动外部 Node。

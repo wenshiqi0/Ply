@@ -6,7 +6,8 @@ declare module "ply:sh" {
     stdout: string;
     stderr: string;
   }
-  export function exec(request: { command: string; cwd?: string; timeout_ms?: number }): Promise<Result>;
+  /** `env` is the command's whole environment; it defaults to `process.env`. */
+  export function exec(request: { command: string; cwd?: string; timeout_ms?: number; env?: Record<string, string | undefined> }): Promise<Result>;
 }
 
 /** Plugin-owned, cross-realm events. Declare/subscribe during onLoad. */

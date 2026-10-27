@@ -3,8 +3,10 @@ import path from "node:path";
 
 // Plugins see capabilities, never scheduling (RFC 0012): no fiber, caller
 // identity or load waits in plugin-visible code or the runtime prelude.
+// Libraries come from npm, not `ply:` modules (RFC 0013): the removed
+// model module stays gone. CommonJS `module.loaded` is Node's own field.
 const root = path.resolve(import.meta.dirname, "..");
-const forbidden = [/fiber/i, /ply:lifecycle/, /\bctx\b/, /\.loaded\b/];
+const forbidden = [/fiber/i, /ply:lifecycle/, /\bctx\b/, /(?<!\bmodule)\.loaded\b/, /ply:models/];
 const files = [];
 const walk = dir => {
   for (const entry of fs.readdirSync(path.join(root, dir), { withFileTypes: true })) {
@@ -14,7 +16,7 @@ const walk = dir => {
   }
 };
 for (const dir of ["plugins", "examples/plugins", "packages/sdk"]) walk(dir);
-files.push("crates/ply-jsc/src/prelude.js", "crates/ply-jsc/src/async.js");
+files.push("crates/ply-jsc/src/prelude.js", "crates/ply-jsc/src/async.js", "crates/ply-jsc/src/web.js");
 const failures = [];
 for (const file of files) {
   fs.readFileSync(path.join(root, file), "utf8").split("\n").forEach((line, index) => {
@@ -24,4 +26,4 @@ for (const file of files) {
 if (failures.length) {
   process.stderr.write(failures.join("\n") + "\n");
   process.exitCode = 1;
-} else console.log(`Checked ${files.length} plugin-visible files for scheduling leaks.`);
+} else console.log(`Checked ${files.length} plugin-visible files for scheduling leaks and removed modules.`);

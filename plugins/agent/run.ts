@@ -1,15 +1,14 @@
 import * as checkpoints from "ply:checkpoints";
 import type { AgentInput, AgentPolicy, AgentResult, Block, Message, Recovery, ReportState, RunUsage, UsageSummary } from "./types";
-import type { ModelProfile } from "ply:models";
 import { REPORT_END, reportFor, sectionNames, validateReport } from "./report";
 import { audit } from "./audit";
 import { delegations } from "./state";
 import { combinedUsage, startUsage, tokenUsage, totalUsageSummary, usageSummary } from "./usage";
 import { completeTurn, prepareForTurn } from "./model";
-import { context } from "ply:plugins";
+import { context, type ModelProfile } from "ply:plugins";
 import { delegationState, integer, policyFor } from "./policy";
 import { recovery } from "./recovery";
-import { request as modelRequest } from "ply:models";
+import { request as modelRequest } from "./pi";
 import { runTool } from "./tools";
 
 /** Run a task with bounded tool/delegation grants, or resume a recovery ID. */

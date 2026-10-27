@@ -216,7 +216,7 @@ fn fixture_agent(work: &Path) -> PathBuf {
     let dir = work.join("agent");
     std::fs::create_dir_all(&dir).unwrap();
     let ply_kernel::PluginSource::Bundled { files, .. } = ply_kernel::PluginSource::builtin("agent").unwrap() else { unreachable!() };
-    let import = "import { request as modelRequest } from \"ply:models\";";
+    let import = "import { request as modelRequest } from \"./pi\";";
     let mut replaced = 0;
     for (name, source) in files {
         let path = dir.join(name);

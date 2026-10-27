@@ -43,6 +43,8 @@ declare module "ply:plugins" {
   export type MemoryOptions = import("../../plugins/memory/types").MemoryOptions;
   export type SkillOptions = import("../../plugins/skill/types").SkillOptions;
   export type ContextConfig = import("../../plugins/context/types").ContextConfig;
+  export type ModelProfile = import("../../plugins/context/types").ModelProfile;
+  export type ModelLimits = import("../../plugins/context/types").ModelLimits;
   export type AgentResult = import("../../plugins/agent/types").AgentResult;
   export type UsageSummary = import("../../plugins/agent/types").UsageSummary;
   export type ToolAuthorization = import("../../plugins/approval/types").ToolAuthorization;
