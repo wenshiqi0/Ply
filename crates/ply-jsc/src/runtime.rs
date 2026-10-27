@@ -56,6 +56,8 @@ use crate::transpile::{has_module_syntax, lower_async, transpile, transpile_cjs}
 const PRELUDE: &str = include_str!("prelude.js");
 const ASYNC: &str = include_str!("async.js");
 const WEB: &str = include_str!("web.js");
+/// The Node version the runtime aligns with (RFC 0014), defined once.
+const NODE_VERSION: &str = include_str!("../../../.node-version");
 const BUILTINS: &[&str] = &[
     "fs",
     "fs/promises",
@@ -522,6 +524,8 @@ struct Engine {
     stdout: String,
     stderr: String,
     exit_code: Option<i32>,
+    /// `process.exitCode`: the status when nothing called process.exit.
+    exit_hint: Option<i32>,
     /// The fiber the running entry belongs to.
     current: Scope,
     binding_class: JSClassRef,
@@ -659,7 +663,7 @@ fn engine_main(
                 let out = with(|e| Output {
                     stdout: std::mem::take(&mut e.stdout),
                     stderr: std::mem::take(&mut e.stderr),
-                    exit_code: e.exit_code,
+                    exit_code: e.exit_code.or(e.exit_hint),
                 });
                 let _ = reply.send(out);
             }
@@ -714,6 +718,7 @@ fn init(id: RealmId, config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtim
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: None,
+                exit_hint: None,
                 current: None,
                 binding_class: binding_class(),
                 continuations: HashMap::new(),
@@ -754,7 +759,7 @@ fn init(id: RealmId, config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtim
         // Node's names for the host platform and architecture.
         let platform = match std::env::consts::OS { "macos" => "darwin", other => other };
         let arch = match std::env::consts::ARCH { "aarch64" => "arm64", "x86_64" => "x64", other => other };
-        let settings = json!({ "env": config.env, "argv": config.argv, "version": env!("CARGO_PKG_VERSION"), "platform": platform, "arch": arch }).to_string();
+        let settings = json!({ "env": config.env, "argv": config.argv, "version": env!("CARGO_PKG_VERSION"), "node": NODE_VERSION.trim(), "platform": platform, "arch": arch }).to_string();
         let settings = RootedValue::new(ctx, string_value(ctx, &settings));
         let prelude_fn = JSValueToObject(ctx, prelude.get(), null_mut());
         let api = enter(None, || call(ctx, prelude_fn, &[host.get(), host_async_fn.get(), settings.get(), helpers.get()])).map_err(fail)?;
@@ -1457,6 +1462,11 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
                 Err(err) => node_error(err, "chdir", &dir, None),
             }
         }
+        "process.exit_code" => {
+            let code = args.get("code").and_then(Value::as_i64).map(|code| code as i32);
+            with(|e| e.exit_hint = code);
+            OpResult::Json(Value::Null)
+        }
         "process.exit" => {
             let code = args.get("code").and_then(Value::as_i64).unwrap_or(0) as i32;
             with(|e| e.exit_code = Some(code));
@@ -1629,6 +1639,11 @@ async fn fs_op(fs: Fs, op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResul
                 }
                 _ => OpResult::Bytes(data),
             },
+            // Node opens a directory fine and fails reading it, with no path.
+            Err(e) if e.errno.code() == "EISDIR" => OpResult::Error(json!({
+                "code": "EISDIR", "errno": -e.errno.number(), "syscall": "read",
+                "message": format!("EISDIR: {}, read", e.errno.uv_message()),
+            })),
             Err(e) => node_error(e, "open", &path, None),
         },
         "fs.writeFile" => {

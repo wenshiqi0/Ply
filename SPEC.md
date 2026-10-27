@@ -20,7 +20,7 @@ RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南
 - 插件只见能力，不见调度：运行时不提供 `fiber`、`ctx` 全局和 `ply:lifecycle`，句柄没有 `.loaded`；插件之间通过输入、返回值和持有的值（如会话 id）建立关系，不按调用方判定归属。
 - 入口可用插件目录内的相对 import 拆分模块。同一插件的模块共享一个 realm 和模块缓存，不能因拆文件改变 fiber 归属、状态或加载时序。ES 模块的导入是 live binding：每次使用都读取导出模块当时的值，循环导入按 Node 语义工作。
 - 内置插件在二进制中嵌入完整模块目录；它们的 npm 依赖处于开发模式（[RFC 0013](docs/rfcs/0013-resources-and-npm.md) 第一步）：运行时以只读方式读取仓库根目录的 `node_modules`（路径在编译期确定，挂载在代码命名空间的 `/ply/node_modules`），cargo 构建前必须先 `npm ci`，打包模式实现前二进制不能脱离仓库运行。构建和运行都不启动外部 Node；目录插件、脚本与内置插件使用同一模块解析规则。
-- 模块解析按 Node：裸模块名从导入方目录逐级向上查找 `node_modules`，读取 `exports`（条件依次为 `node`、`import`/`require`、`default`），否则用 `main` 与 `index`；`.js` 按最近 package.json 的 `type` 区分 ESM/CJS，没有 `type` 时按 Node 22 的语法检测；支持 CJS（`require`、`module`、`exports`、`__filename`、`__dirname`）、ESM 导入 CJS（`default` 为 `module.exports`）、require 不含顶层 await 的 ESM、JSON。插件内的相对导入不越出插件目录，包内的相对导入不越出该包；目录插件和脚本祖先目录中的 `node_modules` 以只读方式挂载；未实现的内置模块报 `ERR_UNKNOWN_BUILTIN_MODULE`。转译结果按路径与内容哈希在进程内缓存。
+- 模块解析按 Node：裸模块名从导入方目录逐级向上查找 `node_modules`，读取 `exports`（条件为 `node`、`import`/`require`、`module-sync`、`default`，按包中列出的顺序匹配；不匹配 `node-addons`，等同 `node --no-addons`），否则用 `main` 与 `index`；`.js` 按最近 package.json 的 `type` 区分 ESM/CJS，没有 `type` 时按 Node 22 的语法检测；支持 CJS（`require`、`module`、`exports`、`__filename`、`__dirname`）、ESM 导入 CJS（`default` 为 `module.exports`）、require 不含顶层 await 的 ESM（有默认导出时返回的对象带 `__esModule: true`）、JSON（ES 模块导入时必须带 `with { type: "json" }`）。插件内的相对导入不越出插件目录，包内的相对导入不越出该包；目录插件和脚本祖先目录中的 `node_modules` 以只读方式挂载；未实现的内置模块报 `ERR_UNKNOWN_BUILTIN_MODULE`。转译结果按路径与内容哈希在进程内缓存。
 - 运行时边界：Ply 只提供资源能力（进程环境、进程执行、文件、网络、终端）与内核能力（`ply:plugins`、`ply:events`、`ply:commands`）。外部代码依赖经 node 模块解析从 node_modules 引入，开发模式直接读取 node_modules，打包时随应用嵌入；存储由插件在 fs 上实现，跨进程互斥使用 fs 的文件锁扩展（OS 排他咨询锁，跨进程有效，关闭句柄或进程退出时释放）；密钥通过环境变量注入。`ply:models` 已删除；`ply:memory-store`、`ply:checkpoints`、`ply:http`、`ply:skills`、`ply:markdown` 按 [RFC 0013](docs/rfcs/0013-resources-and-npm.md) 的后续步骤迁出，迁移完成前按各自现行契约运行。
 - 签名读取支持插件目录内相对文件中的具名类型导入与别名；递归类型保守收敛为 unknown。未支持的 TypeScript 高级类型不得声称具备运行时参数校验。
 - `main.ts` 保留入口与装配，`types.ts` 声明输入、输出、onLoad 参数和公共导出；较复杂的策略、存储、渲染、统计等放入职责模块。
@@ -28,8 +28,9 @@ RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南
 - 具名句柄由 `import { context, agent, memory } from "ply:plugins"` 引入；动态目录由默认 import 引入。插件的 onLoad 在它具名导入的插件完成 onLoad 后才开始；被导入的插件加载失败时依赖方加载失败，相互导入成环报错；默认导入不建立顺序。对句柄的调用和方法调用等待目标加载完成；`events.on` 等待事件被声明或所属插件 onLoad 结束。
 - `ply:commands` 在 onLoad 注册宿主入口，不扩大模型工具权限。默认工具由 context 收集，agent 按授权收窄。
 - Node 风格 API 由 JSC shim 提供；编辑器的 Node 类型不意味着支持完整 Node 运行时。支持范围以运行时及其测试为准。`process.platform`、`process.arch` 与 `os` 报告宿主的真实平台。
-- Web 全局 `fetch`、`Headers`、`Request`、`Response`、`URL`、`URLSearchParams`、`AbortController`、`AbortSignal`、`ReadableStream`、`FormData`、`EventTarget`、`Event`、`DOMException` 由运行时原生实现：URL 用 Rust `url` crate 按 WHATWG 标准解析，fetch 走 Rust HTTP/TLS，只支持 http/https，重定向到其他源时去掉凭据头，请求体和累计响应体各限 16 MiB，网络失败为 `TypeError: fetch failed`；`AbortSignal` 中止得到它的 reason，所属调用被取消时得到 AbortError（`ERR_PLY_CANCELLED`）。FormData 只保存字符串，不支持 multipart 请求体；不支持 byte stream。
+- Web 全局 `fetch`、`Headers`、`Request`、`Response`、`URL`、`URLSearchParams`、`AbortController`、`AbortSignal`、`ReadableStream`、`FormData`、`EventTarget`、`Event`、`DOMException`、`structuredClone` 由运行时原生实现：URL 用 Rust `url` crate 按 WHATWG 标准解析，fetch 走 Rust HTTP/TLS，只支持 http/https，重定向到其他源时去掉凭据头，请求体和累计响应体各限 16 MiB，网络失败为 `TypeError: fetch failed`；`AbortSignal` 中止得到它的 reason，所属调用被取消时得到 AbortError（`ERR_PLY_CANCELLED`）。FormData 只保存字符串，不支持 multipart 请求体；不支持 byte stream。
 - Ply 运行时以 Node 为基线，可以作为 Node 的超集：已提供的 Node API 遵循 Node 语义；Node 缺少的资源能力（如文件锁）作为扩展加在对应的 Node 对象上，不另起 `ply:` 模块。
+- 对齐的 Node 版本只在根目录 `.node-version` 定义一处（当前 24.14.0），`process.version`、CI 的 Node 和兼容用例都取自它（[RFC 0014](docs/rfcs/0014-node-compat-suite.md)）。已提供的 Node API 由 `tests/node/<类别>/` 的用例保障：期望值由该版本的 Node 录制、CI 复核，Ply 用 `ply run` 跑同一批用例比对。只有 Ply 的进程模型与沙箱（pid、argv[0]、精选环境、`HOME` 与临时目录、挂载、无原生扩展、插件根与包边界）可以造成差异，这类用例另有 `.ply.expected`，并在用例开头用 `// ply-divergence:` 写明理由。
 
 ## SPEC-TYPES：类型与静态检查
 
@@ -38,6 +39,7 @@ RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南
 - 已知插件句柄提供具体参数与返回类型；动态插件和外部数据使用 unknown，经校验或明确的类型收窄后使用。
 - memory 的输入使用 action 区分联合：记住/查找用 key，遗忘只用 id + expected_version；错误组合必须在类型层与运行时均被拒绝。
 - lint 不接受 any、忽略类型错误或跳过 Ply 自己的声明检查；类型契约的正反例放入 `type-tests/`。
+- `@types/node` 的主版本与 `.node-version` 相同、次版本不高于它，由 `npm run check` 核对。
 - 依赖和版本锁在根 `package-lock.json`；开发和 CI 均运行 `npm ci --ignore-scripts`、`npm run check`。check 包含插件可见面检查：插件、示例、SDK 和运行时 prelude 中不出现 fiber、`ply:lifecycle`、全局 `ctx`、`.loaded` 或已删除的 `ply:models`。运行时的 npm 依赖写在根 `dependencies`（pi-ai 锁定 0.82.1）。
 
 ## SPEC-FIBER：归属、错误与清理
@@ -120,6 +122,7 @@ Ply 的当前范围是 macOS 上的 Rust/JSC agent harness：CLI、脚本和 MCP
 | 上下文 | Rules/Project/Extensions/State/Reference 中央排序，固定前缀、会话隔离、增量状态；工具快照、预算、完整交互压缩及失败恢复 | [context 集成](crates/ply-kernel/tests/context.rs)、[agent 集成](crates/ply-kernel/tests/agent.rs) |
 | 失败恢复 | 私有原子快照、排他恢复、agent 格式 4 / context 格式 2，拒绝旧版本；恢复对话、权限、累计配额、报告状态及历史用量；tools_pending 禁止自动重放 | [agent 恢复用例](crates/ply-kernel/tests/agent.rs)、[宿主快照](crates/ply-jsc/src/checkpoints.rs) |
 | 模型运行时 | agent 的 pi.ts 经 npm pi-ai 与运行时 fetch 接入 DeepSeek/MiMo、SSE 流读取、reasoning/tool/usage 透传、并发隔离；密钥来自插件环境，模型 shell 看不到；模型调用无需外部 Node | [本地 HTTP 集成](crates/ply-jsc/tests/model_runtime.rs)、[密钥与 bash](crates/ply-kernel/tests/kernel.rs)、[模型选择](crates/ply-cli/src/main.rs) |
+| Node 兼容用例 | 按类别（modules、path、fs、buffer、events、util、process、os、timers、child_process、web）保障已提供的 Node API；期望值由 `.node-version` 的 Node 录制、CI 复核；有意差异登记理由 | [用例](tests/node/)、[Ply 比对](crates/ply-cli/tests/node_compat.rs)、[录制与复核](scripts/node-compat.mjs) |
 | 模块与 Web 全局 | node_modules 逐级查找、exports 条件与模式、CJS/ESM 互操作、JSON、语法检测、包边界、live binding；真实 pi-ai 依赖图加载；URL/Headers/流、fetch 的 JSON、重定向去凭据、流读取与 clone、AbortSignal、调用取消、体积上限 | [解析](crates/ply-jsc/tests/node_modules.rs)、[Web 全局](crates/ply-jsc/tests/web.rs)、[解析实现](crates/ply-jsc/src/resolve.rs)、[Web 实现](crates/ply-jsc/src/web.js) |
 | 用量与事件 | agent.model_call_started/agent.model_call 事件配对、自身/子树汇总、缺失用量标记、按 token 加权缓存命中率；JSONL 写 Spawn/Exit/Cleanup/Plugin | [agent 集成](crates/ply-kernel/tests/agent.rs)、[事件实现](crates/ply-core/src/fiber.rs) |
 
@@ -128,6 +131,7 @@ Ply 的当前范围是 macOS 上的 Rust/JSC agent harness：CLI、脚本和 MCP
 ```bash
 npm ci --ignore-scripts --registry=https://registry.npmjs.org
 npm run check
+npm run compat:check
 cargo test --workspace --locked --offline
 cargo build -p ply-cli --locked --offline
 ```

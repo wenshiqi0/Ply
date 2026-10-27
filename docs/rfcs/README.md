@@ -16,4 +16,5 @@
 | [0010-jev](0010-jev.md) | 已实现 |
 | [0011 插件模块与类型](0011-plugin-modules-and-types.md) | 已实现 |
 | [0012 插件只见能力](0012-capabilities-not-scheduling.md) | 已实现 |
-| [0013 运行时只提供资源](0013-resources-and-npm.md) | 提议 |
+| [0013 运行时只提供资源](0013-resources-and-npm.md) | 第一步已实现 |
+| [0014 Node 兼容用例集](0014-node-compat-suite.md) | 已实现 |

@@ -140,7 +140,12 @@ impl Resolver<'_> {
         let manifest = self.manifest(package).await;
         let missing = || fail("ERR_MODULE_NOT_FOUND", format!("Cannot find module '{spec}' imported from {shown}"));
         if let Some(exports) = manifest.as_ref().and_then(|m| m.get("exports")).filter(|e| !matches!(e, Json::Null)) {
-            let conditions: &[&str] = match kind { Kind::Import => &["node", "import"], Kind::Require => &["node", "require"] };
+            // Node 24's defaults, except "node-addons": Ply loads no native
+            // addons, so it resolves like `node --no-addons` (RFC 0014).
+            let conditions: &[&str] = match kind {
+                Kind::Import => &["node", "import", "module-sync"],
+                Kind::Require => &["node", "require", "module-sync"],
+            };
             let file = exports_resolve(package, subpath, exports, conditions)?;
             return if self.code.is_file(&file).await { Ok(file) } else { Err(missing()) };
         }

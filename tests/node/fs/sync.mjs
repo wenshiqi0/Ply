@@ -1,0 +1,27 @@
+// Synchronous fs on the working directory.
+import fs from "node:fs";
+const show = (label, value) => console.log(label, JSON.stringify(value));
+fs.writeFileSync("a.txt", "hello");
+fs.appendFileSync("a.txt", " world");
+show("read", { utf8: fs.readFileSync("a.txt", "utf8"), options: fs.readFileSync("a.txt", { encoding: "utf8" }), buffer: [...fs.readFileSync("a.txt").subarray(0, 3)] });
+show("mkdir recursive", fs.mkdirSync("d/e/f", { recursive: true }));
+show("mkdir recursive again", fs.mkdirSync("d/e/f", { recursive: true }) ?? null);
+fs.writeFileSync("d/one.txt", "1");
+fs.writeFileSync("d/two.txt", new Uint8Array([50]));
+show("readdir", fs.readdirSync("d").sort());
+show("dirents", fs.readdirSync("d", { withFileTypes: true }).map((e) => [e.name, e.isFile(), e.isDirectory()]).sort());
+const stat = fs.statSync("a.txt");
+show("stat", { file: stat.isFile(), dir: stat.isDirectory(), size: stat.size, mtime: stat.mtime instanceof Date, lstat: fs.lstatSync("d").isDirectory() });
+show("exists", [fs.existsSync("a.txt"), fs.existsSync("nope")]);
+fs.renameSync("d/one.txt", "d/uno.txt");
+fs.copyFileSync("d/two.txt", "d/dos.txt");
+show("after rename and copy", { list: fs.readdirSync("d").sort(), copied: fs.readFileSync("d/dos.txt", "utf8") });
+fs.accessSync("a.txt");
+show("realpath", fs.realpathSync("d/../a.txt") === process.cwd() + "/a.txt");
+const temp = fs.mkdtempSync("tmp-");
+show("mkdtemp", { prefixed: temp.startsWith("tmp-"), length: temp.length, isDir: fs.statSync(temp).isDirectory() });
+fs.unlinkSync("d/dos.txt");
+fs.rmdirSync(temp);
+fs.rmSync("d", { recursive: true });
+fs.rmSync("missing", { force: true });
+show("after removal", ["d", temp, "a.txt"].map((p) => fs.existsSync(p)));

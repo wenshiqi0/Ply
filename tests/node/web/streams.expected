@@ -1,0 +1,9 @@
+locked true
+reads [{"value":"a","done":false},{"value":"b","done":false},{"done":true},{"done":true}]
+released false
+pull and iterate [1,2,3]
+tee [[1,2],[1,2]]
+cancel {"cancelled":"stop","after":{"done":true}}
+error "TypeError broken"
+break "first"
+double lock "TypeError"

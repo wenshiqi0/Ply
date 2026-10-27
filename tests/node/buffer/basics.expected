@@ -1,0 +1,9 @@
+utf8 {"length":10,"byteLength":10,"text":"héllo ✓","utf8":"héllo ✓","dash":"héllo ✓"}
+hex {"to":"68c3a96c6c6f20e29c93","from":"hello"}
+base64 {"to":"YW55IGNhcm5hbCBwbGVhcw==","from":"hello"}
+from array {"type":"Buffer","data":[104,105,0,255]}
+alloc {"zero":[0,0,0],"fill":[7,7,7],"unsafe":4}
+concat {"joined":"abcd","limited":"abc"}
+equals [true,false]
+isBuffer [true,false,true]
+toJSON "{\"type\":\"Buffer\",\"data\":[104,105]}"

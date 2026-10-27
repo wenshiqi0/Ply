@@ -1,0 +1,5 @@
+format ["a and b","42.5|42|1.5","{\"a\":[1]}","%s x","extra 1 two null","undefined","1 2","%s"]
+inspect primitives ["'s'","1","-0","null","undefined","true","10n","Symbol(x)"]
+inspect objects ["{ a: 1, b: 'two', c: [ 1, 2 ] }","[]","{}","[ 1, [ 2, [ 3, [Array] ] ] ]","{ a: { b: { c: [Object] } } }"]
+inspect functions ["[Function: named]","[Function (anonymous)]","[class K]"]
+console.log formatting ["{ a: 1 }","x { y: [ 1 ] }"]

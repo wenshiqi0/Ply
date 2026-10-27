@@ -1,0 +1,4 @@
+EOL "\n"
+platform {"platform":true,"type":true,"arch":true}
+tmpdir "/tmp"
+shapes {"cpus":true,"totalmem":"number","freemem":"number","hostname":"string","release":"string"}

@@ -5,12 +5,15 @@
     "typecheck": "tsc --noEmit && node scripts/check-sdk-types.mjs",
     "lint": "eslint plugins packages/sdk examples/plugins type-tests --max-warnings 0",
     "check:docs": "node scripts/check-docs.mjs",
-    "check": "npm run typecheck && npm run lint && npm run check:docs && npm run check:surface",
+    "check": "npm run typecheck && npm run lint && npm run check:docs && npm run check:surface && npm run compat:lint",
+    "compat:lint": "node scripts/node-compat.mjs lint",
+    "compat:record": "node scripts/node-compat.mjs record",
+    "compat:check": "node scripts/node-compat.mjs check",
     "check:surface": "node scripts/check-surface.mjs"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@types/node": "22.18.12",
+    "@types/node": "24.13.6",
     "eslint": "10.13.0",
     "typescript": "5.9.3",
     "typescript-eslint": "8.72.1"

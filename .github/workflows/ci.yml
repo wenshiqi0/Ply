@@ -17,12 +17,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The Node version Ply aligns with (RFC 0014); compat expectations
+      # are re-recorded with it.
       - uses: actions/setup-node@v5
         with:
-          node-version: 24
+          node-version-file: .node-version
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run check
+      - run: npm run compat:check
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

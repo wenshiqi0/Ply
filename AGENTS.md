@@ -7,4 +7,5 @@
 - 公共插件类型从 `packages/sdk` 的 `ply:plugins` 暴露。类型文件也参与严格检查，不用 `any`、`@ts-ignore` 或跳过声明检查消除诊断；根 tsconfig 的 `skipLibCheck` 只为 `node_modules` 的第三方声明而开，`packages/sdk` 的声明由 `scripts/check-sdk-types.mjs` 严格检查。
 - 完成前运行 `npm ci --ignore-scripts`、`npm run check` 和相关 Rust 测试。涉及内置模块加载的重构运行完整 workspace 测试，包括 CLI、MCP、真实 PTY 与目录插件。
 - 克隆后运行 `git config core.hooksPath .githooks` 启用提交钩子：对已暂存的 TS/JS 自动 `eslint --fix` 并重新暂存，无法自动修复的错误会阻止提交。
+- 改变已提供的 Node API 行为时，同步 `tests/node/` 的用例，并用 `.node-version` 指定的 Node 运行 `npm run compat:record`；有意差异写 `.ply.expected` 并在用例开头登记理由。
 - 自动化测试使用 fixture / 本地 HTTP；真实供应商调用另行取得用户授权并保留轨迹。

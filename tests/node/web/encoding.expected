@@ -1,0 +1,6 @@
+encode [195,169,226,156,147,240,159,152,128]
+decode ["é✓😀","�A","utf-8"]
+structuredClone {"equal":true,"distinct":true}
+structuredClone types {"date":0,"map":"one","set":true,"re":"/x/gi","big":"bigint","undef":true}
+structuredClone cycle true
+function "DataCloneError"

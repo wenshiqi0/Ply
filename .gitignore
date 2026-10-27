@@ -5,6 +5,8 @@
 out/
 .DS_Store
 node_modules/
+# Package fixtures of the Node compatibility cases (RFC 0014).
+!tests/node/**/node_modules/
 
 .env
 .env.*

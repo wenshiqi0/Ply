@@ -23,6 +23,19 @@ cargo test --workspace --locked --offline
 - 自动化测试只用 fixture 和本地 HTTP；真实供应商调用需要另行取得授权并保留轨迹。
 - [GitHub Actions](../.github/workflows/ci.yml) 在 macOS runner 上对每次推送到 main 和每个 pull request 运行同样的检查（`npm ci`、`npm run check`、`cargo test --workspace --locked`）。
 
+## Node 兼容用例
+
+Ply 对齐的 Node 版本写在根目录的 `.node-version`（当前 24.14.0），`process.version` 和 CI 的 Node 都取自它（[RFC 0014](rfcs/0014-node-compat-suite.md)）。`tests/node/<类别>/` 里每个 `<名称>.mjs` 是一个用例，`<名称>.expected` 是这个版本的 Node 打印的结果；`cargo test -p ply-cli --test node_compat` 用 `ply run` 跑同一批用例并逐个比对。
+
+```bash
+npm run compat:record
+npm run compat:check
+```
+
+- 录制和复核只接受 `.node-version` 指定的 Node，例如用 `nvm use` 切换；CI 每次都会复核。
+- 改变已提供的 Node API 行为时，补充或修改对应类别的用例，再重新录制；不要通过改期望值让 Ply 通过。
+- Ply 有意不同于 Node 的用例另写 `<名称>.ply.expected`，并在用例第一行写 `// ply-divergence: <理由>`；只有进程模型与沙箱（pid、argv[0]、环境、`HOME`、挂载、原生扩展、插件根与包边界）可以造成差异。`npm run check` 拒绝没有理由的差异，并核对 `@types/node` 与 `.node-version` 一致。
+
 ## 提交钩子
 
 克隆后启用：

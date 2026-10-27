@@ -1,0 +1,10 @@
+get {"accept":"a, b","cookie":"x=1, y=2","custom":"padded","missing":null}
+setCookie ["x=1","y=2"]
+entries [["accept","a, b"],["content-type","text/plain"],["set-cookie","x=1"],["set-cookie","y=2"],["x-custom","padded"]]
+keys and values [["accept","content-type","set-cookie","set-cookie","x-custom"],["a, b","text/plain","x=1","y=2","padded"]]
+has [false,true]
+from pairs [["a","1, 2"]]
+from headers 4
+bad "TypeError"
+bad "TypeError"
+forEach ["content-type","set-cookie","set-cookie","x-custom"]

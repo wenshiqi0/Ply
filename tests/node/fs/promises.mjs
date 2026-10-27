@@ -1,0 +1,21 @@
+// fs/promises and the callback API.
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+const show = (label, value) => console.log(label, JSON.stringify(value));
+show("same object", fs.promises === fsp);
+await fsp.writeFile("p.txt", "promised");
+await fsp.appendFile("p.txt", "!");
+show("read", await fsp.readFile("p.txt", "utf8"));
+await fsp.mkdir("pd/x", { recursive: true });
+await fsp.copyFile("p.txt", "pd/copy.txt");
+await fsp.rename("pd/copy.txt", "pd/moved.txt");
+show("readdir", (await fsp.readdir("pd")).sort());
+show("stat", { size: (await fsp.stat("p.txt")).size, dir: (await fsp.lstat("pd")).isDirectory() });
+show("access", await fsp.access("p.txt") ?? null);
+show("realpath", (await fsp.realpath("pd/../p.txt")) === process.cwd() + "/p.txt");
+await fsp.unlink("pd/moved.txt");
+await fsp.rmdir("pd/x");
+await fsp.rm("pd", { recursive: true });
+show("callback", await new Promise((resolve) => fs.readFile("p.txt", "utf8", (error, data) => resolve([error, data]))));
+show("callback error", await new Promise((resolve) => fs.readFile("nope.txt", (error) => resolve(error.code))));
+show("exists callback", await new Promise((resolve) => fs.exists("p.txt", resolve)));

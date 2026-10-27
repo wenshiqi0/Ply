@@ -1,0 +1,11 @@
+before {"aborted":false,"reason":null}
+after {"aborted":true,"name":"AbortError","message":"This operation was aborted","code":20,"isError":true,"isDOMException":true,"seen":[["listener","abort",true],["onabort"]]}
+throwIfAborted "AbortError"
+custom reason 42
+AbortSignal.abort [true,"why"]
+any [true,"b first"]
+timeout {"name":"TimeoutError","code":23}
+constructor "TypeError"
+EventTarget 12
+Event {"type":"y","defaultPrevented":true,"dispatched":false}
+DOMException [9,"Error",""]

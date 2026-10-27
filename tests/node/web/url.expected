@@ -1,0 +1,20 @@
+parse https://user:pw@EXAMPLE.com:443/a/./b/../c?x=1#f {"href":"https://user:pw@example.com/a/c?x=1#f","origin":"https://example.com","protocol":"https:","username":"user","password":"pw","host":"example.com","hostname":"example.com","port":"","pathname":"/a/c","search":"?x=1","hash":"#f"}
+parse ../d?q {"href":"http://h/a/d?q","origin":"http://h","protocol":"http:","username":"","password":"","host":"h","hostname":"h","port":"","pathname":"/a/d","search":"?q","hash":""}
+parse //other/x {"href":"https://other/x","origin":"https://other","protocol":"https:","username":"","password":"","host":"other","hostname":"other","port":"","pathname":"/x","search":"","hash":""}
+parse file:///tmp/a b {"href":"file:///tmp/a%20b","origin":"null","protocol":"file:","username":"","password":"","host":"","hostname":"","port":"","pathname":"/tmp/a%20b","search":"","hash":""}
+parse http://[::1]:8080/ {"href":"http://[::1]:8080/","origin":"http://[::1]:8080","protocol":"http:","username":"","password":"","host":"[::1]:8080","hostname":"[::1]","port":"8080","pathname":"/","search":"","hash":""}
+parse https://xn--fsq.com/ {"href":"https://xn--fsq.com/","origin":"https://xn--fsq.com","protocol":"https:","username":"","password":"","host":"xn--fsq.com","hostname":"xn--fsq.com","port":"","pathname":"/","search":"","hash":""}
+parse https://例え.jp/パス {"href":"https://xn--r8jz45g.jp/%E3%83%91%E3%82%B9","origin":"https://xn--r8jz45g.jp","protocol":"https:","username":"","password":"","host":"xn--r8jz45g.jp","hostname":"xn--r8jz45g.jp","port":"","pathname":"/%E3%83%91%E3%82%B9","search":"","hash":""}
+parse mailto:someone@example.com {"href":"mailto:someone@example.com","origin":"null","protocol":"mailto:","username":"","password":"","host":"","hostname":"","port":"","pathname":"someone@example.com","search":"","hash":""}
+parse blob:https://a/b {"href":"blob:https://a/b","origin":"https://a","protocol":"blob:","username":"","password":"","host":"","hostname":"","port":"","pathname":"https://a/b","search":"","hash":""}
+parse http://h:65536 "TypeError ERR_INVALID_URL"
+parse not a url "TypeError ERR_INVALID_URL"
+parse http://a b "TypeError ERR_INVALID_URL"
+canParse [true,false,true]
+setters "http://example.org:8080/q%20r?b=2&c=3+4"
+search updates params [["z","9"]]
+ignored setters "http://example.org:8080/q%20r?z=9"
+params {"get":"1","all":["1","2"],"b":" x y","empty":"","flag":"","missing":null,"has":true,"size":5}
+params mutated "a=3&b=+x+y&empty=&flag="
+params init ["x=1&y=%C3%A4+%26%3D","k=v&k=w","lead=1"]
+toJSON "{\"u\":\"https://h/x\"}"

@@ -188,7 +188,7 @@
     if (s.includes("'") && !s.includes('"')) return `"${s}"`;
     return "'" + s.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n") + "'";
   }
-  function inspect(v, opts) { return fmt(v, 0, [], true, (opts && opts.depth) ?? 2); }
+  function inspect(v, opts) { return fmt(v, 0, [], false, (opts && opts.depth) ?? 2); }
   function fmt(v, depth, seen, top, maxDepth) {
     switch (typeof v) {
       case "string": return top ? v : quote(v);
@@ -318,7 +318,12 @@
   const queueMicrotask = G.queueMicrotask ?? ((fn) => { Promise.resolve().then(fn); });
 
   // --------------------------------------------------------------- process
-  const env = Object.assign(Object.create(null), config.env);
+  // Like Node's process.env, values become strings when assigned.
+  const env = new Proxy(Object.assign(Object.create(null), config.env), {
+    set: (target, key, value) => { target[key] = typeof key === "symbol" ? value : String(value); return true; },
+    defineProperty: (target, key, d) => Reflect.defineProperty(target, key, "value" in d && typeof key !== "symbol" ? { ...d, value: String(d.value) } : d),
+  });
+  let exitCode;
   const process = {
     env,
     argv: ["ply", ...config.argv],
@@ -329,10 +334,12 @@
     pid: 1,
     ppid: 0,
     title: "ply",
-    version: "v22.0.0",
-    versions: { node: "22.0.0", ply: config.version },
+    version: "v" + config.node,
+    versions: { node: config.node, ply: config.version },
     release: { name: "node" },
-    exitCode: undefined,
+    // The status when the script ends without process.exit.
+    get exitCode() { return exitCode; },
+    set exitCode(code) { exitCode = code; op("process.exit_code", { code: code ?? null }); },
     cwd: () => op("process.cwd"),
     chdir: (dir) => { op("process.chdir", { dir: String(dir) }); },
     exit(code) {
@@ -380,6 +387,7 @@
     isAbsolute: (p) => p.startsWith("/"),
     dirname: (p) => op("path.dirname", { path: p }),
     basename(p, ext) {
+      if (ext !== undefined && ext !== "" && ext === p) return "";
       const b = op("path.basename", { path: p });
       return ext && b.endsWith(ext) && b !== ext ? b.slice(0, -ext.length) : b;
     },
@@ -398,7 +406,11 @@
       const dir = p.includes("/") ? path.dirname(p) : "";
       return { root, dir, base, ext, name: ext ? base.slice(0, -ext.length) : base };
     },
-    format: (o) => (o.dir ? o.dir + "/" : o.root ?? "") + (o.base ?? (o.name ?? "") + (o.ext ?? "")),
+    format(o) {
+      const dir = o.dir || o.root;
+      const base = o.base || `${o.name || ""}${o.ext ? (o.ext[0] === "." ? "" : ".") + o.ext : ""}`;
+      return !dir ? base : dir === o.root ? dir + base : `${dir}/${base}`;
+    },
   };
   path.posix = path;
 
@@ -450,6 +462,18 @@
   }
   const sfs = makeFs(op);
   const fsp = makeFs(opAsync);
+  // What a recursive mkdir returns in Node: the first directory it creates,
+  // in the form the path was given.
+  function firstMissing(p, exists) {
+    let first;
+    for (let dir = String(p); !exists(dir);) {
+      first = dir;
+      const up = path.dirname(dir);
+      if (up === dir) break;
+      dir = up;
+    }
+    return first;
+  }
   const dirents = (list, p, o) => (opts(o).withFileTypes ? list.map((e) => new Dirent(e, p)) : list.map((e) => e.name));
   const fsSync = {
     readFileSync: (p, o) => asResult(sfs.readFile(p, o), o),
@@ -458,7 +482,11 @@
     existsSync: (p) => { try { return sfs.exists(p); } catch { return false; } },
     statSync: (p, o) => { try { return new Stats(sfs.stat(p)); } catch (e) { if (o && o.throwIfNoEntry === false && e.code === "ENOENT") return undefined; throw e; } },
     readdirSync: (p, o) => dirents(sfs.readdir(p), String(p), o),
-    mkdirSync: (p, o) => { sfs.mkdir(p, o); return opts(o).recursive ? path.resolve(String(p)) : undefined; },
+    mkdirSync: (p, o) => {
+      const first = opts(o).recursive ? firstMissing(p, fsSync.existsSync) : undefined;
+      sfs.mkdir(p, o);
+      return first;
+    },
     rmSync: (p, o) => { sfs.rm(p, o); },
     rmdirSync: (p, o) => { sfs.rmdir(p, o); },
     unlinkSync: (p) => { sfs.unlink(p); },
@@ -479,7 +507,11 @@
     appendFile: async (p, d, o) => { await fsp.appendFile(p, d, o); },
     stat: async (p) => new Stats(await fsp.stat(p)),
     readdir: async (p, o) => dirents(await fsp.readdir(p), String(p), o),
-    mkdir: async (p, o) => { await fsp.mkdir(p, o); return opts(o).recursive ? path.resolve(String(p)) : undefined; },
+    mkdir: async (p, o) => {
+      const first = opts(o).recursive ? firstMissing(p, fsSync.existsSync) : undefined;
+      await fsp.mkdir(p, o);
+      return first;
+    },
     rm: async (p, o) => { await fsp.rm(p, o); },
     rmdir: async (p, o) => { await fsp.rmdir(p, o); },
     unlink: async (p) => { await fsp.unlink(p); },
@@ -507,6 +539,42 @@
   callbackApi.exists = (p, cb) => { promises.access(p).then(() => cb(true), () => cb(false)); };
   const constants = { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1 };
   const fs = { ...callbackApi, ...fsSync, promises, constants, Stats, Dirent };
+
+  // util.isDeepStrictEqual: same prototype and tag, own enumerable keys,
+  // Object.is for primitives, contents of dates, regexps, errors, views,
+  // maps and sets; cycles compare by the pairing seen so far.
+  function deepEqual(a, b, memo) {
+    if (Object.is(a, b)) return true;
+    if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+    const tag = Object.prototype.toString;
+    if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b) || tag.call(a) !== tag.call(b)) return false;
+    if (memo.get(a) === b) return true;
+    memo.set(a, b);
+    if (a instanceof Date && a.getTime() !== b.getTime()) return false;
+    if (a instanceof RegExp && (String(a) !== String(b) || a.lastIndex !== b.lastIndex)) return false;
+    if (a instanceof Error && (a.name !== b.name || a.message !== b.message)) return false;
+    if ((a instanceof Number || a instanceof String || a instanceof Boolean) && !Object.is(a.valueOf(), b.valueOf())) return false;
+    if (a instanceof ArrayBuffer || ArrayBuffer.isView(a)) {
+      const bytes = (v) => (v instanceof ArrayBuffer ? new Uint8Array(v) : new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+      const [x, y] = [bytes(a), bytes(b)];
+      if (x.length !== y.length || x.some((n, i) => n !== y[i])) return false;
+    }
+    const isObject = (v) => typeof v === "object" && v !== null;
+    if (a instanceof Map) {
+      if (a.size !== b.size) return false;
+      for (const [k, v] of a) {
+        if (b.has(k) ? !deepEqual(v, b.get(k), memo) : !isObject(k) || ![...b].some(([k2, v2]) => deepEqual(k, k2, memo) && deepEqual(v, v2, memo))) return false;
+      }
+    }
+    if (a instanceof Set) {
+      if (a.size !== b.size) return false;
+      for (const v of a) if (!b.has(v) && (!isObject(v) || ![...b].some((w) => deepEqual(v, w, memo)))) return false;
+    }
+    const enumerable = Object.prototype.propertyIsEnumerable;
+    const keys = (o) => [...Object.keys(o), ...Object.getOwnPropertySymbols(o).filter((k) => enumerable.call(o, k))];
+    const [ka, kb] = [keys(a), keys(b)];
+    return ka.length === kb.length && ka.every((k) => enumerable.call(b, k) && deepEqual(a[k], b[k], memo));
+  }
 
   // ---------------------------------------------------------------- events
   class EventEmitter {
@@ -536,7 +604,7 @@
     format,
     inspect,
     promisify,
-    isDeepStrictEqual: (a, b) => jsonStringify(a) === jsonStringify(b),
+    isDeepStrictEqual: (a, b) => deepEqual(a, b, new Map()),
     types: { isPromise: (p) => p instanceof Promise, isDate: (d) => d instanceof Date, isRegExp: (r) => r instanceof RegExp },
     TextEncoder,
     TextDecoder,
@@ -741,7 +809,6 @@
   // fetch and the Web objects around it (RFC 0013), part of the environment
   // like Buffer; compiled once per process, evaluated per realm.
   Object.assign(G, compile(op("web.source"))(op, opAsync, plain));
-  if (!G.structuredClone) G.structuredClone = (v) => jsonParse(jsonStringify(v));
 
   // ---------------------------------------------------------------- modules
   const BUILTIN = {
@@ -863,7 +930,22 @@
       err.code = "ERR_REQUIRE_ASYNC_MODULE";
       throw err;
     }
-    return rec.exports;
+    // Node marks a namespace with a default export for transpiled callers.
+    if (!objectHasOwn(rec.exports, "default") || objectHasOwn(rec.exports, "__esModule")) return rec.exports;
+    if (!rec.marked) {
+      rec.marked = objectCreate(null);
+      objectDefineProperty(rec.marked, "__esModule", { value: true, enumerable: true });
+      for (const key of objectKeys(rec.exports)) objectDefineProperty(rec.marked, key, { enumerable: true, get: () => rec.exports[key] });
+    }
+    return rec.marked;
+  }
+  // An ES module import's `with { type }` must match what it loads.
+  function attributed(rec, spec, type) {
+    const fail = (code, message) => { throw objectAssign(new TypeError(message), { code }); };
+    if (type !== undefined && type !== "json") fail("ERR_IMPORT_ATTRIBUTE_UNSUPPORTED", `Import attribute "type" with value "${type}" is not supported`);
+    if (rec.format === "json" && type !== "json") fail("ERR_IMPORT_ATTRIBUTE_MISSING", `Module "${spec}" needs an import attribute of "type: json"`);
+    if (rec.format !== "json" && type === "json") fail("ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE", `Module "${spec}" is not of type "json"`);
+    return rec;
   }
   function load(spec, from, kind = "import") {
     const r = op("module.resolve", { spec, from, kind });
@@ -873,9 +955,9 @@
     const { format, code } = op("module.load", { id: r.id });
     rec = { format, done: Promise.resolve(), async: false };
     modules.set(r.id, rec);
-    const dynamicImport = (s) => {
+    const dynamicImport = (s, options) => {
       try {
-        const m = load(String(s), r.id);
+        const m = attributed(load(String(s), r.id), String(s), options?.with?.type);
         return m.done.then(() => namespaceOf(m));
       } catch (e) {
         return Promise.reject(e);
@@ -890,7 +972,7 @@
         const exportStar = (m) => {
           for (const key of objectKeys(m)) if (key !== "default" && !objectHasOwn(rec.exports, key)) exportOne(key, () => m[key]);
         };
-        const result = fn(rec.exports, (s) => namespaceOf(load(s, r.id)), dynamicImport, meta, exportOne, exportStar);
+        const result = fn(rec.exports, (s, type) => namespaceOf(attributed(load(s, r.id), s, type)), dynamicImport, meta, exportOne, exportStar);
         if (result && typeof result.then === "function") { rec.done = result; rec.async = true; }
       } else {
         const module = rec.module = { id: r.id, filename: r.id, path: r.dir, exports: {}, loaded: false, children: [], paths: [] };

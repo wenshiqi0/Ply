@@ -1,0 +1,9 @@
+exports {"esm":"esm-default","kind":"import","a":"sub-a","sync":"module-sync"}
+main {"cjs":["add","asyncValue","dirname","esm","filename","helper","json","self"],"mainPkg":"main without extension"}
+nearest {"root":"outer","sub":"inner"}
+esm-pkg/internal/x "ERR_PACKAGE_PATH_NOT_EXPORTED"
+esm-pkg/missing "ERR_PACKAGE_PATH_NOT_EXPORTED"
+missing-pkg "ERR_MODULE_NOT_FOUND"
+@scope/missing "ERR_MODULE_NOT_FOUND"
+node:nope "ERR_UNKNOWN_BUILTIN_MODULE"
+./missing.mjs "ERR_MODULE_NOT_FOUND"

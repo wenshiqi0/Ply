@@ -1,0 +1,6 @@
+execFileSync ["hi there\n",[120,10]]
+execSync "one\ntwo\n"
+execSync failure {"status":3,"error":true}
+execFile [null,"cb\n",""]
+exec failure [2,"out\n","err\n"]
+spawnSync {"status":4,"stdout":"spawned\n","signal":null}

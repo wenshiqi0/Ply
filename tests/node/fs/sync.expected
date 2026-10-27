@@ -1,0 +1,11 @@
+read {"utf8":"hello world","options":"hello world","buffer":[104,101,108]}
+mkdir recursive "d"
+mkdir recursive again null
+readdir ["e","one.txt","two.txt"]
+dirents [["e",false,true],["one.txt",true,false],["two.txt",true,false]]
+stat {"file":true,"dir":false,"size":11,"mtime":true,"lstat":true}
+exists [true,false]
+after rename and copy {"list":["dos.txt","e","two.txt","uno.txt"],"copied":"2"}
+realpath true
+mkdtemp {"prefixed":true,"length":10,"isDir":true}
+after removal [false,false,true]

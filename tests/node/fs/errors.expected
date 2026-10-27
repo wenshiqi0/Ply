@@ -1,0 +1,9 @@
+read missing {"code":"ENOENT","syscall":"open","path":"missing.txt","message":"ENOENT: no such file or directory, open 'missing.txt'","error":true}
+mkdir existing {"code":"EEXIST","syscall":"mkdir","path":"dir","message":"EEXIST: file already exists, mkdir 'dir'","error":true}
+read directory {"code":"EISDIR","syscall":"read","message":"EISDIR: illegal operation on a directory, read","error":true}
+readdir file {"code":"ENOTDIR","syscall":"scandir","path":"dir/file","message":"ENOTDIR: not a directory, scandir 'dir/file'","error":true}
+rmdir non-empty {"code":"ENOTEMPTY","syscall":"rmdir","path":"dir","message":"ENOTEMPTY: directory not empty, rmdir 'dir'","error":true}
+unlink missing {"code":"ENOENT","syscall":"unlink","path":"missing","message":"ENOENT: no such file or directory, unlink 'missing'","error":true}
+stat missing {"code":"ENOENT","syscall":"stat","path":"missing","message":"ENOENT: no such file or directory, stat 'missing'","error":true}
+file as directory {"code":"ENOTDIR","syscall":"open","path":"dir/file/child","message":"ENOTDIR: not a directory, open 'dir/file/child'","error":true}
+promise read missing {"code":"ENOENT","syscall":"open","path":"missing.txt","message":"ENOENT: no such file or directory, open 'missing.txt'","error":true}

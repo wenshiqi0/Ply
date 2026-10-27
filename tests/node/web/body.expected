@@ -1,0 +1,14 @@
+response {"status":201,"statusText":"Created","ok":true,"type":"text/plain;charset=UTF-8","used":false}
+text ["hello","hello",true]
+read twice "TypeError"
+json {"a":1}
+bytes [1,2,3]
+null body [null,"",200]
+Response.json {"status":202,"type":"application/json","body":"{\"ok\":true}"}
+redirect {"status":301,"location":"https://h/x"}
+status 199 "RangeError"
+status 600 "RangeError"
+form body {"type":"application/x-www-form-urlencoded;charset=UTF-8","text":"a=1"}
+request {"url":"https://h/p?q","method":"POST","type":"text/plain;charset=UTF-8","text":"data","signal":true,"redirect":"follow"}
+get body "TypeError"
+request copy "PUT"

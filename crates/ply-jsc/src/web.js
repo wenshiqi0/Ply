@@ -18,7 +18,7 @@
       super(message);
       Object.defineProperty(this, "name", { value: String(name), configurable: true, writable: true });
     }
-    get code() { return { AbortError: 20, TimeoutError: 23, NotSupportedError: 9, InvalidStateError: 11 }[this.name] ?? 0; }
+    get code() { return { AbortError: 20, TimeoutError: 23, NotSupportedError: 9, InvalidStateError: 11, DataCloneError: 25 }[this.name] ?? 0; }
   }
 
   class Event {
@@ -57,9 +57,7 @@
     dispatchEvent(event) {
       event.target = this;
       event.currentTarget = this;
-      const handler = this["on" + event.type];
       const entries = [...(this.#listeners.get(event.type) ?? [])];
-      if (typeof handler === "function") entries.unshift({ listener: handler, once: false });
       for (const { listener, once } of entries) {
         if (once) this.removeEventListener(event.type, listener);
         try {
@@ -80,10 +78,17 @@
   class AbortSignal extends EventTarget {
     #aborted = false;
     #reason = undefined;
+    #onabort = null;
+    #handler = null;
     constructor(key) {
       if (key !== KEY) throw new TypeError("Illegal constructor");
       super();
-      this.onabort = null;
+    }
+    // An event handler property is a listener from the first time it is set.
+    get onabort() { return this.#onabort; }
+    set onabort(fn) {
+      this.#onabort = typeof fn === "function" ? fn : null;
+      if (this.#onabort && !this.#handler) this.addEventListener("abort", this.#handler = (event) => this.#onabort?.call(this, event));
     }
     get aborted() { return this.#aborted; }
     get reason() { return this.#reason; }
@@ -599,6 +604,44 @@
     }
   }
 
+  // ------------------------------------------------------- structuredClone
+  // The structured clone algorithm for the value types JS code exchanges;
+  // functions, symbols and weak or pending objects cannot be cloned.
+  function structuredClone(value, options = undefined) {
+    if (options?.transfer?.length) throw new DOMException("Transferring objects is not supported", "DataCloneError");
+    const memo = new Map();
+    const refuse = (v) => { throw new DOMException(`${typeof v === "symbol" ? v.toString() : String(v)} could not be cloned.`, "DataCloneError"); };
+    const clone = (v) => {
+      if (typeof v === "function" || typeof v === "symbol") refuse(v);
+      if (v === null || typeof v !== "object") return v;
+      if (memo.has(v)) return memo.get(v);
+      const keep = (out) => { memo.set(v, out); return out; };
+      if (v instanceof WeakMap || v instanceof WeakSet || v instanceof WeakRef || v instanceof Promise) refuse(v);
+      if (Array.isArray(v)) { const out = keep(new Array(v.length)); for (const k of Object.keys(v)) out[k] = clone(v[k]); return out; }
+      if (v instanceof Date) return keep(new Date(v.getTime()));
+      if (v instanceof RegExp) return keep(new RegExp(v.source, v.flags));
+      if (v instanceof Map) { const out = keep(new Map()); for (const [k, x] of v) out.set(clone(k), clone(x)); return out; }
+      if (v instanceof Set) { const out = keep(new Set()); for (const x of v) out.add(clone(x)); return out; }
+      if (v instanceof ArrayBuffer) return keep(v.slice(0));
+      if (ArrayBuffer.isView(v)) {
+        const buffer = clone(v.buffer);
+        return keep(v instanceof DataView ? new DataView(buffer, v.byteOffset, v.byteLength) : new v.constructor(buffer, v.byteOffset, v.length));
+      }
+      if (v instanceof Error) {
+        const out = keep(new ({ EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError }[v.name] ?? Error)(v.message));
+        if (typeof v.stack === "string") out.stack = v.stack;
+        if ("cause" in v) out.cause = clone(v.cause);
+        return out;
+      }
+      if (v instanceof Boolean || v instanceof Number || v instanceof String || v instanceof BigInt) return keep(Object(v.valueOf()));
+      // Other objects arrive as plain objects with their own enumerable data.
+      const out = keep({});
+      for (const k of Object.keys(v)) out[k] = clone(v[k]);
+      return out;
+    };
+    return clone(value);
+  }
+
   // --------------------------------------------------------------- fetch
   // A cancelled call's AbortError passes through untouched (RFC 0012); other
   // network failures are Node's `TypeError: fetch failed`.
@@ -683,6 +726,6 @@
 
   return {
     fetch, Headers, Request, Response, URL, URLSearchParams, AbortController, AbortSignal,
-    ReadableStream, ReadableStreamDefaultReader, FormData, Event, EventTarget, DOMException,
+    ReadableStream, ReadableStreamDefaultReader, FormData, Event, EventTarget, DOMException, structuredClone,
   };
 })

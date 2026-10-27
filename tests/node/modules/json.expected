@@ -1,0 +1,4 @@
+static {"data":{"n":3},"pkgData":{"n":1}}
+dynamic {"n":3}
+./data.json "ERR_IMPORT_ATTRIBUTE_MISSING"
+./modern.js "ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE"

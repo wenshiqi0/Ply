@@ -1,0 +1,21 @@
+// The process object: version, platform, cwd, env coercion and hrtime.
+import fs from "node:fs";
+import os from "node:os";
+const show = (label, value) => console.log(label, JSON.stringify(value));
+show("version", { version: process.version, node: process.versions.node, release: process.release.name });
+show("platform", { platform: process.platform === os.platform(), arch: process.arch === os.arch(), known: ["darwin", "linux"].includes(process.platform) });
+show("argv", { length: process.argv.length, script: process.argv[1].endsWith("/basics.mjs") });
+show("cwd", process.cwd());
+fs.mkdirSync("sub");
+process.chdir("sub");
+show("chdir", process.cwd());
+process.chdir("..");
+show("chdir back", process.cwd());
+process.env.PLY_COMPAT_N = 42;
+show("env", { coerced: process.env.PLY_COMPAT_N, type: typeof process.env.PLY_COMPAT_N, has: "PLY_COMPAT_N" in process.env });
+delete process.env.PLY_COMPAT_N;
+show("env deleted", process.env.PLY_COMPAT_N ?? null);
+const [s, ns] = process.hrtime();
+show("hrtime", { shape: Number.isInteger(s) && Number.isInteger(ns) && ns < 1e9, bigint: typeof process.hrtime.bigint() });
+show("uptime", typeof process.uptime());
+show("stdout", { write: typeof process.stdout.write });

@@ -1,0 +1,10 @@
+default export true
+emit [true,true,false]
+calls [["first",1],["once",1],["third",1,true],["first",2],["third",2,true]]
+counts {"tick":2,"listeners":2}
+after off 1
+after removeAll 0
+error thrown "boom"
+error handled "caught"
+emit error true
+chaining true

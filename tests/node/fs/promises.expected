@@ -1,0 +1,9 @@
+same object true
+read "promised!"
+readdir ["moved.txt","x"]
+stat {"size":9,"dir":true}
+access null
+realpath true
+callback [null,"promised!"]
+callback error "ENOENT"
+exists callback true

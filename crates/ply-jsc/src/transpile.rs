@@ -19,8 +19,8 @@ use std::path::Path;
 use oxc::allocator::Allocator;
 use oxc::ast::ast::{
     Declaration, ExportAllDeclaration, ExportDefaultDeclarationKind, ExportFromDeclaration, ExportNamedDeclaration,
-    Expression, IdentifierReference, ImportDeclaration, ImportDeclarationSpecifier, ImportExpression, ImportMeta,
-    ModuleExportName, ObjectProperty, Statement,
+    Expression, IdentifierReference, ImportAttributeKey, ImportDeclaration, ImportDeclarationSpecifier, ImportExpression,
+    ImportMeta, ModuleExportName, ObjectProperty, Statement, WithClause,
 };
 use oxc::ast_visit::{Visit, walk};
 use oxc::codegen::Codegen;
@@ -227,6 +227,19 @@ fn export_name(name: &ModuleExportName<'_>) -> String {
     name.name().to_string()
 }
 
+/// `"src"`, or `"src", "json"` when the import says `with { type: "json" }`:
+/// the loader checks the attribute against the module it finds.
+fn require_args(source: &str, with: &Option<oxc::allocator::Box<'_, WithClause<'_>>>) -> String {
+    let kind = with.as_ref().and_then(|clause| clause.with_entries.iter().find(|entry| match &entry.key {
+        ImportAttributeKey::Identifier(id) => id.name == "type",
+        ImportAttributeKey::StringLiteral(s) => s.value == "type",
+    }));
+    match kind {
+        Some(entry) => format!("{}, {}", js_string(source), js_string(&entry.value.value.display().to_string())),
+        None => js_string(source),
+    }
+}
+
 fn js_string(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
@@ -254,7 +267,7 @@ fn rewrite_modules(js: &str, path: &Path) -> Result<String, String> {
     let mut imported: HashMap<String, String> = HashMap::new();
     for stmt in &program.body {
         let Statement::ImportDeclaration(decl) = stmt else { continue };
-        let source = js_string(&decl.source.value.display().to_string());
+        let source = require_args(&decl.source.value.display().to_string(), &decl.with_clause);
         let replacement = match decl.specifiers.as_ref().filter(|specs| !specs.is_empty()) {
             None => format!("__require({source});"),
             Some(specs) => {
@@ -331,11 +344,11 @@ fn rewrite_modules(js: &str, path: &Path) -> Result<String, String> {
                 edits.push(Edit {
                     start: decl.span.start,
                     end: decl.span.end,
-                    text: format!("const {module} = __require({});", js_string(&decl.source.value.display().to_string())),
+                    text: format!("const {module} = __require({});", require_args(&decl.source.value.display().to_string(), &decl.with_clause)),
                 });
             }
             Statement::ExportAllDeclaration(decl) => {
-                let source = js_string(&decl.source.value.display().to_string());
+                let source = require_args(&decl.source.value.display().to_string(), &decl.with_clause);
                 let replacement = match &decl.exported {
                     Some(name) => {
                         let module = fresh("re");

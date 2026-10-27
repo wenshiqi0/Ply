@@ -1,0 +1,12 @@
+same module true
+constants {"sep":"/","delimiter":":"}
+join ["a/c/d","/a/b",".","a","../a"]
+normalize ["/a/c","../b",".",".","./","a/b/","/x"]
+resolve ["/a/c","/b/c",true,true]
+relative ["../../d","","c/d"]
+dirname ["/a/b","/a",".","/","."]
+basename ["b.txt","b","b","",""]
+extname [".txt",".c","",".","",""]
+parse {"root":"/","dir":"/home/u","base":"file.tar.gz","ext":".gz","name":"file.tar"}
+format ["/x/y.z","/n.e","n.e"]
+isAbsolute [true,false,false,false]

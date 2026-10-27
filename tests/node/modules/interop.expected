@@ -1,0 +1,6 @@
+esm imports cjs {"add":5,"helper":"helper","esm":"require","json":2,"dirname":true,"filename":true,"self":true,"asyncValue":7}
+detected {"plain":"plain-cjs","modern":"modern-esm","script":"tla-script"}
+cjs requires esm {"keys":["a"],"a":"sub-a","esModule":null}
+cjs requires esm with default {"__esModule":true,"default":"module-sync"}
+cjs requires top-level await "ERR_REQUIRE_ASYNC_MODULE"
+cjs requires json {"n":3}

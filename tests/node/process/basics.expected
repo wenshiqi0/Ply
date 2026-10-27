@@ -1,0 +1,11 @@
+version {"version":"v24.14.0","node":"24.14.0","release":"node"}
+platform {"platform":true,"arch":true,"known":true}
+argv {"length":2,"script":true}
+cwd "<dir>"
+chdir "<dir>/sub"
+chdir back "<dir>"
+env {"coerced":"42","type":"string","has":true}
+env deleted null
+hrtime {"shape":true,"bigint":"bigint"}
+uptime "number"
+stdout {"write":"function"}
