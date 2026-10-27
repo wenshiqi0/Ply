@@ -1,6 +1,6 @@
 # RFC 0007: Context
 
-状态：已实现。当前有效契约以 [SPEC.md](../SPEC.md) 为准；本文件保留方案细节、边界与操作示例。
+状态：已实现。当前有效契约以 [SPEC.md](../../SPEC.md) 为准；本文件保留方案细节、边界与操作示例。
 
 ## 问题与决策
 
@@ -88,4 +88,4 @@ agent 恢复记录升级为 **format 4**；context 自己的会话快照为 **fo
 
 最多 128 个内容块，每块正文最多 256 KiB，块数据总计最多 1 MiB；还受配置的上下文 token 预算保护。读取、写入和审批的既有边界保持不变。
 
-实现见 [context 插件](../plugins/context/main.ts)、[插件句柄](../crates/ply-jsc/src/prelude.js)、[原生调用来源](../crates/ply-kernel/src/lib.rs)。回归用例源头见 [context_blocks.rs](../crates/ply-kernel/tests/context_blocks.rs)。
+实现见 [context 插件](../../plugins/context/main.ts)、[插件句柄](../../crates/ply-jsc/src/prelude.js)、[原生调用来源](../../crates/ply-kernel/src/lib.rs)。回归用例源头见 [context_blocks.rs](../../crates/ply-kernel/tests/context_blocks.rs)。

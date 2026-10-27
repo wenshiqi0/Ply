@@ -11,9 +11,9 @@
 |---|---|---|
 | 资源 | `ply:sh`、`ply:terminal`、`ply:http` | Rust 实现 |
 | 内核 | `ply:plugins`、`ply:events`、`ply:commands` | Rust 实现 |
-| 外部代码 | `ply:models` | [packages/pi-ai](../packages/pi-ai/build.mjs) 用 esbuild 打成浏览器版 bundle（533 KB），检入 `crates/ply-jsc/src/vendor/pi-ai.js`，再用 `include_str!` 嵌入。fetch、Headers、URL、AbortController、ReadableStream 等只在这个 bundle 的私有作用域里用 polyfill 提供 |
-| 外部代码 | `ply:markdown`、`ply:skills` | Rust 解析器（[markdown.rs](../crates/ply-jsc/src/markdown.rs)、[skills.rs](../crates/ply-jsc/src/skills.rs)）加 markdown.js |
-| 存储逻辑 | `ply:memory-store`、`ply:checkpoints` | [memory.rs](../crates/ply-jsc/src/memory.rs)（946 行）和 [checkpoints.rs](../crates/ply-jsc/src/checkpoints.rs) 在 Rust 里实现私有权限、flock、原子 generation 和 git common-dir 识别 |
+| 外部代码 | `ply:models` | [packages/pi-ai](../../packages/pi-ai/build.mjs) 用 esbuild 打成浏览器版 bundle（533 KB），检入 `crates/ply-jsc/src/vendor/pi-ai.js`，再用 `include_str!` 嵌入。fetch、Headers、URL、AbortController、ReadableStream 等只在这个 bundle 的私有作用域里用 polyfill 提供 |
+| 外部代码 | `ply:markdown`、`ply:skills` | Rust 解析器（[markdown.rs](../../crates/ply-jsc/src/markdown.rs)、[skills.rs](../../crates/ply-jsc/src/skills.rs)）加 markdown.js |
+| 存储逻辑 | `ply:memory-store`、`ply:checkpoints` | [memory.rs](../../crates/ply-jsc/src/memory.rs)（946 行）和 [checkpoints.rs](../../crates/ply-jsc/src/checkpoints.rs) 在 Rust 里实现私有权限、flock、原子 generation 和 git common-dir 识别 |
 
 由此带来的问题：
 
@@ -122,7 +122,7 @@ Ply 运行时以 Node 为基线，可以作为 Node 的超集：Node 已有的 A
 - 以上原则写入 SPEC。
 
 **破坏性变更**
-- 删除 `ply:models`、`ply:memory-store`、`ply:checkpoints`、`ply:http`、`ply:markdown`、`ply:skills`，以及 [packages/sdk/modules](../packages/sdk/modules/models.d.ts) 中对应的声明。
+- 删除 `ply:models`、`ply:memory-store`、`ply:checkpoints`、`ply:http`、`ply:markdown`、`ply:skills`，以及 [packages/sdk/modules](../../packages/sdk/modules/models.d.ts) 中对应的声明。
 - 新增全局 `fetch` 等 Web 对象；fs 新增 FileHandle、`mode`、`chmod`、`lock` 和 `unlock`；新增 `process.env.PLY_STATE_DIR`。
 - cargo 构建前必须先运行 `npm ci --ignore-scripts`。以前 vendor bundle 检入仓库，不需要这一步。
 - 检查点改存到 `~/.ply/agent/checkpoints`，旧位置的记录不迁移。
@@ -145,7 +145,7 @@ Ply 运行时以 Node 为基线，可以作为 Node 的超集：Node 已有的 A
 **针对性回归**
 1. 解析：覆盖裸模块、scope 包、子路径 exports、条件选择、CJS 与 ESM 互操作、JSON、逐级向上查找；未实现的内置模块报错；相对导入越界被拒绝。同一组 fixture 在开发和打包两种模式下结果一致。
 2. 打包：只嵌入可达文件；字面量 `import()` 被跟随；非字面量的动态导入在构建期列出；缺少 `node_modules` 时构建失败并给出提示。记录二进制体积的变化。
-3. fetch：用本地 HTTP 覆盖 JSON、SSE 流、体积上限、取消（`AbortError`）和并发隔离，沿用 [model_runtime.rs](../crates/ply-jsc/tests/model_runtime.rs) 的场景。
+3. fetch：用本地 HTTP 覆盖 JSON、SSE 流、体积上限、取消（`AbortError`）和并发隔离，沿用 [model_runtime.rs](../../crates/ply-jsc/tests/model_runtime.rs) 的场景。
 4. 密钥：环境变量缺失时明确报错；`apiKeyEnv` 改名生效；fixture 测试不发出真实请求。
 5. 文件锁：
    - 同一进程的两个调用、两个 Ply 进程分别争用同一把锁；

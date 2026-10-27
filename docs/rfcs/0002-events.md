@@ -1,6 +1,6 @@
 # RFC 0002: 插件事件和 bash 执行前 hook
 
-状态：已实现。当前有效契约以 [SPEC.md](../SPEC.md) 为准；本文件保留方案细节、边界与操作示例。
+状态：已实现。当前有效契约以 [SPEC.md](../../SPEC.md) 为准；本文件保留方案细节、边界与操作示例。
 
 ## 问题与决策
 
@@ -27,7 +27,7 @@ export async function onHandle(input: { value: string }) {
 
 ## 订阅 bash.beforeExecute
 
-完整可加载示例在 [examples/plugins/bash-guard/main.ts](../examples/plugins/bash-guard/main.ts)：
+完整可加载示例在 [examples/plugins/bash-guard/main.ts](../../examples/plugins/bash-guard/main.ts)：
 
 ```ts
 import plugins from "ply:plugins";
@@ -68,4 +68,4 @@ cargo build -p ply-cli --locked
 
 JSONL 中的 `event:"plugin"` 记录发布及真实来源，回调另有配对的 Spawn/Exit。回调不是插件 onHandle，也不作为 agent 工具调用消耗委派名额。`events.on` 返回订阅编号，所属插件可以用 `events.off(id)` 取消订阅。加载失败会回收该插件的事件定义和订阅。
 
-内部 sh 的语法、命令集和执行边界见 [ply-sh README](../crates/ply-sh/README.md)。当前仅执行内置命令和注册的 utility，未知宿主程序不会被自动透传或交给系统 shell。
+内部 sh 的语法、命令集和执行边界见 [ply-sh README](../../crates/ply-sh/README.md)。当前仅执行内置命令和注册的 utility，未知宿主程序不会被自动透传或交给系统 shell。

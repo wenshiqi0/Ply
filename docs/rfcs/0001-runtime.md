@@ -1,6 +1,6 @@
 # RFC 0001: ply 设计
 
-状态：已实现。当前有效契约以 [SPEC.md](../SPEC.md) 为准；本文件保留方案细节、边界与操作示例。
+状态：已实现。当前有效契约以 [SPEC.md](../../SPEC.md) 为准；本文件保留方案细节、边界与操作示例。
 
 > 已被 [RFC 0012](0012-capabilities-not-scheduling.md) 取代的部分：`fiber`、`ctx` 全局，`ply:lifecycle`（`current()`、`onDispose(cb)`），`plugins.x.loaded`，`fiber.record` 记录，以及内核执行的直属子 agent 配额。下文涉及这些的段落只保留为历史记录。
 

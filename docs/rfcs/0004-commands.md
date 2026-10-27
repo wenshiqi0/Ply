@@ -1,6 +1,6 @@
 # RFC 0004: CLI 命令注册与插件导入
 
-状态：已实现。当前有效契约以 [SPEC.md](../SPEC.md) 为准；本文件保留方案细节、边界与操作示例。
+状态：已实现。当前有效契约以 [SPEC.md](../../SPEC.md) 为准；本文件保留方案细节、边界与操作示例。
 
 ## 问题与决策
 
@@ -22,7 +22,7 @@ export async function onLoad() {
 }
 ```
 
-可运行的例子在 [examples/plugins/hello-command/main.ts](../examples/plugins/hello-command/main.ts)：
+可运行的例子在 [examples/plugins/hello-command/main.ts](../../examples/plugins/hello-command/main.ts)：
 
 ```bash
 # 不需要模型密钥，不启动模型调用
@@ -74,4 +74,4 @@ const names = Object.keys(plugins);
 
 模块导入不会安装 `globalThis.plugins`。`ctx`、`fiber` 继续保留；模型协议中的 `context.tools`、SDK 的 tools 字段以及 CLI 的 `tools` 子命令均保留原名称，它们表示模型工具定义。
 
-SDK 类型见 [packages/sdk/globals.d.ts](../packages/sdk/globals.d.ts)，验收见 [命令与 fiber 测试](../crates/ply-kernel/tests/commands.rs)及 [CLI 测试](../crates/ply-cli/tests/entrypoints.rs)。
+SDK 类型见 [packages/sdk/globals.d.ts](../../packages/sdk/globals.d.ts)，验收见 [命令与 fiber 测试](../../crates/ply-kernel/tests/commands.rs)及 [CLI 测试](../../crates/ply-cli/tests/entrypoints.rs)。

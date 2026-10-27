@@ -1,6 +1,6 @@
 # RFC 0006: Skills
 
-状态：已实现。当前有效契约以 [SPEC.md](../SPEC.md) 为准；本文件保留方案细节、边界与操作示例。
+状态：已实现。当前有效契约以 [SPEC.md](../../SPEC.md) 为准；本文件保留方案细节、边界与操作示例。
 
 ## 问题与决策
 
@@ -115,4 +115,4 @@ description: >-
 
 宿主选择技能来源属于插件启动配置；发现阶段只向模型提供元数据。模型通过 read 读取正文，TUI 默认逐次审批，`--bypass` 按既有宿主策略记录跳过。技能内容不修改工具授权、挂载、委派权限或子 agent 配额，也不会自动执行 scripts。
 
-`ply:skills.parse(source)` 只解析字符串，不执行文件、网络或脚本。源头与本地验证见 [skill 插件](../plugins/skill/main.ts)、[原生解析](../crates/ply-jsc/src/skills.rs)、[CLI 参数转发](../crates/ply-cli/tests/entrypoints.rs)、[skill 集成测试](../crates/ply-kernel/tests/skills.rs)。
+`ply:skills.parse(source)` 只解析字符串，不执行文件、网络或脚本。源头与本地验证见 [skill 插件](../../plugins/skill/main.ts)、[原生解析](../../crates/ply-jsc/src/skills.rs)、[CLI 参数转发](../../crates/ply-cli/tests/entrypoints.rs)、[skill 集成测试](../../crates/ply-kernel/tests/skills.rs)。

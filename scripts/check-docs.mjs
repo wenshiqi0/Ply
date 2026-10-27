@@ -2,7 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 const root = path.resolve(import.meta.dirname, "..");
-const documents = ["README.md", "SPEC.md", "AGENTS.md", ...fs.readdirSync(path.join(root, "rfcs")).map(name => `rfcs/${name}`)];
+const markdown = dir => fs.readdirSync(path.join(root, dir), { withFileTypes: true }).flatMap(entry =>
+  entry.isDirectory() ? markdown(`${dir}/${entry.name}`) : entry.name.endsWith(".md") ? [`${dir}/${entry.name}`] : []);
+const documents = ["README.md", "SPEC.md", "AGENTS.md", ...markdown("docs")];
 const failures = [];
 for (const document of documents) {
   const source = fs.readFileSync(path.join(root, document), "utf8").replace(/```[\s\S]*?```|`[^`]*`/g, "");

@@ -1,6 +1,6 @@
 # RFC 0003: 审批协调与环境适配器
 
-状态：已实现。当前有效契约以 [SPEC.md](../SPEC.md) 为准；本文件保留方案细节、边界与操作示例。
+状态：已实现。当前有效契约以 [SPEC.md](../../SPEC.md) 为准；本文件保留方案细节、边界与操作示例。
 
 ## 问题与决策
 
@@ -102,7 +102,7 @@ interface PlyApprovalResponse {
 
 ## 适配器模板
 
-[examples/plugins/approval-adapter/main.ts](../examples/plugins/approval-adapter/main.ts) 可加载但永远返回 pending，只展示协议，不是实际审批环境：
+[examples/plugins/approval-adapter/main.ts](../../examples/plugins/approval-adapter/main.ts) 可加载但永远返回 pending，只展示协议，不是实际审批环境：
 
 ```ts
 import plugins from "ply:plugins";

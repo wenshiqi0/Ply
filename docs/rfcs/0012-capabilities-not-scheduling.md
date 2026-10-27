@@ -5,17 +5,17 @@
 
 ## 问题与证据
 
-fiber 是内核的调度单位。续体归属本来已经在 Rust 里：注册 Promise reaction 时，原生对象捕获消费方 scope（[runtime.rs](../crates/ply-jsc/src/runtime.rs) 的 `bind_continuation`），JS 拿不到。但内核又把调度信息交回了插件：
+fiber 是内核的调度单位。续体归属本来已经在 Rust 里：注册 Promise reaction 时，原生对象捕获消费方 scope（[runtime.rs](../../crates/ply-jsc/src/runtime.rs) 的 `bind_continuation`），JS 拿不到。但内核又把调度信息交回了插件：
 
 - 全局 `fiber`：`info()` 返回 id、parent、ancestors；另有 `record()`、`limitChildren()`、`childBudget()`。
 - `ply:lifecycle`：`current()` 返回 plugin、loading、host、client、fiber、ancestors；`onDispose(cb)` 按调用注册清理。
 - 插件据此用调用方身份重建调用树：
   - context 用 `owners: Map<fiberId, conversationId>` 沿祖先链找"当前会话"，用 `current().plugin` 决定 block 来源，用 `host` 放行任意会话（原 `plugins/context/ownership.ts`）；
-  - agent 用 `activeUsage: Map<fiberId, RunUsage>` 沿祖先链找父 agent，继承策略、报告要求和用量链（[run.ts](../plugins/agent/run.ts)）；
-  - jev 通过 `ctx.reportExternalModelCall` 把用量挂到最近的 agent 祖先（[usage.ts](../plugins/agent/usage.ts)）；
-  - TUI 用 `ancestors.includes(session.fiber)` 判断审批是否属于自己的会话（[tui/main.ts](../plugins/tui/main.ts)）；
-  - bash 和 approval 用 `fiberId + ":approval"` 拼审批 id，agent 校验 `source.fiber` 等于自己（[bash/main.ts](../plugins/bash/main.ts)、[agent/tools.ts](../plugins/agent/tools.ts)）；
-  - 内核 `kernel.memory_policy` 数祖先链里有几个 `agent`，决定 memory 能否写入，插件名写死在内核里（[lib.rs](../crates/ply-kernel/src/lib.rs)）。
+  - agent 用 `activeUsage: Map<fiberId, RunUsage>` 沿祖先链找父 agent，继承策略、报告要求和用量链（[run.ts](../../plugins/agent/run.ts)）；
+  - jev 通过 `ctx.reportExternalModelCall` 把用量挂到最近的 agent 祖先（[usage.ts](../../plugins/agent/usage.ts)）；
+  - TUI 用 `ancestors.includes(session.fiber)` 判断审批是否属于自己的会话（[tui/main.ts](../../plugins/tui/main.ts)）；
+  - bash 和 approval 用 `fiberId + ":approval"` 拼审批 id，agent 校验 `source.fiber` 等于自己（[bash/main.ts](../../plugins/bash/main.ts)、[agent/tools.ts](../../plugins/agent/tools.ts)）；
+  - 内核 `kernel.memory_policy` 数祖先链里有几个 `agent`，决定 memory 能否写入，插件名写死在内核里（[lib.rs](../../crates/ply-kernel/src/lib.rs)）。
 - 全局 `ctx` 与 `ply:plugins` 句柄是同一份 onLoad 挂载的两个入口；同名时后挂载覆盖，调用方不知道自己调到了谁。
 - `plugins.x.loaded` 让插件自己处理加载顺序，共 17 处。
 - `fiber.record` 只被 `--record` 和测试读取。内容与 Spawn/Exit 的输入输出或插件事件重叠，是第二种"带归属的 payload"。
@@ -61,7 +61,7 @@ fiber 是内核的调度单位。续体归属本来已经在 Rust 里：注册 P
 | `ply:models`、`ply:memory-store`、`ply:checkpoints`、`ply:skills`、`ply:markdown` | 本 RFC 不改；它们是否应作为 `ply:` 模块另行讨论 |
 | `ply:async/helpers/*` | 编译器内部使用 |
 
-SDK 声明随之删除：`packages/sdk/modules/runtime.d.ts`（`fiber`、`ctx` 和 `PlyChildBudget`）与 `packages/sdk/modules/lifecycle.d.ts` 整个删除；[approval.d.ts](../packages/sdk/modules/approval.d.ts) 与 [events.d.ts](../packages/sdk/modules/events.d.ts) 中的 fiber 字段。
+SDK 声明随之删除：`packages/sdk/modules/runtime.d.ts`（`fiber`、`ctx` 和 `PlyChildBudget`）与 `packages/sdk/modules/lifecycle.d.ts` 整个删除；[approval.d.ts](../../packages/sdk/modules/approval.d.ts) 与 [events.d.ts](../../packages/sdk/modules/events.d.ts) 中的 fiber 字段。
 
 ### 取消时执行 finally
 

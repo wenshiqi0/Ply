@@ -10,7 +10,7 @@
 4. 内部重构保留已确认的 CLI、插件参数、`ply:plugins` 接口与安全边界。
 5. 自动检查通过后记录验证结果。fixture 测试不能代替真实供应商或交互验收。
 
-RFC 索引见 [rfcs/README.md](rfcs/README.md)。插件模块化和类型治理见 [RFC 0011](rfcs/0011-plugin-modules-and-types.md)；插件只见能力、fiber 只在内核见 [RFC 0012](rfcs/0012-capabilities-not-scheduling.md)。
+RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南见 [docs/](docs/README.md)。插件模块化和类型治理见 [RFC 0011](docs/rfcs/0011-plugin-modules-and-types.md)；插件只见能力、fiber 只在内核见 [RFC 0012](docs/rfcs/0012-capabilities-not-scheduling.md)。
 
 ## SPEC-PLUGINS：插件与模块
 
@@ -20,7 +20,7 @@ RFC 索引见 [rfcs/README.md](rfcs/README.md)。插件模块化和类型治理�
 - 插件只见能力，不见调度：运行时不提供 `fiber`、`ctx` 全局和 `ply:lifecycle`，句柄没有 `.loaded`；插件之间通过输入、返回值和持有的值（如会话 id）建立关系，不按调用方判定归属。
 - 入口可用插件目录内的相对 import 拆分模块。同一插件的模块共享一个 realm 和模块缓存，不能因拆文件改变 fiber 归属、状态或加载时序。当前导入采用复制绑定；跨模块更新使用稳定对象或方法访问，不依赖可变标量的 live binding。
 - 内置插件在二进制中嵌入完整模块目录，普通构建和运行不依赖外部 Node；目录插件与内置插件使用同一模块解析规则。
-- 运行时边界：Ply 只提供资源能力（进程环境、进程执行、文件、网络、终端）与内核能力（`ply:plugins`、`ply:events`、`ply:commands`）。外部代码依赖经 node 模块解析从 node_modules 引入，开发模式直接读取 node_modules，打包时随应用嵌入；存储由插件在 fs 上实现，跨进程互斥使用 fs 的文件锁扩展（OS 排他咨询锁，跨进程有效，关闭句柄或进程退出时释放）；密钥通过环境变量注入。现有 `ply:models`、`ply:memory-store`、`ply:checkpoints`、`ply:http`、`ply:skills`、`ply:markdown` 按 [RFC 0013](rfcs/0013-resources-and-npm.md) 迁出，迁移完成前按各自现行契约运行。
+- 运行时边界：Ply 只提供资源能力（进程环境、进程执行、文件、网络、终端）与内核能力（`ply:plugins`、`ply:events`、`ply:commands`）。外部代码依赖经 node 模块解析从 node_modules 引入，开发模式直接读取 node_modules，打包时随应用嵌入；存储由插件在 fs 上实现，跨进程互斥使用 fs 的文件锁扩展（OS 排他咨询锁，跨进程有效，关闭句柄或进程退出时释放）；密钥通过环境变量注入。现有 `ply:models`、`ply:memory-store`、`ply:checkpoints`、`ply:http`、`ply:skills`、`ply:markdown` 按 [RFC 0013](docs/rfcs/0013-resources-and-npm.md) 迁出，迁移完成前按各自现行契约运行。
 - 签名读取支持插件目录内相对文件中的具名类型导入与别名；递归类型保守收敛为 unknown。未支持的 TypeScript 高级类型不得声称具备运行时参数校验。
 - `main.ts` 保留入口与装配，`types.ts` 声明输入、输出、onLoad 参数和公共导出；较复杂的策略、存储、渲染、统计等放入职责模块。
 - 每个 TS/声明文件最多 250 个非空、非注释行；不得通过合并多条语句或全局关闭检查规避约束。
@@ -101,7 +101,7 @@ Ply 的当前范围是 macOS 上的 Rust/JSC agent harness：CLI、脚本和 MCP
 | 能力 | 已实现的完整路径 | 验收来源 |
 |---|---|---|
 | 使用入口 | tools 描述插件；call 返回输出/错误；run 运行脚本；MCP 提供工具服务；commands 列出注册入口；插件可注册顶层命令，tui 启动面板 | [CLI 端到端](crates/ply-cli/tests/entrypoints.rs)、[真实 PTY](crates/ply-cli/tests/tui.rs) |
-| 插件与命令模块 | ply:plugins 显式导入实时目录，移除旧全局 tools；ply:commands 只在 onLoad 注册，原生 realm 归属、重复拒绝/失败撤销、独立 fiber 与取消清理 | [模块与命令](rfcs/0004-commands.md)、[内核验收](crates/ply-kernel/tests/commands.rs) |
+| 插件与命令模块 | ply:plugins 显式导入实时目录，移除旧全局 tools；ply:commands 只在 onLoad 注册，原生 realm 归属、重复拒绝/失败撤销、独立 fiber 与取消清理 | [模块与命令](docs/rfcs/0004-commands.md)、[内核验收](crates/ply-kernel/tests/commands.rs) |
 | MCP 请求处理 | 单行 JSON-RPC 并发处理；非法 JSON、版本/方法/id、参数对象返回明确错误；合法通知和入站响应不回包；坏请求后继续服务 | [CLI 端到端](crates/ply-cli/tests/entrypoints.rs)、[入口实现](crates/ply-cli/src/main.rs) |
 | 插件事件 | onLoad 声明/订阅命名空间事件；运行时异步分发，监听器独立子 fiber；异常/超时/取消阻止 bash 执行；失败加载回收注册 | [事件实现](crates/ply-kernel/src/events.rs)、[hook 集成](crates/ply-kernel/tests/kernel.rs) |
 | 插件与句柄 | TS 签名转工具定义、具名/默认稳定插件句柄、onLoad 接口按插件挂载、具名导入决定 onLoad 顺序、共享闭包、重复/加载失败处理、临时 realm 回收；插件可见面不含 fiber/ctx/lifecycle/.loaded | [内核集成](crates/ply-kernel/tests/kernel.rs)、[加载顺序与回收](crates/ply-kernel/tests/loading.rs)、[签名实现](crates/ply-kernel/src/signature.rs)、[多文件模块回归](crates/ply-kernel/tests/plugin_modules.rs) |
@@ -109,10 +109,10 @@ Ply 的当前范围是 macOS 上的 Rust/JSC agent harness：CLI、脚本和 MCP
 | fiber 调度与归属 | 共享 Promise 按消费者归属；并发父子关系、方法调用/timer/续体保持调用身份，由 FiberHook 观察而非 JS；每个 Spawn 有唯一 Exit | [JSC 集成](crates/ply-jsc/tests/node_outlet.rs)、[内核集成](crates/ply-kernel/tests/kernel.rs) |
 | 错误与取消 | 普通错误、rejection、定时器错误、宿主 panic、CPU/内存超限有明确终态；父取消传播到子，独立兄弟继续；同步 CPU/exec 等待响应取消 | [JSC 集成](crates/ply-jsc/tests/node_outlet.rs)、[内核取消](crates/ply-kernel/tests/kernel.rs) |
 | 清理生命周期 | 取消/预算超限后 catch/finally 在两秒有界清理中运行（AbortError）、父子都清理、清理中拒绝新调用；超时中断 CPU/同步 exec/异步等待；清理完成回收未 await 的定时器/宿主任务；onDispose 导出 hook 在 realm 回收时运行一次；独立 Cleanup 记录 owner 与终态 | [JSC 清理](crates/ply-jsc/tests/node_outlet.rs)、[内核清理](crates/ply-kernel/tests/cleanup.rs) |
-| 环境审批协调 | approval.request 保持 bash 协议，toolRequest 覆盖模型工具调用；读取前审批，决定与原参数绑定；TUI 只调用 agent 并展示审批；默认主/子 agent 分别七/五个工具；无环境返回 approval_required | [审批协议](rfcs/0003-approval.md)、[模型工具门禁](crates/ply-kernel/tests/approval.rs)、[真实 PTY](crates/ply-cli/tests/tui.rs) |
-| 持久化记忆 | memory 显式 remember/recall/forget，用户/项目分域，私有文件与原子 generation；context.Reference 快照和所属会话刷新；key 记住/查找、id+version 遗忘 | [Memory](rfcs/0008-memory.md)、[集成测试](crates/ply-kernel/tests/memory.rs)、[存储实现](crates/ply-jsc/src/memory.rs) |
-| skills | 插件 onLoad 参数配置来源，启动目录发现；元数据写入 context.Extensions 模板，由 context 继承和恢复；通过既有 read 读取完整 SKILL.md，保留审批和挂载边界 | [Skills](rfcs/0006-skills.md)、[集成测试](crates/ply-kernel/tests/skills.rs) |
-| Jev 安全检查 | 可选订阅 bash.beforeExecute，原生 state/questions/Noul，阈值建议、结构化结果、异常或不确定转审批；私有密钥及插件模型用量归属 | [Jev 说明](rfcs/0010-jev.md)、[原生 API 集成](crates/ply-kernel/tests/jev.rs) |
+| 环境审批协调 | approval.request 保持 bash 协议，toolRequest 覆盖模型工具调用；读取前审批，决定与原参数绑定；TUI 只调用 agent 并展示审批；默认主/子 agent 分别七/五个工具；无环境返回 approval_required | [审批协议](docs/rfcs/0003-approval.md)、[模型工具门禁](crates/ply-kernel/tests/approval.rs)、[真实 PTY](crates/ply-cli/tests/tui.rs) |
+| 持久化记忆 | memory 显式 remember/recall/forget，用户/项目分域，私有文件与原子 generation；context.Reference 快照和所属会话刷新；key 记住/查找、id+version 遗忘 | [Memory](docs/rfcs/0008-memory.md)、[集成测试](crates/ply-kernel/tests/memory.rs)、[存储实现](crates/ply-jsc/src/memory.rs) |
+| skills | 插件 onLoad 参数配置来源，启动目录发现；元数据写入 context.Extensions 模板，由 context 继承和恢复；通过既有 read 读取完整 SKILL.md，保留审批和挂载边界 | [Skills](docs/rfcs/0006-skills.md)、[集成测试](crates/ply-kernel/tests/skills.rs) |
+| Jev 安全检查 | 可选订阅 bash.beforeExecute，原生 state/questions/Noul，阈值建议、结构化结果、异常或不确定转审批；私有密钥及插件模型用量归属 | [Jev 说明](docs/rfcs/0010-jev.md)、[原生 API 集成](crates/ply-kernel/tests/jev.rs) |
 | agent 委派 | 独立对话、委派凭据、工具白名单、子级只能收窄、代数限制；累计直属子数由 agent 插件同步准入，失败/完成/替换/恢复不退款；模型轮数默认不限 | [agent 集成](crates/ply-kernel/tests/agent.rs)、[配额并发](crates/ply-kernel/tests/kernel.rs) |
 | 报告完成 | 正常停止、非空、结束标记、围栏、协议残留、要求章节；失败由原 agent 修复，截断工具参数不执行 | [agent 集成及模型 fixture](crates/ply-kernel/tests/agent.rs) |
 | 上下文 | Rules/Project/Extensions/State/Reference 中央排序，固定前缀、会话隔离、增量状态；工具快照、预算、完整交互压缩及失败恢复 | [context 集成](crates/ply-kernel/tests/context.rs)、[agent 集成](crates/ply-kernel/tests/agent.rs) |

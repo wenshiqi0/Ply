@@ -1,6 +1,6 @@
 # RFCs
 
-当前契约见 [SPEC.md](../SPEC.md)。新增 RFC 使用连续编号，复制 [模板](TEMPLATE.md)。
+当前契约见 [SPEC.md](../../SPEC.md)。新增 RFC 使用连续编号，复制 [模板](TEMPLATE.md)。
 
 | RFC | 状态 |
 |---|---|
