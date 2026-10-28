@@ -9,5 +9,3 @@ declare module "ply:skills" {
   /** YAML frontmatter plus Markdown body; data only, at most 64 KiB. */
   export function parse(source: string): SkillDocument;
 }
-
-/** pi-ai embedded in this realm; DeepSeek and Xiaomi MiMo only. */
