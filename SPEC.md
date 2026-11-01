@@ -14,6 +14,7 @@ RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南
 
 ## SPEC-PLUGINS：插件与模块
 
+- 支持 macOS 与 Linux：macOS 链接系统 JavaScriptCore framework；Linux 通过 `pkg-config` 链接 JavaScriptCoreGTK 4.1（构建需要 `javascriptcoregtk-4.1` 开发包，运行需要对应共享库）。其他平台在编译期明确拒绝，见 [RFC 0017](docs/rfcs/0017-linux.md)。
 - 一个目录是一个插件，入口按 `main.ts`、`index.ts`、`main.js`、`index.js` 选择。目录名是插件名。
 - 入口具名导出 `onHandle(input)`、`onLoad(options)`、`onDispose()` 中的任意几个；`onHandle` 的 JSDoc、参数、返回类型生成描述与工具 schema。
 - `onLoad` 只运行一次，返回的数据与方法通过插件句柄提供；方法是所属 realm 内的异步 RPC。`onDispose` 在 realm 回收时运行一次。
@@ -51,6 +52,7 @@ RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南
 - 取消或预算超限时 Exit 立即发出，随后有界清理：调用等待的非自身创建的 Promise 与宿主操作以 AbortError（code `ERR_PLY_CANCELLED`）拒绝，它自身创建的叶子 Promise 被拒绝，被强制终止的同步段留下的 async 帧也被拒绝；每个取消前已存在的 async 帧恰好收到一次 AbortError（取消后首次恢复，或同步宿主调用当场抛出），清理中新开始的帧不受影响，catch/finally 照常运行并可 await；只中止取消那一刻已存在的工作；清理期间不能发起新的子调用。整段两秒期限，结束或超时后回收定时器、HTTP、宿主任务和续体。被终止的同步段内部的 finally 不执行。
 - onDispose 在 realm 回收时运行一次：`Kernel::close` 先取消在途调用并等待其清理，再按加载完成逆序调用各插件 onDispose，然后关闭 realm；onLoad 失败后同样调用并回收 realm。两秒期限。Cleanup 事件记录 owner（onDispose 为空）与终态。
 - 临时 realm 无论成功、失败或取消均回收。内存预算是全进程水位，不宣称逐 fiber 堆隔离。
+- 内存看门狗在 macOS 读取当前 physical footprint，在 Linux 读取 `/proc/self/statm` 的当前 resident pages 乘以系统页大小；不使用进程历史峰值。Linux 运行环境需提供 `/proc`。
 
 ## SPEC-AGENT：模型、委派、报告和用量
 
@@ -101,10 +103,11 @@ RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南
 
 ## 验收矩阵
 
-Ply 的当前范围是 macOS 上的 Rust/JSC agent harness：CLI、脚本和 MCP 共用同一个内核，TS 插件提供工具与上下文，DeepSeek/MiMo 通过 npm 上的 pi-ai、运行时的 fetch 和 Rust HTTP 调用。下面按系统行为列出验收路径，不把模型评审报告的正确率当作系统验收。
+Ply 的当前范围是 macOS 和 Linux 上的 Rust/JSC agent harness：CLI、脚本和 MCP 共用同一个内核，TS 插件提供工具与上下文，DeepSeek/MiMo 通过 npm 上的 pi-ai、运行时的 fetch 和 Rust HTTP 调用。下面按系统行为列出验收路径，不把模型评审报告的正确率当作系统验收。
 
 | 能力 | 已实现的完整路径 | 验收来源 |
 |---|---|---|
+| 宿主平台 | macOS 系统 JavaScriptCore 与 Linux JavaScriptCoreGTK 4.1；真实平台报告、进程内存预算与终端行为 | [CI 双平台检查](.github/workflows/ci.yml)、[进程内存](crates/ply-jsc/src/process_memory.rs)、[JSC 集成](crates/ply-jsc/tests/node_outlet.rs)、[真实 PTY](crates/ply-cli/tests/tui.rs) |
 | 使用入口 | tools 描述插件；call 返回输出/错误；run 运行脚本；MCP 提供工具服务；commands 列出注册入口；插件可注册顶层命令，tui 启动面板 | [CLI 端到端](crates/ply-cli/tests/entrypoints.rs)、[真实 PTY](crates/ply-cli/tests/tui.rs) |
 | 插件与命令模块 | ply:plugins 显式导入实时目录，移除旧全局 tools；ply:commands 只在 onLoad 注册，原生 realm 归属、重复拒绝/失败撤销、独立 fiber 与取消清理 | [模块与命令](docs/rfcs/0004-commands.md)、[内核验收](crates/ply-kernel/tests/commands.rs) |
 | MCP 请求处理 | 单行 JSON-RPC 并发处理；非法 JSON、版本/方法/id、参数对象返回明确错误；合法通知和入站响应不回包；坏请求后继续服务 | [CLI 端到端](crates/ply-cli/tests/entrypoints.rs)、[入口实现](crates/ply-cli/src/main.rs) |

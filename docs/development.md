@@ -9,6 +9,12 @@
 
 ## 检查
 
+macOS 使用系统 JavaScriptCore framework。Linux 使用 JavaScriptCoreGTK
+4.1，通过 `pkg-config` 查找；Debian/Ubuntu 先安装
+`pkg-config libjavascriptcoregtk-4.1-dev`。其他发行版安装提供
+`javascriptcoregtk-4.1.pc` 的开发包。非系统目录安装时配置
+`PKG_CONFIG_PATH`，运行时也必须能找到相应的共享库。
+
 ```bash
 npm ci --ignore-scripts --registry=https://registry.npmjs.org
 npm run check
@@ -21,7 +27,7 @@ cargo test --workspace --locked --offline
 - 根 `tsconfig.json` 自动加载 SDK 声明，编辑器打开仓库即可检查所有插件和示例。
 - 涉及内置模块加载的改动要跑完整的 workspace 测试，包括 CLI、MCP、真实 PTY 与目录插件。
 - 自动化测试只用 fixture 和本地 HTTP；真实供应商调用需要另行取得授权并保留轨迹。
-- [GitHub Actions](../.github/workflows/ci.yml) 在 macOS runner 上对每次推送到 main 和每个 pull request 运行同样的检查（`npm ci`、`npm run check`、`cargo test --workspace --locked`）。
+- [GitHub Actions](../.github/workflows/ci.yml) 在 macOS 和 Ubuntu runner 上对每次推送到 main 和每个 pull request 运行同样的检查（`npm ci`、`npm run check`、`npm run compat:check`、`cargo test --workspace --locked`），包括真实 PTY、CLI 与 MCP；Linux runner 先安装 JavaScriptCoreGTK 开发包。
 
 ## Node 兼容用例
 

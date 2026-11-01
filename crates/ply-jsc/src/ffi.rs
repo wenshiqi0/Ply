@@ -52,7 +52,7 @@ pub const TYPED_UINT8: u32 = 3;
 /// Called when a script has run past the group's time limit; `true` ends it.
 pub type ShouldTerminate = unsafe extern "C" fn(ctx: JSContextRef, context: *mut c_void) -> bool;
 
-#[link(name = "JavaScriptCore", kind = "framework")]
+#[cfg_attr(target_os = "macos", link(name = "JavaScriptCore", kind = "framework"))]
 unsafe extern "C" {
     pub fn JSContextGroupCreate() -> JSContextGroupRef;
     pub fn JSContextGroupRelease(group: JSContextGroupRef);
@@ -115,12 +115,12 @@ unsafe extern "C" {
     pub fn JSObjectGetTypedArrayByteLength(ctx: JSContextRef, obj: JSObjectRef, exception: *mut JSValueRef) -> usize;
 
     // Test-only full, synchronous GC; the public JSGarbageCollect merely
-    // schedules collection. Exported by the system framework.
+    // schedules collection. Exported by both the framework and GTK library.
     #[cfg(test)]
     pub fn JSSynchronousGarbageCollectForDebugging(ctx: JSContextRef);
 
-    // Exported by the system framework, declared in JSC's private headers
-    // (JSContextRefPrivate.h). Stable since macOS 10.6 / 12 respectively.
+    // Exported by both the framework and GTK library, declared in JSC's
+    // private headers (JSContextRefPrivate.h).
     pub fn JSContextGroupSetExecutionTimeLimit(
         group: JSContextGroupRef,
         limit: f64,

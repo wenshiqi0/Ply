@@ -19,6 +19,11 @@ fn modules(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
 }
 
 fn main() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        pkg_config::Config::new().probe("javascriptcoregtk-4.1").unwrap_or_else(|error| {
+            panic!("Linux requires JavaScriptCoreGTK 4.1 and pkg-config. On Debian/Ubuntu, install pkg-config and libjavascriptcoregtk-4.1-dev.\n{error}")
+        });
+    }
     let root = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/node");
     println!("cargo:rerun-if-changed={}", root.display());
     let mut found = Vec::new();

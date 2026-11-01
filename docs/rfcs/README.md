@@ -20,3 +20,4 @@
 | [0014 Node 兼容用例集](0014-node-compat-suite.md) | 已实现 |
 | [0015 原生句柄与 Node 网络、进程 API](0015-node-io-and-net.md) | 第一阶段已实现 |
 | [0016 命令即程序](0016-commands-as-programs.md) | 提议 |
+| [0017 Linux 支持](0017-linux.md) | 已实现 |

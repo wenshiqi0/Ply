@@ -48,6 +48,7 @@ use ply_libc::{EntryKind, Errno, ExecSpec, Fs, Io, SysError, path as lpath};
 use ply_core::{CleanupStatus, FiberEvent};
 
 use crate::ffi::*;
+use crate::process_memory::footprint;
 use crate::http::Http;
 use crate::checkpoints::Checkpoints;
 use crate::resolve::{Format, Kind, Manifests, Resolver};
@@ -620,15 +621,6 @@ unsafe extern "C" fn should_terminate(_ctx: JSContextRef, _context: *mut c_void)
             false
         }
     }
-}
-
-/// Physical footprint of the whole process (what Activity Monitor shows).
-fn footprint() -> u64 {
-    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
-    let ok = unsafe {
-        libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, (&mut info as *mut libc::rusage_info_v2).cast())
-    };
-    if ok == 0 { info.ri_phys_footprint } else { 0 }
 }
 
 /// Run `f`, which enters JS, as fiber `fiber` with a fresh CPU budget.

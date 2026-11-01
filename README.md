@@ -4,7 +4,7 @@
 
 Ply 是一个 agent harness：Rust 内核负责调度、IO 和记录，插件用 TypeScript 写，运行在内嵌的 JavaScriptCore 里。一个目录就是一个插件，导出的函数签名就是它的工具定义；内置的 agent、上下文、审批和终端界面也都是普通插件。
 
-目前只支持 macOS（使用系统 JavaScriptCore）。
+支持 macOS（系统 JavaScriptCore）和 Linux（JavaScriptCoreGTK 4.1）。
 
 ## 特点
 
@@ -17,7 +17,16 @@ Ply 是一个 agent harness：Rust 内核负责调度、IO 和记录，插件用
 
 ## 快速开始
 
-需要 macOS、Node/npm 和 Rust 工具链。npm 只用来安装插件的依赖（如 pi-ai），运行时不启动 Node。
+需要 Node/npm 和 Rust 工具链。npm 只用来安装插件的依赖（如 pi-ai），运行时不启动 Node。
+
+macOS 使用系统 JavaScriptCore，无需安装额外的引擎。Linux 需要
+`pkg-config` 和 JavaScriptCoreGTK 4.1 开发包；Debian/Ubuntu 上安装：
+
+```bash
+sudo apt-get install pkg-config libjavascriptcoregtk-4.1-dev
+```
+
+在项目目录构建：
 
 ```bash
 npm ci --ignore-scripts

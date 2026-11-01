@@ -1510,6 +1510,7 @@ dependencies = [
  "libc",
  "oxc",
  "oxc_ecmascript",
+ "pkg-config",
  "ply-core",
  "ply-libc",
  "ply-sh",

@@ -21,5 +21,8 @@ ply-libc.workspace = true
 ply-sh.workspace = true
 ply-core.workspace = true
 
+[build-dependencies]
+pkg-config = "0.3"
+
 [dev-dependencies]
 tempfile.workspace = true

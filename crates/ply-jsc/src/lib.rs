@@ -2,7 +2,7 @@
 //! JavaScriptCore embedded in the ply process.
 //!
 //! Important decisions:
-//! - The engine is the system JavaScriptCore (macOS for now), driven
+//! - The engine is the system JavaScriptCore (macOS framework or Linux GTK), driven
 //!   through its C API. It ships no host APIs of its own; everything plugin
 //!   code can do comes from ply's prelude. Files/processes go through
 //!   `ply-libc` into `ply-io`; `fetch` uses Rust HTTP.
@@ -19,10 +19,11 @@
 //! - Layers above reach the IO layer through this crate only, so the
 //!   types they need are re-exported here.
 
-#[cfg(not(target_os = "macos"))]
-compile_error!("ply-jsc currently supports macOS only (system JavaScriptCore)");
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+compile_error!("ply-jsc supports macOS (system JavaScriptCore) and Linux (JavaScriptCoreGTK 4.1)");
 
 mod ffi;
+mod process_memory;
 mod checkpoints;
 mod memory;
 mod http;

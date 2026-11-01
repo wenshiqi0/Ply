@@ -66,6 +66,22 @@ impl World {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn process_and_os_report_the_host_platform() {
+    let w = world();
+    let main = w.plugin("platform.ts", r#"
+import os from "node:os";
+export function host() {
+  return [process.platform, process.arch, os.platform(), os.arch(), os.type()];
+}
+"#);
+    let realm = w.realm("platform").await;
+    w.rt.run_main(realm, &main).await.unwrap();
+    let (platform, os_type) = if cfg!(target_os = "macos") { ("darwin", "Darwin") } else { ("linux", "Linux") };
+    let arch = match std::env::consts::ARCH { "aarch64" => "arm64", "x86_64" => "x64", other => other };
+    assert_eq!(w.rt.call(realm, &main, "host", vec![]).await.unwrap(), json!([platform, arch, platform, arch, os_type]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn closing_a_realm_reaps_pending_calls_and_never_reuses_its_id() {
     let w = world();
     let realm = w.realm("temporary").await;
