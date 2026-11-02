@@ -78,7 +78,7 @@ export async function onLoad(){
 "#),
         ("approval", r#"
 import * as events from "ply:events";
-export async function onLoad(){await events.define("request");await events.define("toolRequest");return {useDefault:()=>{},ask:async(input)=>await events.emit("approval.toolRequest",input)};}
+export async function onLoad(){await events.define("request");await events.define("toolRequest");return {setMode:()=>{},ask:async(input)=>await events.emit("approval.toolRequest",input)};}
 "#),
         ("worker", r#"
 import {writeFile} from "node:fs/promises";
@@ -132,6 +132,8 @@ fn acp_permission_denial_cancellation_and_eof_stop_actual_child_work() {
         for file in ["entered","executed","cleaned"]{let _=std::fs::remove_file(work.path().join(file));}
         let id=peer.request("session/prompt",json!({"sessionId":session,"prompt":[{"type":"text","text":if wait{"tool wait"}else{"tool"}}]}));
         let permission=loop{let row=peer.row();if row["method"]=="session/request_permission"{break row;}};
+        let change=peer.request("session/set_config_option",json!({"sessionId":session,"configId":"approval_mode","value":"bypass"}));
+        assert_eq!(peer.reply(change)["error"]["code"],-32000,"active permission must not be bypassed by a setting change");
         peer.send(json!({"jsonrpc":"2.0","id":permission["id"],"result":{"outcome":{"outcome":"selected","optionId":if allowed{"allow"}else{"reject"}}}}));
         if wait {
             let deadline=Instant::now()+Duration::from_secs(3);while !work.path().join("entered").exists(){assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
@@ -149,6 +151,24 @@ fn acp_permission_denial_cancellation_and_eof_stop_actual_child_work() {
     peer.send(json!({"jsonrpc":"2.0","id":permission["id"],"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}));
     let deadline=Instant::now()+Duration::from_secs(3);while !work.path().join("entered").exists(){assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
     peer.finish();assert!(!work.path().join("executed").exists());assert!(work.path().join("cleaned").exists());
+}
+
+#[test]
+fn session_permission_modes_are_validated_isolated_and_restored() {
+    let work=tempfile::tempdir().unwrap();fixture(work.path());let mut peer=Peer::start(work.path());let session=peer.session(work.path());
+    let select=|peer:&mut Peer,value:&str|peer.call("session/set_config_option",json!({"sessionId":session,"configId":"approval_mode","value":value}));
+    for value in ["risk","bypass","ask"] {
+        let result=select(&mut peer,value);
+        assert_eq!(result["configOptions"].as_array().unwrap().iter().find(|row|row["id"]=="approval_mode").unwrap()["currentValue"],value);
+    }
+    select(&mut peer,"risk");
+    let bad=peer.request("session/set_config_option",json!({"sessionId":session,"configId":"approval_mode","value":"invented"}));
+    assert_eq!(peer.reply(bad)["error"]["code"],-32602);
+    let another=peer.call("session/new",json!({"cwd":work.path(),"mcpServers":[]}));
+    assert_eq!(another["configOptions"].as_array().unwrap().iter().find(|row|row["id"]=="approval_mode").unwrap()["currentValue"],"ask");
+    peer.finish();let mut peer=Peer::start(work.path());peer.call("initialize",json!({"protocolVersion":1}));
+    let loaded=peer.call("session/load",json!({"sessionId":session,"cwd":work.path(),"mcpServers":[]}));
+    assert_eq!(loaded["configOptions"].as_array().unwrap().iter().find(|row|row["id"]=="approval_mode").unwrap()["currentValue"],"risk");peer.finish();
 }
 
 #[test]

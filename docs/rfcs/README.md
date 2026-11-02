@@ -24,3 +24,4 @@
 | [0018 可信宿主聊天能力](0018-host-chat-capabilities.md) | 已实现 |
 
 | [0019 ACP 协议插件](0019-acp-plugin.md) | 已实现，待发布 |
+| [0020 会话权限策略](0020-session-permissions.md) | 已实现 |

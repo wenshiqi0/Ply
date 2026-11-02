@@ -1,5 +1,5 @@
 import * as events from "ply:events";
-import type { Input, Response } from "./types";
+import type { ApprovalMode, Input, Response } from "./types";
 
 let requestEvent: string;
 
@@ -11,7 +11,7 @@ let resultEvent: string;
 
 let timeout: number;
 
-let mode: "risk" | "ask" | "bypass";
+let mode: ApprovalMode;
 
 let nextRequest = 0;
 
@@ -69,6 +69,11 @@ export async function onLoad() {
   };
   await listen();
   return {
+    /** Trusted host setting; this export is never registered as a model tool. */
+    async setMode(value: ApprovalMode) {
+      if (!["risk", "ask", "bypass"].includes(value)) throw new Error("invalid approval mode");
+      mode = value;
+    },
     async useDefault(value: "ask") {
       if (value !== "ask") throw new Error("invalid default approval mode");
       if (process.env.PLY_APPROVAL_MODE === undefined) mode = value;

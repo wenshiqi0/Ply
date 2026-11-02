@@ -72,6 +72,38 @@ fn named(records: &Records, start: usize, name: &str) -> Vec<(Option<String>, Va
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn trusted_host_can_change_policy_without_exposing_a_model_tool_or_weakening_hard_denials() {
+    let work = tempfile::tempdir().unwrap();
+    std::fs::write(work.path().join("note.txt"), "owned note").unwrap();
+    let (kernel, records) = kernel(work.path(), 5000).await;
+    kernel.load(PluginSource::Embedded { name:"host-policy".into(), source:r#"
+import { approval } from "ply:plugins";
+import * as events from "ply:events";
+export async function onHandle(input) { await approval.setMode(input.mode); }
+export async function onLoad() { await events.on("bash.beforeExecute", event => event.data.command.includes("hard-denied") ? {allow:false,reason:"fixture hard denial"} : {allow:true}); }
+"#.into() }).await.unwrap();
+    kernel.ready().await.unwrap();
+    let ask = kernel.call("agent", prompt("read",json!({"path":"note.txt"}))).await.unwrap();
+    assert_eq!(ask["status"],"approval_required");
+    for mode in ["risk","bypass"] {
+        kernel.call("host-policy",json!({"mode":mode})).await.unwrap();
+        let start=records.0.lock().unwrap().len();
+        let result=kernel.call("agent",prompt("read",json!({"path":"note.txt"}))).await.unwrap();
+        assert_ne!(result["status"],"approval_required");
+        assert!(named(&records,start,"approval.toolRequest").is_empty());
+        assert_eq!(!named(&records,start,"approval.bypassed").is_empty(),mode=="bypass");
+    }
+    let result=kernel.call("agent",prompt("bash",json!({"command":"echo hard-denied > forbidden.txt"}))).await.unwrap();
+    assert_ne!(result["status"],"approval_required");
+    assert!(!work.path().join("forbidden.txt").exists());
+    assert!(kernel.call("host-policy",json!({"mode":"invalid"})).await.is_err());
+    kernel.call("host-policy",json!({"mode":"ask"})).await.unwrap();
+    let again=kernel.call("agent",prompt("read",json!({"path":"note.txt"}))).await.unwrap();
+    assert_eq!(again["status"],"approval_required");
+    kernel.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn model_tools_wait_before_io_and_need_matching_explicit_approval() {
     let work = tempfile::tempdir().unwrap();
     let secret = "PRIVATE-CONTENT-MUST-NOT-BE-READ";

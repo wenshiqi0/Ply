@@ -51,6 +51,7 @@ declare module "ply:plugins" {
   export type AgentResult = import("../../plugins/agent/types").AgentResult;
   export type UsageSummary = import("../../plugins/agent/types").UsageSummary;
   export type ToolAuthorization = import("../../plugins/approval/types").ToolAuthorization;
+  export type ApprovalMode = import("../../plugins/approval/types").ApprovalMode;
   export type CommandAuthorization = import("../../plugins/approval/types").CommandAuthorization;
   export type MemoryInput = import("../../plugins/memory/types").MemoryInput;
   export type MemoryPlugin = Plugin<MemoryInput, import("../../plugins/memory/types").MemoryResult> & ExportsOf<typeof import("../../plugins/memory/main")>;

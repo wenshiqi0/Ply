@@ -58,7 +58,7 @@ export async function prepareServer(options: Options): Promise<() => Promise<voi
     const turn: Active = { session, cancelled: false, tools: new Map() };
     active = turn;
     try {
-      await approval.useDefault("ask");
+      await approval.setMode(session.approvalMode);
       if (turn.cancelled) return { stopReason: "cancelled" };
       const call = agent.hostChat({ prompt: texts.join("\n") || "Describe the supplied images.", images,
         model: session.model, effort: session.effort, snapshot: session.snapshot });

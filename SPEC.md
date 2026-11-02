@@ -60,7 +60,7 @@ RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南
 - agent 从 npm 导入 pi-ai，首次模型请求时才加载，经运行时的 fetch 和 Rust HTTP/TLS 传输；默认 DeepSeek，MiMo 显式选择。密钥取自 profile 的 `apiKeyEnv` 所指的 `process.env` 变量，不使用 pi-ai 的其他环境变量或凭据文件；CLI 只把宿主已设置的 `DEEPSEEK_API_KEY`、`MIMO_API_KEY` 传入插件环境。
 - `ply acp` 是 ACP v1 插件命令；JSON-RPC、会话、模型配置、内容、工具进度、权限请求和取消都在 `plugins/acp`。Rust CLI 和内核不识别协议方法，不保留 MCP 服务或 host-chat 兼容入口。
 - ACP 通过标准 `initialize`、`session/new`、`session/load`、`session/prompt`、`session/set_config_option`、`session/update`、`session/request_permission`、`session/cancel` 接入。私有会话存储在 `~/.ply/plugins/acp`，重载回放公开历史，不输出隐藏推理或恢复快照；每进程串行执行 prompt，会话 cwd 与进程 cwd 相同，不接入非空外部 `mcpServers`。
-- ACP 默认 ask，宿主可显式选择 `--approval-mode risk/ask/bypass`。取消实际中止模型和工具调用，等待清理后返回 `stopReason: cancelled`，连接可继续服务。
+- ACP 默认 ask，宿主可显式选择 `--approval-mode risk/ask/bypass`，或经 `approval_mode` 会话配置选择并持久化策略。每次 prompt 使用其会话策略，活动 prompt 不接受配置变更，既有待审批请求不因设置改变而自动获准。取消实际中止模型和工具调用，等待清理后返回 `stopReason: cancelled`，连接可继续服务。
 - 根 agent 默认最多两个直属子 agent；agent 插件在审批后、发起子调用前同步检查并计数（同 realm 单线程，原子），失败、完成、替换和恢复不退还配额，超额成为工具错误且不产生 Spawn。
 - 父 agent 为每次委派生成一次性凭据，放入子调用输入的 `delegation`（总是覆盖模型提供的值）；子 agent 凭它继承策略上限、报告要求、用量链和父会话快照。未知凭据被拒绝。
 - 子级工具与委派代数只能收窄；默认子级没有 memory 写入能力。max_delegation_depth 为零时不提供 agent 工具，入口也拒绝继续委派。
@@ -90,7 +90,7 @@ RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南
 - 风险复核进入 approval 协调；缺少适配器返回 approval_required，不能把未获批准视为完成。审批请求的 id 由 approval 分配，只用于展示和日志，不含来源字段；请求方按提交内容（command/cwd 或 tool/cwd/input）校验返回结果。审批结果发出 `approval.result` 事件。
 - 插件事件信封为 `{ id, name, source: { plugin }, data }`；内核记录事件时附上 fiber。
 - TUI 仅通过 agent 对话并提供审批交互，agent 自行管理工具白名单。有活动会话时回答审批，否则返回 pending。读取、写入与执行均走对应审批路径。
-- bypass 必须由宿主 CLI 显式选择，发出 `approval.bypassed` 事件；不扩大工具、委派、挂载权限，不跳过硬拒绝或 Jev 评估。
+- bypass 必须由宿主 CLI 或 ACP 客户端显式选择，发出 `approval.bypassed` 事件；不扩大工具、委派、挂载权限，不跳过硬拒绝或 Jev 评估。可信宿主可用 `approval.setMode` 修改策略，该导出不是模型工具。
 - Jev 可选订阅安全事件；缺失凭据、超时或不确定结果进入环境确认，不能让模型自己批准。
 
 ## SPEC-SKILLS-MEMORY：扩展与持久化记忆

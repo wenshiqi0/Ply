@@ -1,6 +1,8 @@
 
 
 /** What bash submits; approval assigns the request id. */
+export type ApprovalMode = "risk" | "ask" | "bypass";
+
 export type Input = { tool: "bash"; command: string; cwd: string; assessments: unknown[] };
 
 export type Response = { request_id: string; decision: "approved" | "rejected" | "pending"; reason?: string; reference?: string; approver?: string };

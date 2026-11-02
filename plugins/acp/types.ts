@@ -1,10 +1,10 @@
-import type { Cancellable, HostModel } from "ply:plugins";
+import type { ApprovalMode, Cancellable, HostModel } from "ply:plugins";
 
 export type ObjectValue = Record<string, unknown>;
 export type Id = string | number;
 export type Message = { jsonrpc: "2.0"; id?: Id | null; method?: string; params?: unknown; result?: unknown; error?: unknown };
 export type Session = {
-  id: string; cwd: string; model: string; effort: string; snapshot?: unknown; history: { role: "user" | "agent"; content: unknown }[];
+  id: string; cwd: string; model: string; effort: string; approvalMode: ApprovalMode; snapshot?: unknown; history: { role: "user" | "agent"; content: unknown }[];
 };
 export type Active = {
   session: Session; cancelled: boolean; call?: Cancellable<unknown>; tools: Map<string, { name: string; input: unknown }>;

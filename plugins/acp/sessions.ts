@@ -1,7 +1,14 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { ApprovalMode } from "ply:plugins";
 import type { Catalog, ConfigOption, ObjectValue, Session } from "./types";
 import { object, ProtocolError, text } from "./transport";
+
+function approvalMode(value: unknown): ApprovalMode {
+  if (value !== "ask" && value !== "risk" && value !== "bypass") throw new ProtocolError(-32602, "invalid approval mode");
+  return value;
+}
+const initialApprovalMode = () => approvalMode(process.env.PLY_APPROVAL_MODE ?? "ask");
 
 export class Sessions {
   private sessions = new Map<string, Session>();
@@ -18,7 +25,7 @@ export class Sessions {
     this.validate(input);
     const selected = this.catalog.find(row => row.isDefault) ?? this.catalog[0];
     if (!selected) throw new ProtocolError(-32000, "model catalog unavailable");
-    const session: Session = { id: "session-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2), cwd: process.cwd(), model: selected.id, effort: selected.defaultEffort, history: [] };
+    const session: Session = { id: "session-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2), cwd: process.cwd(), model: selected.id, effort: selected.defaultEffort, approvalMode: initialApprovalMode(), history: [] };
     await this.save(session); return session;
   }
   async load(input: ObjectValue): Promise<Session> {
@@ -30,7 +37,7 @@ export class Sessions {
     try { saved = object(JSON.parse(await readFile(file, "utf8"))); }
     catch { throw new ProtocolError(-32002, "session not found"); }
     if (saved.format !== 1 || saved.id !== id || saved.cwd !== process.cwd()) throw new ProtocolError(-32602, "session cwd mismatch");
-    const session: Session = { id, cwd: text(saved.cwd), model: text(saved.model), effort: typeof saved.effort === "string" ? saved.effort : text(saved.effort), snapshot: saved.snapshot, history: [] };
+    const session: Session = { id, cwd: text(saved.cwd), model: text(saved.model), effort: typeof saved.effort === "string" ? saved.effort : text(saved.effort), approvalMode: saved.approvalMode === undefined ? initialApprovalMode() : approvalMode(saved.approvalMode), snapshot: saved.snapshot, history: [] };
     if (!Array.isArray(saved.history)) throw new ProtocolError(-32602, "invalid session history");
     session.history = saved.history.map(raw => {
       const row = object(raw);
@@ -59,6 +66,9 @@ export class Sessions {
     return [
       { id: "model", name: "Model", category: "model", type: "select", currentValue: session.model, options: this.catalog.map(row => ({ value: row.id, name: row.name })) },
       { id: "reasoning_effort", name: "Reasoning", category: "thought_level", type: "select", currentValue: session.effort, options: selected.efforts.map(value => ({ value, name: value })) },
+      { id: "approval_mode", name: "Tool approval", category: "permissions", type: "select", currentValue: session.approvalMode, options: [
+        { value: "ask", name: "Ask for every operation" }, { value: "risk", name: "Ask when risk review requires it" }, { value: "bypass", name: "Allow without asking" },
+      ] },
     ];
   }
   async select(session: Session, input: ObjectValue): Promise<void> {
@@ -69,6 +79,7 @@ export class Sessions {
       const selected = this.catalog.find(row => row.id === value);
       if (selected && !selected.efforts.includes(updated.effort)) updated.effort = selected.defaultEffort;
     } else if (id === "reasoning_effort") updated.effort = value;
+    else if (id === "approval_mode") updated.approvalMode = approvalMode(value);
     else throw new ProtocolError(-32602, "unknown config option");
     this.validateSelection(updated); await this.save(updated);
     Object.assign(session, updated);
