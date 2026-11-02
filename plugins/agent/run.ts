@@ -1,6 +1,6 @@
 import * as checkpoints from "ply:checkpoints";
 import type { AgentInput, AgentPolicy, AgentResult, Block, Message, Recovery, ReportState, RunUsage, UsageSummary } from "./types";
-import { REPORT_END, reportFor, sectionNames, validateReport } from "./report";
+import { MAX_REJECTED_REPORTS, REPORT_END, reportFor, sectionNames, validateReport } from "./report";
 import { audit } from "./audit";
 import { delegations } from "./state";
 import { combinedUsage, startUsage, tokenUsage, totalUsageSummary, usageSummary } from "./usage";
@@ -62,6 +62,7 @@ export async function onHandle(input: AgentInput, continuation?: HostConversatio
     }
     policy = policyFor(input, await context.availableTools(), parent, saved?.policy);
     report = reportFor(input, parent, saved?.report);
+    if (report.rejected_reports >= MAX_REJECTED_REPORTS) throw new Error(`report validation failed after ${report.rejected_reports} rejected reports; automatic repair budget exhausted`);
     run = startUsage(policy, report, parent, saved?.children_started ?? 0);
     await audit("policy", { ...policy, resumed_from: checkpointId ?? null });
     profile = saved?.profile ?? (await context.currentModel()) ?? undefined;
@@ -110,6 +111,7 @@ export async function onHandle(input: AgentInput, continuation?: HostConversatio
           // Regenerate in this same agent; no extra child or slot is created.
           await context.repairReport(id, checked.errors, prepared.revision);
           nextTurn = turn + 1;
+          if (report.rejected_reports >= MAX_REJECTED_REPORTS) throw new Error(`report validation failed after ${report.rejected_reports} rejected reports: ${checked.errors.join(", ")}`);
           continue;
         }
         const observed = tokenUsage(reply.usage);
