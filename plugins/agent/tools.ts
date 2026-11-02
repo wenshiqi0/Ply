@@ -2,6 +2,10 @@ import plugins from "ply:plugins";
 import type { Block, RunUsage, ToolOutcome } from "./types";
 import type { ToolAuthorization } from "ply:plugins";
 import { delegations } from "./state";
+import { audit } from "./audit";
+
+const eventPrefix = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+let nextToolEvent = 0;
 
 export function sameJson(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -16,6 +20,8 @@ export async function runTool(call: Block, offered: string[], run: RunUsage): Pr
   let output: unknown;
   let isError = false;
   let approvals: unknown[] | undefined;
+  const eventId = eventPrefix + "-" + (++nextToolEvent);
+  await audit("tool_call", { id: eventId, name, input: call.arguments ?? {} });
   try {
     if (!offered.includes(name) || !policy.allowed_tools.includes(name)) throw new Error(`no tool named ${name}`);
     if (name === "agent" && policy.max_delegation_depth === 0) throw new Error("delegation is not allowed");
@@ -46,6 +52,7 @@ export async function runTool(call: Block, offered: string[], run: RunUsage): Pr
     isError = true;
     output = e instanceof Error ? e.message : String(e);
   }
+  await audit("tool_result", { id: eventId, name, output, isError });
   return { id: call.id ?? "", name, output, isError, ...(approvals ? { approval_requests: approvals } : {}) };
 }
 

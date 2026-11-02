@@ -59,6 +59,14 @@ await context.set({ source: "skill", type: context.Type.Extensions, key: "skills
 
 `source` 是插件自己的名字；不指定数字 order，也不注册构建回调，类型决定顺序和更新策略。不给 `conversation` 时修改模板，只影响之后打开的会话。详见 [上下文](context.md) 和 [RFC 0007](rfcs/0007-context.md)。
 
+## 宿主协议插件
+
+[acp](../plugins/acp/main.ts) 没有 `onHandle`，在 `onLoad` 注册 `acp` 命令。`entrypoint.json` 声明命令名和额外依赖，CLI 按通用机制选择加载，协议逻辑只在 TypeScript 插件中。带 `stdio: "inherit"` 的宿主命令独占标准流，其他插件输出仍隔离；插件内部调用命令不获得宿主标准流。
+
+插件工具调用和导出方法返回可 await 的调用能力，`cancel()` 取消这一次调用及其等待的子调用，随后仍 await 原调用观察结果。它不暴露调度身份。
+
+CLI 为各插件挂载私有 `/ply/state`（`process.env.PLY_DATA_DIRECTORY`），宿主目录为 `~/.ply/plugins/<插件名>`；不同插件不能通过挂载文件 API 读取彼此的状态。挂载继续不构成 OS 沙箱。
+
 ## 内置插件
 
 默认加载 DeepSeek 接入；用 `--model mimo-v2.6-pro` 或 `--model mimo-v2.6-flash` 切换为 MiMo，两者只加载一个。
@@ -80,7 +88,7 @@ await context.set({ source: "skill", type: context.Type.Extensions, key: "skills
 | [tui](../plugins/tui/main.ts) | onHandle、onLoad | 可选的终端交互与审批界面；只调用 agent |
 | [jev](../plugins/jev/main.ts) | onLoad | 可选的 TypeSafe Jev 安全检查，订阅 `bash.beforeExecute`；用 `--jev` 启用 |
 
-context、deepseek、mimo 等没有 `onHandle` 的插件不能被调用，也不会作为工具透出给模型或 MCP 客户端。
+context、deepseek、mimo 等没有 `onHandle` 的插件不能被调用，也不会作为工具透出给模型。
 
 ## Skills
 

@@ -42,7 +42,7 @@
 ### 2. 进程身份与资源
 
 - `process.pid`、`ppid`、`getuid`/`getgid`、`execPath` 报告 ply 进程的真实值，与子进程的真实 pid 一致。`process.env` 与 `HOME` 仍是精选的，密钥规则（RFC 0013）不变。
-- `process.stdin` 只有 `ply run` 脚本读到真实输入。MCP 和 TUI 模式下 stdin 属于宿主协议和终端，插件得到一个立即结束的空流。
+- `process.stdin` 默认为空流；由宿主执行、声明 `stdio: "inherit"` 的插件命令得到真实标准流，其他插件继续隔离。ACP 使用此通用能力，见 [RFC 0019](0019-acp-plugin.md)。
 - 插件是可信的：socket、子进程和信号不经审批。每个 realm 有打开句柄的数量上限，与现有的 HTTP 请求上限一样。
 - 模型的 bash 工具不受影响，仍走 Ply sh。
 

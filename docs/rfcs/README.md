@@ -22,3 +22,5 @@
 | [0016 命令即程序](0016-commands-as-programs.md) | 提议 |
 | [0017 Linux 支持](0017-linux.md) | 已实现 |
 | [0018 可信宿主聊天能力](0018-host-chat-capabilities.md) | 已实现 |
+
+| [0019 ACP 协议插件](0019-acp-plugin.md) | 已实现，待发布 |

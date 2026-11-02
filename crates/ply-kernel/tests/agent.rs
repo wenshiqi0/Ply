@@ -123,7 +123,7 @@ async fn the_agent_loops_model_turns_and_runs_the_offered_tools_as_child_fibers(
     let persisted: Vec<Value> = std::fs::read_to_string(&record).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
     assert!(!persisted.iter().any(|event| event["event"] == "record"));
     let own: Vec<_> = persisted.iter().filter(|event| event["event"] == "plugin" && event["fiber"] == agent).map(|event| event["name"].as_str().unwrap()).collect();
-    assert_eq!(own, ["agent.policy", "agent.model_call_started", "agent.model_call", "agent.model_call_started", "agent.model_call", "agent.report"]);
+    assert_eq!(own, ["agent.policy", "agent.model_call_started", "agent.model_call", "agent.tool_call", "agent.tool_call", "agent.tool_result", "agent.tool_result", "agent.model_call_started", "agent.model_call", "agent.report"]);
     assert!(persisted.iter().filter(|event| event["event"] == "plugin").all(|event| event["plugin"] == "agent" && event["data"].get("type").is_none()));
     assert_eq!(persisted.last().unwrap()["event"], "exit");
 

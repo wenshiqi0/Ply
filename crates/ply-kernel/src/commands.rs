@@ -6,11 +6,15 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use ply_jsc::Caller;
 
+fn is_false(value: &bool) -> bool { !value }
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandSpec {
     pub name: String,
     pub description: String,
     pub plugin: String,
+    #[serde(skip_serializing_if = "is_false")]
+    pub stdio: bool,
 }
 
 #[derive(Clone)]
@@ -44,6 +48,13 @@ impl Kernel {
 
     /// Start a registered command as a top-level fiber; not a model tool.
     pub async fn run_command(&self, name: &str, input: Value) -> Result<Value, KernelError> {
+        let entry = self.commands().into_iter().find(|entry| entry.name == name);
+        let realm = entry.filter(|entry| entry.stdio).and_then(|entry| self.find(&entry.plugin)).map(|entry| entry.realm);
+        let _lease = if realm.is_some() { Some(self.inner.host_stdio.lock().await) } else { None };
+        struct Streams<'a>(&'a ply_jsc::JsRuntime, Option<ply_jsc::RealmId>);
+        impl Drop for Streams<'_> { fn drop(&mut self) { if let Some(realm) = self.1 { self.0.set_stdio(realm, false); } } }
+        let _streams = Streams(&self.inner.js, realm);
+        if let Some(realm) = realm { self.inner.js.set_stdio(realm, true); }
         self.invoke_command(name, input, None).await
     }
 
@@ -121,9 +132,14 @@ impl Kernel {
             .and_then(Value::as_str)
             .filter(|s| PluginSpec::valid_name(s))
             .ok_or("command name must match [a-zA-Z0-9_-]{1,64}")?;
-        if ["tools", "commands", "call", "mcp", "run", "help"].contains(&name) {
+        if self.inner.reserved_commands.iter().any(|reserved| reserved == name) {
             return Err(format!("command name `{name}` is reserved by the CLI"));
         }
+        let stdio = match args.get("stdio") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(value)) if value == "inherit" => true,
+            _ => return Err("command stdio must be inherit when provided".into()),
+        };
         let description = match args.get("description") {
             None => "",
             Some(Value::String(s)) if s.len() <= 4096 => s,
@@ -143,6 +159,7 @@ impl Kernel {
             Registration {
                 spec: CommandSpec {
                     name: name.into(),
+                    stdio,
                     description: description.into(),
                     plugin,
                 },

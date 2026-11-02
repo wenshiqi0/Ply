@@ -61,10 +61,18 @@ export async function onLoad() {
   toolEvent = await events.define("toolRequest");
   bypassedEvent = await events.define("bypassed");
   resultEvent = await events.define("result");
-  if (mode === "ask" || mode === "bypass") {
-    await events.on("bash.beforeExecute", () => ({ allow: false, requires_approval: true, decision: "review", reason: mode === "bypass" ? "host selected bypass authorization for this bash call" : "approval policy requires confirmation for this bash call" }));
-  }
+  let listening = false;
+  const listen = async () => {
+    if (listening) return;
+    listening = true;
+    await events.on("bash.beforeExecute", () => mode === "risk" ? { allow: true } : ({ allow: false, requires_approval: true, decision: "review", reason: mode === "bypass" ? "host selected bypass authorization for this bash call" : "approval policy requires confirmation for this bash call" }));
+  };
+  await listen();
   return {
+    async useDefault(value: "ask") {
+      if (value !== "ask") throw new Error("invalid default approval mode");
+      if (process.env.PLY_APPROVAL_MODE === undefined) mode = value;
+    },
     async requestCommandApproval(input: Input) {
       if (!input || input.tool !== "bash" || typeof input.command !== "string" || typeof input.cwd !== "string" || !Array.isArray(input.assessments)) throw new Error("invalid command approval request");
       const request: PlyApprovalRequest = { schema_version: 1, id: "approval-" + (++nextRequest), tool: input.tool, command: input.command, cwd: input.cwd,

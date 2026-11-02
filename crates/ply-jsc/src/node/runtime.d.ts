@@ -3,6 +3,7 @@
 // (Buffer, process, …) are the ones @types/node describes.
 declare module "ply:runtime" {
   /** Gives a Uint8Array Buffer's prototype, without copying. */
+  export function readStdin(): Promise<Uint8Array>;
   export function toBuffer(bytes: Uint8Array): Buffer;
   export function encode(text: string, encoding?: string): Uint8Array;
   export function decode(bytes: Uint8Array, encoding?: string): string;

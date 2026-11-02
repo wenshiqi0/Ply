@@ -11,7 +11,7 @@ cargo build -p ply-cli
 | `ply tools` | 列出已加载插件及其工具 schema（JSON） |
 | `ply call PLUGIN JSON` | 调用一个插件并输出结果 |
 | `ply run FILE.ts -- ARGS` | 像 node 一样运行一个 TS 文件，定时器跑完才退出；通过 `ply:plugins` 导入插件目录 |
-| `ply mcp` | 以 stdio JSON-RPC 提供 MCP 工具服务 |
+| `ply acp` | 由 ACP 插件注册，以 stdio 提供 agent 会话 |
 | `ply tui` | 交互任务与终端审批，见 [审批与安全](approval.md) |
 | `ply commands` | 列出插件注册的顶层命令（JSON），例如 `ply memory` |
 
@@ -22,13 +22,13 @@ cargo build -p ply-cli
 ./target/debug/ply run ./script.ts -- arg1
 ```
 
-作为 MCP server 给其他 agent 使用（例如 Claude Code）：
+通过 ACP 连接支持 ACP v1 的客户端：
 
 ```bash
-claude mcp add ply -- /path/to/ply/target/debug/ply mcp --record /tmp/ply-fibers.jsonl
+/path/to/ply/target/debug/ply acp --record /tmp/ply-events.jsonl
 ```
 
-MCP 服务按行处理 JSON-RPC 2.0 请求，可以并发；非法 JSON、版本、方法、id 或参数会返回明确的错误，坏请求之后继续服务。
+ACP 插件按行处理 JSON-RPC 2.0，提供会话、图片提示、模型/思考配置、公开回复、工具进度、双向权限请求及会话取消。会话私有状态保存在 `~/.ply/plugins/acp`，工作目录必须与进程挂载目录一致；本版不接入外部 MCP servers。旧 `ply mcp` 与 `--host-chat` 已移除，客户端须改为 ACP。协议入口不成为模型工具；实现与边界见 [RFC 0019](rfcs/0019-acp-plugin.md)。
 
 ## 常用选项
 

@@ -9,6 +9,27 @@ use std::time::{Duration, Instant};
 use ply_io::{DiskStorage, ExecSpec, Io, MemoryStorage, MountMode, SqliteStorage};
 
 #[tokio::test]
+async fn private_views_isolate_state_and_follow_dynamic_parent_mounts() {
+    let shared = Io::new();
+    shared.mount("/work", Arc::new(MemoryStorage::empty()), MountMode::ReadWrite).unwrap();
+    let first = shared.view();
+    let second = shared.view();
+    for view in [&first, &second] { view.mount("/state", Arc::new(MemoryStorage::empty()), MountMode::ReadWrite).unwrap(); }
+    first.write("/state/private", b"first only").await.unwrap();
+    assert!(second.read("/state/private").await.is_err());
+    assert!(shared.read("/state/private").await.is_err());
+    shared.mount("/added", Arc::new(MemoryStorage::empty()), MountMode::ReadWrite).unwrap();
+    shared.write("/added/new", b"live mount").await.unwrap();
+    assert_eq!(first.read("/added/new").await.unwrap(), b"live mount");
+    shared.swap("/work", Arc::new(MemoryStorage::empty()), MountMode::ReadWrite).unwrap();
+    second.write("/work/new", b"live swap").await.unwrap();
+    assert_eq!(first.read("/work/new").await.unwrap(), b"live swap");
+    shared.unmount("/added").unwrap();
+    assert!(first.read("/added/new").await.is_err());
+    assert_eq!(first.read("/state/private").await.unwrap(), b"first only");
+}
+
+#[tokio::test]
 async fn only_mounted_storage_exists() {
     let io = Io::new();
     io.mount("/workspace", Arc::new(MemoryStorage::empty()), MountMode::ReadWrite).unwrap();

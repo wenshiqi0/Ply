@@ -19,6 +19,9 @@ impl Io {
         Self::default()
     }
 
+    /// A private overlay that continues to observe changes to the parent mounts.
+    pub fn view(&self) -> Self { Self { ns: Arc::new(Namespace::view(self.ns.clone())) } }
+
     // ---- mounts ----
 
     pub fn mount(&self, at: &str, storage: Arc<dyn Storage>, mode: MountMode) -> io::Result<MountInfo> {

@@ -2,7 +2,7 @@ import * as events from "ply:events";
 
 // The agent's audit trail: plugin events the kernel records with the call
 // that emitted them. Nothing needs to listen.
-const names = { model_call_started: "", model_call: "", context_compaction: "", policy: "", checkpoint: "", report: "" };
+const names = { model_call_started: "", model_call: "", context_compaction: "", policy: "", checkpoint: "", report: "", tool_call: "", tool_result: "" };
 
 /** Declare the audit events; onLoad only. */
 export async function declareAudit() {

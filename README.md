@@ -13,7 +13,7 @@ Ply 是一个 agent harness：Rust 内核负责调度、IO 和记录，插件用
 - **挂载式 IO**：文件访问通过挂载，后端可在磁盘、内存、SQLite 之间切换；模型的 `bash` 工具由内置的 Ply sh 执行。
 - **自带 agent**：分层上下文与自动压缩、子 agent 委派与配额、用量统计、失败后从快照恢复；当前接入 DeepSeek 与 MiMo。
 - **审批与安全**：环境审批协议、终端 TUI 审批、可选的 Jev 命令风险审查。
-- **多种入口**：CLI、脚本、MCP server、TUI；`--record` 把每次调用的过程写成 JSON lines。
+- **多种入口**：CLI、脚本、ACP agent server、TUI；`--record` 把每次调用的过程写成 JSON lines。
 
 ## 快速开始
 
@@ -43,10 +43,10 @@ cargo build -p ply-cli
 ./target/debug/ply call agent '{"prompt": "只读总结这个项目"}'
 ```
 
-作为 MCP server 给其他 agent 使用：
+通过 ACP 连接 agent 客户端：
 
 ```bash
-claude mcp add ply -- /path/to/ply/target/debug/ply mcp
+/path/to/ply/target/debug/ply acp
 ```
 
 ## 一个插件

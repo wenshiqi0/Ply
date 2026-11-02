@@ -41,7 +41,14 @@
   // rewrite what is sent (the host checks it regardless).
   const callArgs = (args) => jsonStringify(args === undefined ? null : objectAssign(objectCreate(null), args));
   const op = (name, args, bytes) => unwrap(host(name, callArgs(args), bytes));
-  const opAsync = async (name, args, bytes) => unwrap(await hostAsync(name, callArgs(args), bytes));
+  const opAsync = async (name, args, bytes, token) => unwrap(await hostAsync(name, callArgs(args), bytes, token));
+  let nextOperation = 0;
+  function cancellable(name, args) {
+    const token = ++nextOperation;
+    const result = opAsync(name, args, undefined, token);
+    objectDefineProperty(result, "cancel", { value: () => op("operation.cancel", { token }) });
+    return result;
+  }
   const plain = (u8) =>
     u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength && Object.getPrototypeOf(u8) === Uint8Array.prototype
       ? u8
@@ -736,8 +743,13 @@
   //   Schema of its tool arguments) and `wrapsInput`.
   function callHandle(plugin, input) {
     let started = null;
-    const start = () => (started ??= opAsync("kernel.spawn", { plugin, input: input === undefined ? null : input }));
+    let stopped = false;
+    const start = () => {
+      if (stopped && !started) return Promise.reject(Object.assign(new Error("call cancelled"), { name: "AbortError", code: "ERR_PLY_CANCELLED" }));
+      return started ??= cancellable("kernel.spawn", { plugin, input: input === undefined ? null : input });
+    };
     return objectFreeze({
+      cancel: () => { stopped = true; started?.cancel(); },
       then: (onDone, onFailed) => start().then(onDone, onFailed),
       catch: (onFailed) => start().catch(onFailed),
       finally: (onSettled) => start().finally(onSettled),
@@ -761,7 +773,7 @@
       if (typeof key === "string" && known) {
         if (objectHasOwn(known.mounts.data, key)) return known.mounts.data[key];
         if (known.mounts.methods.includes(key)) {
-          if (!methods.has(key)) methods.set(key, (...args) => opAsync("kernel.method", { plugin: name, method: key, args }));
+          if (!methods.has(key)) methods.set(key, (...args) => cancellable("kernel.method", { plugin: name, method: key, args }));
           return methods.get(key);
         }
       }
@@ -804,8 +816,9 @@
   // like Buffer; compiled once per process, evaluated per realm.
   Object.assign(G, compile(op("web.source"))(op, opAsync, plain));
   // What runtime modules import as "ply:runtime".
-  const runtime = objectFreeze(objectAssign(objectCreate(null), { toBuffer, encode, decode, inspect, format, deepEqual }));
+  const runtime = objectFreeze(objectAssign(objectCreate(null), { toBuffer, encode, decode, inspect, format, deepEqual, readStdin: () => opAsync("stdio.read", {}) }));
   // Buffer's methods are part of the global; atob/btoa and global are Node's.
+  objectDefineProperty(process, "stdin", { get: () => internal("stdio").stdin });
   const bufferModule = internal("buffer");
   objectAssign(G, { global: G, atob: bufferModule.atob, btoa: bufferModule.btoa });
 
@@ -872,7 +885,7 @@
           const id = ++nextCommandCallback;
           commandCallbacks.set(id, command.handler);
           try {
-            await opAsync("kernel.command_register", { name: command.name, description: command.description, callback: id });
+            await opAsync("kernel.command_register", { name: command.name, description: command.description, stdio: command.stdio, callback: id });
           } catch (error) { commandCallbacks.delete(id); throw error; }
         },
         list: () => opAsync("kernel.command_list", {}),

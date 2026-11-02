@@ -32,6 +32,7 @@ mod runtime;
 mod sh;
 mod host_commands;
 mod terminal;
+mod stdio;
 mod whatwg;
 mod markdown;
 mod skills;

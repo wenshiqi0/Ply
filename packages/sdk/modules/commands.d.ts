@@ -1,8 +1,10 @@
 declare module "ply:commands" {
-  export interface CommandInfo { name: string; description: string; plugin: string }
+  export interface CommandInfo { name: string; description: string; plugin: string; stdio?: boolean }
   export interface Command<Input = unknown, Output = unknown> {
     name: string;
     description?: string;
+    /** Host invocation grants standard streams only to this command owner. */
+    stdio?: "inherit";
     handler: (input: Input) => Output | PromiseLike<Output>;
   }
   export function register<Input = unknown, Output = unknown>(command: Command<Input, Output>): Promise<void>;

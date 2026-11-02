@@ -15,7 +15,9 @@ Rust 是主核心：内核加载插件、调度调用、提供 IO 并记录发�
 | `ply-storage` | 磁盘 / 内存 / SQLite 后端，同一套行为测试同时覆盖三种 |
 | `ply-sh` | 内部 shell 解释器及工具集，执行模型 bash 工具的脚本，见 [ply-sh](../crates/ply-sh/README.md) |
 | `ply-libc` | errno / path / fs / glob / time |
-| `ply-cli` | tools / call / run / mcp / tui / commands，以及插件注册的顶层命令 |
+| `ply-cli` | tools / call / run / tui / commands，以及插件注册的顶层命令 |
+
+协议由 [ACP 插件](../plugins/acp/main.ts) 承担。宿主按插件的 `entrypoint.json` 发现注册命令及依赖；`stdio: "inherit"` 只为宿主调用的命令拥有者接通标准流。内核不路由协议方法。各插件的 `/ply/state` 是独立挂载，共享工作区挂载仍实时可见。
 
 ## fiber：内核的调度单位
 

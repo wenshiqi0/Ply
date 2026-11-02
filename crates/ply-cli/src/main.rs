@@ -3,7 +3,7 @@
 //! ```text
 //! ply tools                              describe the loaded plugins
 //! ply call edit '{"path": "a.txt", ...}' run one plugin, print its output
-//! ply mcp                                serve the plugins as MCP tools (stdio)
+//! ply acp                                serve agent sessions (plugin command)
 //! ply run ./script.ts -- arg1            run TS/JS; import ply:plugins
 //! ply commands                          list registered plugin commands
 //! ply tui                               run the registered TUI command
@@ -19,16 +19,13 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use ply_kernel::{Io, JsonlRecorder, Kernel, KernelConfig, KernelError, MountMode, PluginSource, StorageSpec};
 
 mod user_skills;
-mod mcp;
 
 #[derive(Parser)]
 #[command(name = "ply", version, about = "ply agent harness")]
@@ -45,8 +42,6 @@ enum Cmd {
     Commands(Setup),
     /// Run one plugin and print its output (JSON).
     Call(CallArgs),
-    /// Serve the plugins to an agent as MCP tools (JSON-RPC on stdin/stdout).
-    Mcp(Setup),
     /// Run a TypeScript/JavaScript file; import plugins from ply:plugins.
     Run(RunArgs),
     /// Interact with the agent and respond to tool approval requests in a terminal.
@@ -58,6 +53,8 @@ enum Cmd {
 
 #[derive(clap::Args)]
 struct Setup {
+    #[arg(skip)]
+    entrypoint: Option<String>,
     /// `AT=disk:PATH[:ro]`, `AT=sqlite:PATH[:ro]`, `AT=memory`, or
     /// `disk:PATH[:ro]` (mounted at its own absolute path). Repeatable.
     /// Default: the current directory, read-write, at its own path;
@@ -73,9 +70,6 @@ struct Setup {
     /// JSON options passed to one plugin's onLoad. Repeat for different plugins.
     #[arg(long = "plugin-options", value_name = "NAME=JSON", value_parser = parse_plugin_options)]
     plugin_options: Vec<(String, Value)>,
-    /// Expose trusted host conversation methods over MCP (not model tools).
-    #[arg(long)]
-    host_chat: bool,
     /// Host approval policy. Model grants and hard denials still apply.
     #[arg(long, value_parser = ["risk", "ask", "bypass"])]
     approval_mode: Option<String>,
@@ -278,6 +272,8 @@ async fn kernel(setup: &Setup, ui: UiMode) -> Result<Kernel> {
         user_skills::mount(&io, std::env::var_os("HOME").map(PathBuf::from))?
     } else { None };
     let mut config = KernelConfig::new(io, cwd);
+    config.state_root = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".ply/plugins"));
+    config.reserved_commands = ["tools", "commands", "call", "run", "help"].into_iter().map(String::from).collect();
     config.env.insert("PLY_LAUNCH_DIRECTORY".into(), launch);
     if let Some(directory) = user_skills_directory {
         config.env.insert("PLY_USER_SKILLS_DIRECTORY".into(), directory);
@@ -289,10 +285,9 @@ async fn kernel(setup: &Setup, ui: UiMode) -> Result<Kernel> {
     }
     // The host selects the approval policy. The TUI only presents requests;
     // agent tool visibility and delegation remain agent-owned defaults.
-    if setup.host_chat { config.env.insert("PLY_HOST_CHAT".into(), "1".into()); }
     if let Some(mode) = &setup.approval_mode {
         config.env.insert("PLY_APPROVAL_MODE".into(), mode.clone());
-    } else if tui || setup.host_chat {
+    } else if tui {
         config.env.insert("PLY_APPROVAL_MODE".into(), if matches!(ui, UiMode::Bypass) { "bypass" } else { "ask" }.into());
     }
     if let Some(model) = &setup.model {
@@ -337,10 +332,20 @@ async fn kernel(setup: &Setup, ui: UiMode) -> Result<Kernel> {
         };
         kernel.load(plugin).await.context("loading the default plugins")?;
     }
+    if !setup.no_default_plugins {
+        if let Some(entrypoint) = &setup.entrypoint {
+            for source in PluginSource::entrypoint(entrypoint) {
+                let name = match &source { PluginSource::Bundled { name, .. } | PluginSource::Embedded { name, .. } => name.as_str(), PluginSource::Dir(_) => unreachable!() };
+                if !kernel.plugins().iter().any(|plugin| plugin.name == name) && !setup.plugins.iter().any(|dir| dir.file_name().is_some_and(|value| value == name)) {
+                    kernel.load(source).await.context("loading entrypoint dependencies")?;
+                }
+            }
+        }
+    }
     for dir in &setup.plugins {
         kernel.load(PluginSource::Dir(dir.clone())).await.with_context(|| format!("loading plugin {}", dir.display()))?;
     }
-    if (setup.jev || tui || setup.host_chat || setup.approval_mode.is_some()) && !setup.plugins.iter().any(|path| path.file_name().and_then(|name| name.to_str()) == Some("approval")) {
+    if (setup.jev || tui || setup.approval_mode.is_some()) && !kernel.plugins().iter().any(|plugin| plugin.name == "approval") && !setup.plugins.iter().any(|path| path.file_name().and_then(|name| name.to_str()) == Some("approval")) {
         kernel.load(PluginSource::builtin("approval").context("missing approval plugin")?).await.context("loading approval coordination")?;
     }
     if setup.jev { kernel.load(PluginSource::builtin("jev").context("missing Jev plugin")?).await.context("loading Jev")?; }
@@ -365,10 +370,11 @@ async fn describe(setup: Setup) -> Result<i32> {
     Ok(0)
 }
 
-async fn describe_commands(setup: Setup) -> Result<i32> {
+async fn describe_commands(mut setup: Setup) -> Result<i32> {
     // Discover the bundled TUI by default; --no-default-plugins lists only
     // explicitly selected providers without requiring agent/UI dependencies.
     let include_tui = !setup.no_default_plugins;
+    if include_tui { setup.entrypoint = Some("*".into()); }
     let kernel = kernel(&setup, if include_tui { UiMode::Ask } else { UiMode::Disabled }).await?;
     println!("{}", serde_json::to_string_pretty(&kernel.commands())?);
     kernel.close().await;
@@ -386,16 +392,18 @@ async fn registered(args: Vec<String>) -> Result<i32> {
         }
         Err(error) => return Err(error.into()),
     };
-    let Cmd::Call(args) = parsed.command else { unreachable!() };
+    let Cmd::Call(mut args) = parsed.command else { unreachable!() };
     let input = args.input.as_deref().map(serde_json::from_str).transpose().context("command input must be JSON")?.unwrap_or_else(|| json!({}));
+    args.setup.entrypoint = Some(args.plugin.clone());
     let kernel = kernel(&args.setup, UiMode::Disabled).await?;
+    let streams = kernel.commands().iter().any(|command| command.name == args.plugin && command.stdio);
     let result = kernel.run_command(&args.plugin, input).await;
     for plugin in kernel.plugins() {
         if let Some(out) = kernel.take_output(&plugin.name).await { eprint!("{}{}", out.stdout, out.stderr); }
     }
     kernel.close().await;
     match result {
-        Ok(output) => { println!("{}", serde_json::to_string_pretty(&output)?); Ok(0) }
+        Ok(output) => { if !streams { println!("{}", serde_json::to_string_pretty(&output)?); } Ok(0) }
         Err(error) => { eprintln!("ply {}: {error}", args.plugin); Ok(1) }
     }
 }
@@ -452,7 +460,6 @@ async fn main() -> Result<()> {
         Cmd::Tools(setup) => describe(setup).await?,
         Cmd::Commands(setup) => describe_commands(setup).await?,
         Cmd::Call(args) => call(args).await?,
-        Cmd::Mcp(setup) => mcp::serve_mcp(setup).await?,
         Cmd::Run(args) => run(args).await?,
         Cmd::Tui(args) => {
             let kernel = kernel(&args.setup, if args.bypass { UiMode::Bypass } else { UiMode::Ask }).await?;

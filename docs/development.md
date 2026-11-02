@@ -25,9 +25,9 @@ cargo test --workspace --locked --offline
 - `npm run check` 执行严格类型检查、ESLint、文档链接检查和插件可见面检查（插件、示例、SDK 和运行时 prelude 中不能出现 fiber、`ply:lifecycle`、全局 `ctx`、`.loaded` 或已删除的 `ply:models`），覆盖 SDK 声明、插件、示例与 [类型契约反例](../type-tests/plugins.ts)。
 - 根 `tsconfig.json` 打开 `skipLibCheck`，因为 `node_modules` 里的第三方 d.ts 在本仓库的配置下无法通过；`packages/sdk` 的声明由 [check-sdk-types.mjs](../scripts/check-sdk-types.mjs) 单独严格检查。
 - 根 `tsconfig.json` 自动加载 SDK 声明，编辑器打开仓库即可检查所有插件和示例。
-- 涉及内置模块加载的改动要跑完整的 workspace 测试，包括 CLI、MCP、真实 PTY 与目录插件。
+- 涉及内置模块加载的改动要跑完整的 workspace 测试，包括 CLI、ACP、真实 PTY 与目录插件。
 - 自动化测试只用 fixture 和本地 HTTP；真实供应商调用需要另行取得授权并保留轨迹。
-- [GitHub Actions](../.github/workflows/ci.yml) 在 macOS 和 Ubuntu runner 上对每次推送到 main 和每个 pull request 运行同样的检查（`npm ci`、`npm run check`、`npm run compat:check`、`cargo test --workspace --locked`），包括真实 PTY、CLI 与 MCP；Linux runner 先安装 JavaScriptCoreGTK 开发包。
+- [GitHub Actions](../.github/workflows/ci.yml) 在 macOS 和 Ubuntu runner 上对每次推送到 main 和每个 pull request 运行同样的检查（`npm ci`、`npm run check`、`npm run compat:check`、`cargo test --workspace --locked`），包括真实 PTY、CLI 与 ACP；Linux runner 先安装 JavaScriptCoreGTK 开发包。
 
 ## Node 兼容用例
 

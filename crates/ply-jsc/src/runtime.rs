@@ -194,6 +194,7 @@ enum Msg {
     /// prelude reports back via `settle`.
     Api { id: u64, method: &'static str, args: Vec<String>, fiber: Option<String>, cancel: Arc<CallCancellation>, reply: Reply<Result<Value, JsError>> },
     TakeOutput(Reply<Output>),
+    Stdio(bool),
     Idle(Reply<()>),
     Directory(Value),
     RawHostCall(String, Value, Reply<Value>),
@@ -292,6 +293,9 @@ impl JsRuntime {
             Ok(())
         })
     }
+
+    /// Connect a top-level entry to host standard streams; other realms stay buffered.
+    pub fn set_stdio(&self, realm: RealmId, enabled: bool) { self.send(realm, Msg::Stdio(enabled)); }
 
     fn send(&self, realm: RealmId, msg: Msg) -> bool {
         let realms = self.realms.lock().expect("realm table poisoned");
@@ -530,6 +534,8 @@ struct Engine {
     /// The plugins the imported directory and `ctx` reflect, as last described
     /// them.
     directory: Value,
+    stdio: Arc<crate::stdio::Stdio>,
+    operations: HashMap<u64, u64>,
     stdout: String,
     stderr: String,
     exit_code: Option<i32>,
@@ -653,6 +659,7 @@ fn engine_main(
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Shutdown => break,
+            Msg::Stdio(enabled) => with(|e| e.stdio.enabled.store(enabled, Ordering::Release)),
             Msg::Api { id, method, args, fiber, cancel, reply } => start_call(id, method, args, fiber, cancel, reply),
             Msg::Continuation(id) => run_continuation(id),
             Msg::CancelCall(id) => fail_call(id, FailureKind::Cancelled, "the awaiting call was cancelled".into()),
@@ -715,6 +722,8 @@ fn init(id: RealmId, config: RealmConfig, tx: Sender<Msg>, handle: tokio::runtim
                 terminal: Arc::new(crate::terminal::Terminal::default()),
                 terminal_owner: None,
                 directory: json!([]),
+                stdio: Arc::new(crate::stdio::Stdio::default()),
+                operations: HashMap::new(),
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: None,
@@ -1162,6 +1171,7 @@ fn start_call(id: u64, method: &'static str, args: Vec<String>, fiber: Option<St
 
 fn complete(id: u64, result: OpResult) {
     let Some((ctx, resolve, fiber)) = with(|e| {
+        e.operations.retain(|_, pending| *pending != id);
         e.pending_jobs.remove(&id);
         e.pending_ops.remove(&id).map(|(r, f)| (e.ctx, r, f))
     }) else { return };
@@ -1265,6 +1275,8 @@ unsafe extern "C" fn host_async(
             let loading = e.current.as_ref().and_then(|scope| e.calls.get(&scope.id)).is_some_and(|call| call.method == "load");
             (id, e.tx.clone(), e.handle.clone(), e.fs.clone(), e.current.clone(), e.bridge.clone(), e.name.clone(), e.id, loading)
         });
+        let token = std::slice::from_raw_parts(argv, argc).get(3).map(|v| JSValueToNumber(ctx, *v, null_mut())).filter(|v| v.is_finite() && *v >= 1.0).map(|v| v as u64);
+        if let Some(token) = token { with(|e| { e.operations.insert(token, id); }); }
         let completion = HostCompletion { tx, id, completed: false };
         let finish = move |result: OpResult| completion.finish(result);
         let job = if let Some(refused) = refusal() {
@@ -1273,6 +1285,9 @@ unsafe extern "C" fn host_async(
         } else if matches!(op.as_str(), "kernel.spawn" | "kernel.command_run") && fiber.as_ref().is_some_and(|scope| scope.cleaning()) {
             finish(cancelled("a cancelled call cannot start new calls while it cleans up"));
             None
+        } else if op == "stdio.read" {
+            let stdio = with(|e| e.stdio.clone());
+            Some(handle.spawn(async move { finish(stdio.read().await) }))
         } else if op.starts_with("fs.") {
             Some(handle.spawn(async move { finish(fs_op(fs, &op, args, bytes).await) }))
         } else if op == "sh.exec" {
@@ -1374,6 +1389,16 @@ fn blocking<T>(future: impl std::future::Future<Output = T>) -> Result<T, OpResu
 fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
     let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     match op {
+        "operation.cancel" => {
+            let token = args.get("token").and_then(Value::as_u64).unwrap_or(0);
+            with(|e| {
+                if let Some(id) = e.operations.remove(&token) {
+                    let _ = e.tx.send(Msg::Completion(id, cancelled("operation cancelled")));
+                    if let Some(job) = e.pending_jobs.remove(&id) { job.abort(); }
+                }
+            });
+            OpResult::Json(Value::Null)
+        }
         "markdown.parse" => crate::markdown::parse(args),
         "skills.parse" => crate::skills::parse(args),
         "markdown.source" => OpResult::Json(json!(include_str!("markdown.js"))),
@@ -1433,6 +1458,8 @@ fn sync_op(op: &str, args: Value, bytes: Option<Vec<u8>>) -> OpResult {
         "console.write" => {
             let text = s("text");
             let fd = args.get("fd").and_then(Value::as_u64).unwrap_or(1);
+            let live = with(|e| e.stdio.clone());
+            if live.enabled.load(Ordering::Acquire) { return live.write(fd, &text); }
             with(|e| if fd == 2 { e.stderr.push_str(&text) } else { e.stdout.push_str(&text) });
             OpResult::Json(Value::Null)
         }

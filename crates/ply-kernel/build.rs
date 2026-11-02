@@ -56,10 +56,18 @@ fn main() {
         .filter(|path| path.is_dir())
         .collect();
     plugins.sort();
+    let mut entries = String::from("const BUILTIN_ENTRYPOINTS: &[(&str, &str, &[&str])] = &[\n");
     let mut generated = String::from("const BUILTIN_PLUGINS: &[(&str, &[(&str, &str)])] = &[\n");
     for directory in plugins {
         if !directory.join("main.ts").is_file() {
             continue;
+        }
+        let descriptor = directory.join("entrypoint.json");
+        if descriptor.is_file() {
+            let value: serde_json::Value = serde_json::from_str(&fs::read_to_string(&descriptor).unwrap()).unwrap();
+            let command = value["command"].as_str().expect("entrypoint command");
+            let dependencies: Vec<_> = value["dependencies"].as_array().expect("entrypoint dependencies").iter().map(|v| v.as_str().expect("dependency name")).collect();
+            entries.push_str(&format!("({command:?}, {:?}, &{dependencies:?}),\n", directory.file_name().unwrap().to_str().unwrap()));
         }
         let mut files = Vec::new();
         modules(&directory, &directory, &mut files);
@@ -73,6 +81,8 @@ fn main() {
         generated.push_str("]),\n");
     }
     generated.push_str("];\n");
+    entries.push_str("];\n");
+    generated.push_str(&entries);
     fs::write(
         Path::new(&env::var("OUT_DIR").unwrap()).join("plugins.rs"),
         generated,

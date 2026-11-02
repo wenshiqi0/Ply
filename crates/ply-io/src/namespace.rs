@@ -53,9 +53,21 @@ pub(crate) enum Resolved {
 #[derive(Default)]
 pub struct Namespace {
     mounts: RwLock<Vec<Mount>>,
+    parent: Option<Arc<Namespace>>,
 }
 
 impl Namespace {
+    pub(crate) fn view(parent: Arc<Namespace>) -> Self { Self { mounts: RwLock::new(Vec::new()), parent: Some(parent) } }
+
+    fn all_mounts(&self) -> Vec<Mount> {
+        let local = self.mounts.read().expect("mount table poisoned").clone();
+        let mut mounts = self.parent.as_ref().map(|parent| parent.all_mounts()).unwrap_or_default();
+        mounts.retain(|mount| !local.iter().any(|own| own.at == mount.at));
+        mounts.extend(local);
+        mounts.sort_by_key(|mount| std::cmp::Reverse(mount.at.len()));
+        mounts
+    }
+
     /// Mount `storage` at `at`. Fails if something is already mounted there.
     pub fn mount(&self, at: &str, storage: Arc<dyn Storage>, mode: MountMode) -> io::Result<MountInfo> {
         let at = normalize(Path::new(at))?;
@@ -94,13 +106,13 @@ impl Namespace {
 
     pub fn list(&self) -> Vec<MountInfo> {
         let mut infos: Vec<MountInfo> =
-            self.mounts.read().expect("mount table poisoned").iter().map(Mount::info).collect();
+            self.all_mounts().iter().map(Mount::info).collect();
         infos.sort_by(|a, b| a.at.cmp(&b.at));
         infos
     }
 
     pub(crate) fn resolve(&self, path: &str) -> Resolved {
-        let mounts = self.mounts.read().expect("mount table poisoned");
+        let mounts = self.all_mounts();
         if let Some(mount) = mounts.iter().find(|m| under(path, &m.at)) {
             let inner = if mount.at == "/" { path.to_string() } else { path[mount.at.len()..].to_string() };
             let inner = if inner.is_empty() { "/".to_string() } else { inner };
@@ -112,7 +124,7 @@ impl Namespace {
 
     /// Mount-point names directly below `path` (to merge into listings).
     pub(crate) fn mount_children(&self, path: &str) -> Vec<String> {
-        mount_children(&self.mounts.read().expect("mount table poisoned"), path)
+        mount_children(&self.all_mounts(), path)
     }
 }
 

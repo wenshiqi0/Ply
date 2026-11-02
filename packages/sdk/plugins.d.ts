@@ -5,15 +5,16 @@ declare module "ply:plugins" {
     readonly parameters?: Record<string, unknown>;
     readonly wrapsInput?: boolean;
   }
+  export interface Cancellable<Output> extends PromiseLike<Output> { cancel(): void }
   /** Call is lazy: awaiting the handle runs the plugin's onHandle and returns its output. */
   export type PluginHandle<Input = unknown, Output = unknown> = {
-    call(input: Input): PromiseLike<Output>;
+    call(input: Input): Cancellable<Output>;
   }["call"] & PluginMetadata;
   /** Unknown plugins keep dynamic member discovery; narrow members before use. */
   export type Plugin<Input = unknown, Output = unknown> = PluginHandle<Input, Output> & { readonly [member: string]: unknown };
   export type Remote<Exports> = {
     readonly [Key in keyof Exports]: Exports[Key] extends (...args: infer Args) => infer Result
-      ? (...args: Args) => Promise<Awaited<Result>> : Exports[Key];
+      ? (...args: Args) => Cancellable<Awaited<Result>> : Exports[Key];
   };
   export type ExportsOf<Module extends { onLoad: (...args: never[]) => unknown }> = Remote<Awaited<ReturnType<Module["onLoad"]>>>;
   export type AgentPlugin = Plugin<import("../../plugins/agent/types").AgentInput, import("../../plugins/agent/types").AgentResult> & ExportsOf<typeof import("../../plugins/agent/main")>;
@@ -59,6 +60,7 @@ declare module "ply:plugins" {
   export type ContextAgentFacts = import("../../plugins/context/types").AgentFacts;
   export type TaskContextInput = import("../../plugins/context/types").TaskInput;
   export const context: ContextPlugin;
+  export const acp: Plugin<never, never> & ExportsOf<typeof import("../../plugins/acp/main")>;
   export const agent: AgentPlugin;
   export const bash: BashPlugin;
   export const create: CreatePlugin;
@@ -75,6 +77,7 @@ declare module "ply:plugins" {
   export interface PluginDirectory {
     readonly [plugin: string]: Plugin;
     readonly context: ContextPlugin;
+    readonly acp: typeof acp;
     readonly agent: AgentPlugin;
     readonly bash: BashPlugin;
     readonly create: CreatePlugin;

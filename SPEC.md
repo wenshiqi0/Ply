@@ -27,7 +27,8 @@ RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南
 - `main.ts` 保留入口与装配，`types.ts` 声明输入、输出、onLoad 参数和公共导出；较复杂的策略、存储、渲染、统计等放入职责模块。
 - 每个 TS/声明文件最多 250 个非空、非注释行；不得通过合并多条语句或全局关闭检查规避约束。
 - 具名句柄由 `import { context, agent, memory } from "ply:plugins"` 引入；动态目录由默认 import 引入。插件的 onLoad 在它具名导入的插件完成 onLoad 后才开始；被导入的插件加载失败时依赖方加载失败，相互导入成环报错；默认导入不建立顺序。对句柄的调用和方法调用等待目标加载完成；`events.on` 等待事件被声明或所属插件 onLoad 结束。
-- `ply:commands` 在 onLoad 注册宿主入口，不扩大模型工具权限。默认工具由 context 收集，agent 按授权收窄。
+- `ply:commands` 在 onLoad 注册宿主入口，不扩大模型工具权限。宿主命令可声明 `stdio: "inherit"` 独占标准流，插件内部执行命令不获得此能力；CLI 保留名由宿主配置，内核不硬编码入口名。插件工具和导出方法的 awaitable 可 `cancel()`，不公开调度身份。
+- CLI 的插件私有状态根目录是 `~/.ply/plugins`，各插件在自己的 IO 子视图挂载 `/ply/state` 并通过 `PLY_DATA_DIRECTORY` 定位；视图共享父命名空间的动态工作区挂载，但互相隔离私有状态。默认工具由 context 收集，agent 按授权收窄。
 - Node 风格 API 由运行时提供；编辑器的 Node 类型不意味着支持完整 Node 运行时。支持范围以运行时及 `tests/node` 用例为准。当前提供的内置模块：`fs`、`fs/promises`、`path`、`path/posix`、`process`、`buffer`、`events`、`util`、`util/types`、`os`、`timers`、`timers/promises`、`child_process`、`stream`、`stream/promises`、`string_decoder`；全局另有 `global`、`atob`、`btoa`。`net`、`http`、`http2` 与进程、系统 API 的补齐按 [RFC 0015](docs/rfcs/0015-node-io-and-net.md) 分阶段进行。
 - 运行时自己的 Node 模块是 `crates/ply-jsc/src/node/` 下的 TypeScript ES 模块，由内置的 OXC 每个进程转译一次，首次导入时求值，导出以 `@types/node` 的类型约束。它们以 `ply:runtime` 导入 prelude 的内部函数，插件代码解析不到这个名字。EventEmitter 与各流类是普通构造函数，`X.call(this)` 配合 `util.inherits` 的旧式子类可用。`process.platform`、`process.arch` 与 `os` 报告宿主的真实平台。
 - Web 全局 `fetch`、`Headers`、`Request`、`Response`、`URL`、`URLSearchParams`、`AbortController`、`AbortSignal`、`ReadableStream`、`FormData`、`EventTarget`、`Event`、`DOMException`、`structuredClone` 由运行时原生实现：URL 用 Rust `url` crate 按 WHATWG 标准解析，fetch 走 Rust HTTP/TLS，只支持 http/https，重定向到其他源时去掉凭据头，请求体和累计响应体各限 16 MiB，网络失败为 `TypeError: fetch failed`；`AbortSignal` 中止得到它的 reason，所属调用被取消时得到 AbortError（`ERR_PLY_CANCELLED`）。FormData 只保存字符串，不支持 multipart 请求体；不支持 byte stream。
@@ -57,8 +58,9 @@ RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南
 ## SPEC-AGENT：模型、委派、报告和用量
 
 - agent 从 npm 导入 pi-ai，首次模型请求时才加载，经运行时的 fetch 和 Rust HTTP/TLS 传输；默认 DeepSeek，MiMo 显式选择。密钥取自 profile 的 `apiKeyEnv` 所指的 `process.env` 变量，不使用 pi-ai 的其他环境变量或凭据文件；CLI 只把宿主已设置的 `DEEPSEEK_API_KEY`、`MIMO_API_KEY` 传入插件环境。
-- `ply mcp --host-chat` 显式开放宿主会话扩展：`ply/agent/catalog`、`chat`、`state`、`approve`；这些入口不加入模型工具 Schema。目录读取原生模型元数据，模型与思考选择按目录校验，图片与提示词放在同一用户消息中作为原生 image 内容发送，恢复与上下文提供方保留实际文本，私有 conversation 快照用于继续同一对话。默认使用 ask 审批，普通工具服务不开放这些入口。
-- MCP `notifications/cancelled` 按请求 id 取消当前任务及其 awaited fiber；连接继续服务，返回 `-32800`。`--approval-mode` 由宿主显式选择 risk/ask/bypass。
+- `ply acp` 是 ACP v1 插件命令；JSON-RPC、会话、模型配置、内容、工具进度、权限请求和取消都在 `plugins/acp`。Rust CLI 和内核不识别协议方法，不保留 MCP 服务或 host-chat 兼容入口。
+- ACP 通过标准 `initialize`、`session/new`、`session/load`、`session/prompt`、`session/set_config_option`、`session/update`、`session/request_permission`、`session/cancel` 接入。私有会话存储在 `~/.ply/plugins/acp`，重载回放公开历史，不输出隐藏推理或恢复快照；每进程串行执行 prompt，会话 cwd 与进程 cwd 相同，不接入非空外部 `mcpServers`。
+- ACP 默认 ask，宿主可显式选择 `--approval-mode risk/ask/bypass`。取消实际中止模型和工具调用，等待清理后返回 `stopReason: cancelled`，连接可继续服务。
 - 根 agent 默认最多两个直属子 agent；agent 插件在审批后、发起子调用前同步检查并计数（同 realm 单线程，原子），失败、完成、替换和恢复不退还配额，超额成为工具错误且不产生 Spawn。
 - 父 agent 为每次委派生成一次性凭据，放入子调用输入的 `delegation`（总是覆盖模型提供的值）；子 agent 凭它继承策略上限、报告要求、用量链和父会话快照。未知凭据被拒绝。
 - 子级工具与委派代数只能收窄；默认子级没有 memory 写入能力。max_delegation_depth 为零时不提供 agent 工具，入口也拒绝继续委派。
@@ -105,14 +107,14 @@ RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南
 
 ## 验收矩阵
 
-Ply 的当前范围是 macOS 和 Linux 上的 Rust/JSC agent harness：CLI、脚本和 MCP 共用同一个内核，TS 插件提供工具与上下文，DeepSeek/MiMo 通过 npm 上的 pi-ai、运行时的 fetch 和 Rust HTTP 调用。下面按系统行为列出验收路径，不把模型评审报告的正确率当作系统验收。
+Ply 的当前范围是 macOS 和 Linux 上的 Rust/JSC agent harness：CLI、脚本和 ACP 插件命令共用同一个内核，TS 插件提供工具与上下文，DeepSeek/MiMo 通过 npm 上的 pi-ai、运行时的 fetch 和 Rust HTTP 调用。下面按系统行为列出验收路径，不把模型评审报告的正确率当作系统验收。
 
 | 能力 | 已实现的完整路径 | 验收来源 |
 |---|---|---|
 | 宿主平台 | macOS 系统 JavaScriptCore 与 Linux JavaScriptCoreGTK 4.1；真实平台报告、进程内存预算与终端行为 | [CI 双平台检查](.github/workflows/ci.yml)、[进程内存](crates/ply-jsc/src/process_memory.rs)、[JSC 集成](crates/ply-jsc/tests/node_outlet.rs)、[真实 PTY](crates/ply-cli/tests/tui.rs) |
-| 使用入口 | tools 描述插件；call 返回输出/错误；run 运行脚本；MCP 提供工具服务；commands 列出注册入口；插件可注册顶层命令，tui 启动面板 | [CLI 端到端](crates/ply-cli/tests/entrypoints.rs)、[真实 PTY](crates/ply-cli/tests/tui.rs) |
+| 使用入口 | tools 描述插件；call 返回输出/错误；run 运行脚本；ACP 插件提供 agent 会话；commands 列出注册入口；插件可注册顶层命令，tui 启动面板 | [CLI 端到端](crates/ply-cli/tests/entrypoints.rs)、[真实 PTY](crates/ply-cli/tests/tui.rs) |
 | 插件与命令模块 | ply:plugins 显式导入实时目录，移除旧全局 tools；ply:commands 只在 onLoad 注册，原生 realm 归属、重复拒绝/失败撤销、独立 fiber 与取消清理 | [模块与命令](docs/rfcs/0004-commands.md)、[内核验收](crates/ply-kernel/tests/commands.rs) |
-| MCP 请求处理 | 单行 JSON-RPC 并发处理；非法 JSON、版本/方法/id、参数对象返回明确错误；合法通知和入站响应不回包；坏请求后继续服务 | [CLI 端到端](crates/ply-cli/tests/entrypoints.rs)、[入口实现](crates/ply-cli/src/mcp.rs) |
+| ACP 插件 | 握手、模型配置、文本/图片、公开历史恢复、工具进度、权限拒绝/批准、取消与 EOF 清理；标准流隔离 | [ACP 端到端](crates/ply-cli/tests/acp.rs)、[协议插件](plugins/acp/server.ts) |
 | 插件事件 | onLoad 声明/订阅命名空间事件；运行时异步分发，监听器独立子 fiber；异常/超时/取消阻止 bash 执行；失败加载回收注册 | [事件实现](crates/ply-kernel/src/events.rs)、[hook 集成](crates/ply-kernel/tests/kernel.rs) |
 | 插件与句柄 | TS 签名转工具定义、具名/默认稳定插件句柄、onLoad 接口按插件挂载、具名导入决定 onLoad 顺序、共享闭包、重复/加载失败处理、临时 realm 回收；插件可见面不含 fiber/ctx/lifecycle/.loaded | [内核集成](crates/ply-kernel/tests/kernel.rs)、[加载顺序与回收](crates/ply-kernel/tests/loading.rs)、[签名实现](crates/ply-kernel/src/signature.rs)、[多文件模块回归](crates/ply-kernel/tests/plugin_modules.rs) |
 | 文件和进程 | read 分页、create/edit/remove、只读挂载拒写、内部 Ply sh 执行与超时/取消；磁盘/内存/SQLite 后端行为一致 | [入口测试](crates/ply-cli/tests/entrypoints.rs)、[存储一致性](crates/ply-storage/tests/conformance.rs)、[IO](crates/ply-io/tests/io_layer.rs) |
@@ -144,7 +146,7 @@ cargo build -p ply-cli --locked --offline
 
 测试中的模型 fixture 和本地 HTTP 服务不产生供应商调用，它们验证系统行为与协议处理。真实 DeepSeek/MiMo 的供应商连通性、用量和进程审计应另留运行轨迹；本地测试通过不能代替供应商实测，也不代表所有 provider 已接入。主 agent 开放 API key 认证的 DeepSeek 和 MiMo；Jev 作为独立的原生决策 API 订阅插件接入。
 
-MCP 的请求字段与错误码依据 [JSON-RPC 2.0](https://www.jsonrpc.org/specification)；这里只列出 Ply 已实现的 stdio 工具服务，不声称实现全部 MCP 扩展。
+ACP v1 的协议来源是 [官方规范](https://agentclientprotocol.com/protocol/v1/initialization)，请求信封依据 [JSON-RPC 2.0](https://www.jsonrpc.org/specification)；当前为会话能力子集，未实现外部 stdio MCP 消费及不同 cwd 的会话创建，不宣称完整 ACP v1 符合性。
 
 ## 行为边界
 

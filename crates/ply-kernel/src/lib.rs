@@ -67,13 +67,17 @@ pub struct KernelConfig {
     pub limits: Limits,
     /// How deep fibers may nest (a fiber awaiting a fiber awaiting ...).
     pub max_depth: usize,
+    /// Entry names owned by the embedding host.
+    pub reserved_commands: Vec<String>,
+    /// Optional host-owned private state root, partitioned by realm name.
+    pub state_root: Option<PathBuf>,
 }
 
 impl KernelConfig {
     pub fn new(io: Io, cwd: impl Into<String>) -> Self {
         let cwd = cwd.into();
         let env = BTreeMap::from([("HOME".to_string(), cwd.clone()), ("USER".to_string(), "ply".to_string())]);
-        KernelConfig { io, cwd, env, plugin_options: BTreeMap::new(), limits: Limits::default(), max_depth: 16 }
+        KernelConfig { io, cwd, env, plugin_options: BTreeMap::new(), limits: Limits::default(), max_depth: 16, reserved_commands: Vec::new(), state_root: None }
     }
 }
 
@@ -90,8 +94,20 @@ pub enum PluginSource {
 impl PluginSource {
     /// agent, bash, context, create, deepseek, edit, memory, read, remove, skill.
     pub fn defaults() -> Vec<PluginSource> {
-        BUILTIN_PLUGINS.iter().filter(|(name, _)| !matches!(*name, "mimo" | "jev" | "approval" | "tui"))
+        BUILTIN_PLUGINS.iter().filter(|(name, _)| !matches!(*name, "mimo" | "jev" | "approval" | "tui") && !BUILTIN_ENTRYPOINTS.iter().any(|(_, plugin, _)| plugin == name))
             .map(|(name, _)| Self::builtin(name).expect("known built-in")).collect()
+    }
+
+    /// Sources declared by an optional bundled host entrypoint.
+    pub fn entrypoint(command: &str) -> Vec<PluginSource> {
+        let mut names = Vec::new();
+        for (entry, plugin, dependencies) in BUILTIN_ENTRYPOINTS {
+            if command != "*" && command != *entry { continue; }
+            for name in dependencies.iter().chain(std::iter::once(plugin)) {
+                if !names.contains(name) { names.push(*name); }
+            }
+        }
+        names.into_iter().filter_map(Self::builtin).collect()
     }
 
     /// An explicitly selected built-in plugin, including all relative modules.
@@ -178,6 +194,9 @@ struct Inner {
     plugin_options: BTreeMap<String, Value>,
     limits: Limits,
     max_depth: usize,
+    reserved_commands: Vec<String>,
+    state_root: Option<PathBuf>,
+    host_stdio: tokio::sync::Mutex<()>,
     plugins: RwLock<Vec<Loaded>>,
     /// Ticks whenever a plugin is added or finishes loading.
     generation: watch::Sender<u64>,
@@ -297,6 +316,9 @@ impl Kernel {
                 plugin_options: config.plugin_options,
                 limits: config.limits,
                 max_depth: config.max_depth,
+                reserved_commands: config.reserved_commands,
+                state_root: config.state_root,
+                host_stdio: tokio::sync::Mutex::new(()),
                 plugins: RwLock::new(Vec::new()),
                 generation: watch::channel(0).0,
                 sealed: AtomicBool::new(false),
@@ -567,13 +589,24 @@ impl Kernel {
     async fn realm(&self, name: &str, root: &str, argv: Vec<String>) -> Result<RealmId, KernelError> {
         let inner = &self.inner;
         let bridge: Arc<dyn HostBridge> = Arc::new(Bridge(Arc::downgrade(inner)));
+        let mut io = inner.io.clone();
+        let mut env = inner.env.clone();
+        if let Some(state_root) = &inner.state_root {
+            use std::os::unix::fs::DirBuilderExt;
+            let directory = state_root.join(name);
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&directory).map_err(|error| KernelError::Load(error.to_string()))?;
+            io = inner.io.view();
+            let storage = DiskStorage::open(directory).map_err(|error| KernelError::Load(error.to_string()))?;
+            io.mount("/ply/state", Arc::new(storage), MountMode::ReadWrite).map_err(|error| KernelError::Load(error.to_string()))?;
+            env.insert("PLY_DATA_DIRECTORY".into(), "/ply/state".into());
+        }
         let realm = inner
             .js
             .create_realm(RealmConfig {
                 name: name.into(),
-                io: inner.io.clone(),
+                io,
                 cwd: inner.cwd.clone(),
-                env: inner.env.clone(),
+                env,
                 argv,
                 modules: ModuleSource { io: inner.code.clone(), root: root.into() },
                 limits: inner.limits,
@@ -669,8 +702,7 @@ impl Kernel {
         specs
     }
 
-    /// The plugins that can be called (have `onHandle`), as tools: what MCP
-    /// clients see.
+    /// The loaded callable plugins as tool schemas.
     pub fn catalog(&self) -> Vec<ToolSchema> {
         self.plugins().iter().filter_map(PluginSpec::tool_schema).collect()
     }

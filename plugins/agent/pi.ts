@@ -38,7 +38,7 @@ async function resolve(profile: ModelProfile) {
 
 export async function nativeProfiles(active: ModelProfile): Promise<ModelProfile[]> {
   const models = await (loading ??= load());
-  return models.getModels(active.provider).map(model => ({ provider: active.provider, model: model.id, apiKeyEnv: active.apiKeyEnv }));
+  return models.getModels(active.provider).map(model => model.id === active.model ? { ...active } : { provider: active.provider, model: model.id, apiKeyEnv: active.apiKeyEnv });
 }
 
 export async function describeProfile(profile: ModelProfile) {

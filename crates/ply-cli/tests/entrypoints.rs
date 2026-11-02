@@ -1,7 +1,25 @@
-//! Binary entrypoints, including long-lived MCP framing and error responses.
-use std::io::Write;
-use std::process::{Command, Output, Stdio};
+//! Binary entrypoints, including script and plugin command dispatch.
+use std::process::{Command, Output};
 use serde_json::{Value, json};
+
+#[test]
+fn registered_commands_can_own_standard_streams_without_leaking_other_plugin_output() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let work = tempfile::tempdir().unwrap();
+    for (name, source) in [
+        ("wire", r#"import * as commands from 'ply:commands';import plugins from 'ply:plugins';
+export async function onLoad(){await commands.register({name:'wire',stdio:'inherit',handler:async()=>{let body='';for await(const chunk of process.stdin)body+=chunk.toString();await plugins.noise({});process.stdout.write('echo:'+body);return {must_not_print:true};}});}"#),
+        ("noise", "export function onHandle(){console.log('private log');return 1;}"),
+    ] { std::fs::create_dir(work.path().join(name)).unwrap();std::fs::write(work.path().join(name).join("main.ts"),source).unwrap(); }
+    let mut child = command(work.path(), "wire").arg("--no-default-plugins").arg("--plugin").arg(work.path().join("wire"))
+        .arg("--plugin").arg(work.path().join("noise")).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all("原生标准流\n".as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "echo:原生标准流\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("private log"));
+}
 
 fn command(work: &std::path::Path, mode: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ply"));
@@ -176,50 +194,6 @@ fn cli_tools_files_scripts_and_read_only_mounts_work_end_to_end() {
     value(&call(work.path(), "remove", json!({ "path": "note.txt" })));
     assert!(!work.path().join("note.txt").exists());
 }
-
-#[test]
-fn mcp_replies_to_bad_requests_and_keeps_handling_valid_requests() {
-    let work = tempfile::tempdir().unwrap();
-    let plugin = work.path().join("echo"); std::fs::create_dir(&plugin).unwrap();
-    std::fs::write(plugin.join("main.ts"), "export function onHandle(input: string): string { return input.toUpperCase(); }").unwrap();
-    let requests = [
-        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } }),
-        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
-        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
-        json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "echo", "arguments": { "input": "mcp" } } }),
-        json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": { "name": "missing" } }),
-        json!({ "jsonrpc": "2.0", "id": 5, "method": "ping" }),
-        json!({ "jsonrpc": "2.0", "id": 6, "method": 42 }),
-        json!({ "jsonrpc": "1.0", "id": 7, "method": "ping" }),
-        json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/list", "params": 42 }),
-        json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": { "name": "echo", "arguments": 42 } }),
-        json!({ "jsonrpc": "2.0", "id": 10 }),
-        json!({ "jsonrpc": "2.0", "id": 11, "result": {} }),
-        json!({ "jsonrpc": "2.0", "id": [12], "method": "ping" }),
-    ];
-    let mut child = command(work.path(), "mcp").arg("--plugin").arg(plugin)
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    for request in requests { writeln!(stdin, "{request}").unwrap(); }
-    writeln!(stdin, "{{").unwrap();
-    drop(stdin);
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    let responses: Vec<Value> = String::from_utf8(output.stdout).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-    let reply = |id: u64| responses.iter().find(|response| response["id"] == id).unwrap_or_else(|| panic!("missing response for {id}; received IDs: {:?}", responses.iter().map(|r| &r["id"]).collect::<Vec<_>>()));
-    assert_eq!(reply(1)["result"]["serverInfo"]["name"], "ply");
-    assert!(reply(2)["result"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "echo"));
-    assert_eq!(reply(3)["result"]["content"][0]["text"], "MCP");
-    assert_eq!(reply(4)["error"]["code"], -32602);
-    assert_eq!(reply(5)["result"], json!({}));
-    for id in [6, 7, 10] { assert_eq!(reply(id)["error"]["code"], -32600); }
-    for id in [8, 9] { assert_eq!(reply(id)["error"]["code"], -32602); }
-    assert!(!responses.iter().any(|response| response["id"] == 11));
-    assert!(responses.iter().any(|response| response["id"].is_null() && response["error"]["code"] == -32600));
-    assert!(responses.iter().any(|response| response["id"].is_null() && response["error"]["code"] == -32700));
-    assert_eq!(responses.len(), 12);
-}
-
 
 #[test]
 fn jev_is_opt_in_missing_key_requires_approval_and_invalid_configuration_is_rejected() {
