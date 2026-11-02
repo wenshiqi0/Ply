@@ -29,8 +29,9 @@ agent 插件用语言模型完成一个任务：每轮让 context 准备上下�
 ## 最终报告
 
 - 最终报告必须正常停止、非空、代码围栏闭合，正文不得残留工具控制标记；内部使用结束标记 `[[PLY_REPORT_COMPLETE]]`，返回前删除。
-- `report_sections` 要求指定的 Markdown 标题及非空内容；标题要求会传给子 agent，子级和恢复调用只能增加要求。CLI 可重复传 `--agent-report-section HEADING`。
+- `report_sections` 要求指定的 Markdown 标题及非空内容；接受 `Findings` 或 `## Findings` 等 ATX 标题形式，比较时统一去掉标题标记和编号。标题要求会传给子 agent，子级和恢复调用只能增加要求。CLI 可重复传 `--agent-report-section HEADING`。
 - 校验失败时发出 `agent.report`（`status: "rejected"`），在原 agent 内重新生成完整报告，不创建替代 agent，不把有问题的原文放回模型历史。通过后发出 `status: "validated"`，返回值带 `report_validation`。
+- 每个任务最多拒绝三份报告，即最多自动重写两次；第三次失败返回校验原因。恢复沿用 `rejected_reports`，耗尽后不再调用模型。普通工具轮数仍默认不限。
 - 这只校验格式和完成状态，不证明结论正确。带半截工具调用的 `length` 响应立即失败并保留可恢复状态，不执行部分参数。
 
 ## 用量统计

@@ -327,7 +327,7 @@ async fn the_agent_loops_model_turns_and_runs_the_offered_tools_as_child_fibers(
     // Report repair stays inside the original child; no B2 is spawned.
     let before_report = spawns.seen.lock().unwrap().len();
     let reviewed = kernel.call("agent", json!({ "prompt": "report root", "max_children": 2,
-        "allowed_tools": ["agent", "read"], "report_sections": ["架构判断", "发现", "验证边界"] })).await.unwrap();
+        "allowed_tools": ["agent", "read"], "report_sections": ["## 架构判断", "### 发现", "验证边界"] })).await.unwrap();
     assert_eq!(reviewed["delegation"]["started"], 1);
     assert_eq!(reviewed["total_usage"]["calls"], 4);
     assert!(!reviewed["text"].as_str().unwrap().contains("PLY_REPORT_COMPLETE"));
@@ -337,6 +337,28 @@ async fn the_agent_loops_model_turns_and_runs_the_offered_tools_as_child_fibers(
     assert_eq!(rejected.len(), 1);
     assert!(rejected[0]["reasons"].as_array().unwrap().contains(&json!("residual_protocol_tokens")));
     assert_eq!(spawns.reports(&report_agents[1].0, "validated").len(), 1);
+
+    // Caller-supplied Markdown headings match the same parsed report headings.
+    let markdown = kernel.call("agent", json!({ "prompt": "report markdown", "allowed_tools": ["read"],
+        "report_sections": ["## 1. Findings", "### 二、验证边界 ###"] })).await.unwrap();
+    assert_eq!(markdown["turns"], 1);
+    assert_eq!(markdown["report_validation"]["rejected_reports"], 0);
+
+    // Automatic repair stops without max_turns, including after explicit recovery.
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), kernel.call("agent", json!({
+        "prompt": "report invalid", "allowed_tools": ["read"], "report_sections": ["## Findings", "Missing"]
+    }))).await.expect("report repair must be bounded").unwrap_err();
+    assert!(error.to_string().contains("report validation failed after 3 rejected reports"), "{error}");
+    assert!(error.to_string().contains("empty_section:## Findings"), "{error}");
+    assert!(error.to_string().contains("missing_section:Missing"), "{error}");
+    let exhausted_id = spawns.seen.lock().unwrap().iter().rev().find(|(_, _, name)| name == "agent").unwrap().0.clone();
+    assert_eq!(spawns.records_for(&exhausted_id, "agent.model_call").len(), 3);
+    assert_eq!(spawns.reports(&exhausted_id, "rejected").len(), 3);
+    let checkpoint = spawns.records_for(&exhausted_id, "agent.checkpoint")[0]["resume_id"].clone();
+    let error = kernel.call("agent", json!({ "resume_id": checkpoint })).await.unwrap_err();
+    assert!(error.to_string().contains("automatic repair budget exhausted"), "{error}");
+    let resumed_id = spawns.seen.lock().unwrap().iter().rev().find(|(_, _, name)| name == "agent").unwrap().0.clone();
+    assert!(spawns.records_for(&resumed_id, "agent.model_call_started").is_empty());
 
     // A truncated final report is repaired after resume; validation state survives.
     let error = kernel.call("agent", json!({ "prompt": "report length", "allowed_tools": ["read"],

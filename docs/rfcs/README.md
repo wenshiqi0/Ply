@@ -25,3 +25,4 @@
 
 | [0019 ACP 协议插件](0019-acp-plugin.md) | 已实现，待发布 |
 | [0020 会话权限策略](0020-session-permissions.md) | 已实现 |
+| [0021 报告章节规范化与有限修复](0021-report-repair-limit.md) | 已实现 |

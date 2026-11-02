@@ -87,6 +87,8 @@ async function modelRequest(req) {
   if (task === "report repaired") return ctx.messages.filter(message => message.role === "user" && !message.ply_context).length === 1
     ? emit(text("## 架构判断\nDraft.\n</｜｜DSML｜｜ parameter>"), usage(10, 5, 90))
     : emit(text("## 架构判断\nComplete.\n## 发现\nNo confirmed defects.\n## 验证边界\nOffline fixture only."), usage(10, 5, 90));
+  if (task === "report markdown") return emit(text("## 1. Findings\nComplete.\n### 二、验证边界 ###\nOffline fixture only."), usage(10, 5, 90));
+  if (task === "report invalid") return emit(text("## Findings\n## Other\nThe required section is empty."), usage(10, 5, 90));
   if (task === "report length") return ctx.messages.filter(message => message.role === "user" && !message.ply_context).length === 1
     ? emit(text("## Findings\n```text\ntruncated"), usage(10, 5, 90), "length")
     : emit(text("## Findings\nThe complete report fits."), usage(10, 5, 90));

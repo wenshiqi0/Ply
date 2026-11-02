@@ -1,6 +1,7 @@
 import type { AgentInput, ReportState, RunUsage } from "./types";
 
 export const REPORT_END = "[[PLY_REPORT_COMPLETE]]";
+export const MAX_REJECTED_REPORTS = 3;
 
 export function sectionNames(value: unknown, name: string): string[] {
   if (!Array.isArray(value) || value.length > 16 || value.some(section => typeof section !== "string" || !section.trim() || section.length > 128 || /[\r\n]/.test(section))) {
@@ -17,7 +18,9 @@ export function reportFor(input: AgentInput, parent?: RunUsage, saved?: ReportSt
 }
 
 export function headingName(value: string): string {
-  return value.trim().replace(/^\d+[.)、\s]+/, "").replace(/^[一二三四五六七八九十]+[、.)]\s*/, "").trim().toLowerCase();
+  const trimmed = value.trim();
+  const heading = /^#{1,6}\s+(.+?)\s*#*\s*$/.exec(trimmed);
+  return (heading?.[1] ?? trimmed).replace(/^\d+[.)、\s]+/, "").replace(/^[一二三四五六七八九十]+[、.)]\s*/, "").trim().toLowerCase();
 }
 
 export function validateReport(text: string, stop: string | undefined, report: ReportState): { text: string; errors: string[] } {

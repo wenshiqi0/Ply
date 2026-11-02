@@ -66,7 +66,7 @@ RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南
 - 子级工具与委派代数只能收窄；默认子级没有 memory 写入能力。max_delegation_depth 为零时不提供 agent 工具，入口也拒绝继续委派。
 - 模型轮数默认不限；只有显式 max_turns 才限制任务调用轮次。
 - 每个 agent 独立对话，子级接收显式任务背景与只读上下文快照。
-- 完成检查覆盖停止原因、非空结果、结束标记、要求章节、代码围栏和协议残留；失败在原 agent 内修复，不承诺语义正确。
+- 完成检查覆盖停止原因、非空结果、结束标记、要求章节、代码围栏和协议残留；要求章节与报告标题使用相同的 Markdown ATX 标记及编号规范化，章节仍须非空。每个任务累计最多拒绝三份报告，前两次在原 agent 内修复，第三次明确失败；恢复保留拒绝计数，耗尽后不再调用模型。普通工具轮数仍默认不限，不承诺报告语义正确。见 [RFC 0021](docs/rfcs/0021-report-repair-limit.md)。
 - 每次模型调用发出 `agent.model_call_started` 与 `agent.model_call` 事件，记录 usage 和用途；缺失 usage 标记为未知，不能记作零。
 - 汇总区分自身与子树（委派的子 agent）；Jev 等旁路插件的模型用量只在它们自己的事件中，不计入 agent 的 total_usage。缓存命中率为 cache_read_tokens / input_tokens，按 token 加权，缺失用量时不能声称完整命中率。
 
