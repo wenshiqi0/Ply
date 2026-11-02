@@ -21,3 +21,4 @@
 | [0015 原生句柄与 Node 网络、进程 API](0015-node-io-and-net.md) | 第一阶段已实现 |
 | [0016 命令即程序](0016-commands-as-programs.md) | 提议 |
 | [0017 Linux 支持](0017-linux.md) | 已实现 |
+| [0018 可信宿主聊天能力](0018-host-chat-capabilities.md) | 已实现 |

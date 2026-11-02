@@ -26,6 +26,8 @@ declare module "ply:plugins" {
 
   export type ContextPlugin = Plugin<never, never> & ExportsOf<typeof import("../../plugins/context/main")>;
   export type ApprovalPlugin = Plugin<never, never> & ExportsOf<typeof import("../../plugins/approval/main")>;
+  export type HostImage = import("../../plugins/agent/host").HostImage;
+  export type HostModel = import("../../plugins/agent/host").HostModel;
   export type AgentInput = import("../../plugins/agent/types").AgentInput;
   export type BashInput = import("../../plugins/bash/types").BashInput;
   export type BashResult = import("../../plugins/bash/types").BashResult;

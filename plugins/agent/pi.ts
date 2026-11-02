@@ -36,6 +36,23 @@ async function resolve(profile: ModelProfile) {
   return { models, model };
 }
 
+export async function nativeProfiles(active: ModelProfile): Promise<ModelProfile[]> {
+  const models = await (loading ??= load());
+  return models.getModels(active.provider).map(model => ({ provider: active.provider, model: model.id, apiKeyEnv: active.apiKeyEnv }));
+}
+
+export async function describeProfile(profile: ModelProfile) {
+  const { model } = await resolve(profile);
+  // Publish distinct levels declared by the native model, without inventing
+  // levels for aliases or missing entries in the provider's mapping.
+  const efforts = model.reasoning ? [...new Set([
+    ...(model.thinkingLevelMap?.off === null ? [] : ["off"]),
+    ...Object.values(model.thinkingLevelMap ?? {}).filter((value): value is string => typeof value === "string"),
+    ...(profile.reasoningEffort ? [profile.reasoningEffort] : ["high"]),
+  ])] : [];
+  return { name: model.name, input: [...model.input], efforts };
+}
+
 export async function request(input: { operation: "describe"; profile: ModelProfile }): Promise<ModelLimits>;
 export async function request(input: {
   operation: "complete"; profile: ModelProfile; context: Context; purpose: "task" | "compaction"; maxTokens: number;
@@ -57,7 +74,7 @@ export async function request(input: {
     return await models.complete(model, input.context as PiContext, {
       apiKey,
       ...(profile.apiKeyHeader ? { headers: { [profile.apiKeyHeader]: apiKey } } : {}),
-      ...(input.purpose !== "compaction" && profile.reasoningEffort ? { reasoningEffort: profile.reasoningEffort } : {}),
+      ...(input.purpose !== "compaction" && profile.reasoningEffort && profile.reasoningEffort !== "off" ? { reasoningEffort: profile.reasoningEffort } : {}),
       maxTokens, signal: controller.signal, timeoutMs: 600_000,
     });
   } finally {

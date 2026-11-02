@@ -9,10 +9,12 @@ import { context, type ModelProfile } from "ply:plugins";
 import { delegationState, integer, policyFor } from "./policy";
 import { recovery } from "./recovery";
 import { request as modelRequest } from "./pi";
+import { describeProfile } from "./pi";
 import { runTool } from "./tools";
+import type { HostConversation } from "./host";
 
 /** Run a task with bounded tool/delegation grants, or resume a recovery ID. */
-export async function onHandle(input: AgentInput): Promise<AgentResult> {
+export async function onHandle(input: AgentInput, continuation?: HostConversation): Promise<AgentResult> {
   if (!input || typeof input !== "object") throw new Error("agent input must be an object");
   if (input.resume_id !== undefined && (typeof input.resume_id !== "string" || !input.resume_id.trim() || input.prompt !== undefined)) {
     throw new Error("resume_id must be a string; omit prompt when resuming");
@@ -70,8 +72,15 @@ export async function onHandle(input: AgentInput): Promise<AgentResult> {
       facts: { max_children: policy.max_children, max_delegation_depth: policy.max_delegation_depth,
         report_sections: report.required_sections, completion_marker: REPORT_END },
       ...(parent?.conversation ? { inherit: parent.conversation } : {}) };
+    const images = continuation?.images ?? [];
+    if (!Array.isArray(images) || images.length > 5 || images.some(image => image.type !== "image"
+      || !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(image.mimeType)
+      || typeof image.data !== "string" || image.data.length > 36 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data))) throw new Error("invalid host images");
+    if (images.length && !(await describeProfile(profile)).input.includes("image")) throw new Error("model does not support images");
     id = saved ? await context.restoreTask(saved.conversation, request)
-      : await context.openTask({ ...request, prompt: input.prompt! });
+      : continuation?.snapshot ? await context.restoreTask(continuation.snapshot, request)
+        : await context.openTask({ ...request, prompt: input.prompt!, images });
+    if (continuation?.snapshot) await context.appendMessages(id, [{ role: "user", content: [{ type: "text", text: input.prompt! }, ...images], timestamp: Date.now() }]);
     run.conversation = id;
     let turns = 0;
     for (let turn = nextTurn; maxTurns === undefined || turns < maxTurns; turn++) {
@@ -110,6 +119,7 @@ export async function onHandle(input: AgentInput): Promise<AgentResult> {
           required_sections: report.required_sections, rejected_reports: report.rejected_reports });
         const delegation = delegationState(run);
         completed = true;
+        if (continuation) continuation.snapshot = await context.exportConversation(id);
         return { text: checked.text, model, turns, total_turns: turn, tool_calls: toolCalls, usage: usageSummary(run.own), total_usage: totalUsageSummary(run), policy,
           delegation, report_validation: { ...report, required_sections: [...report.required_sections] },
           ...(input.resume_id ? { resumed_from: input.resume_id, previous_usage: previousUsage, previous_total_usage: previousTotalUsage } : {}) };

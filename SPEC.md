@@ -57,6 +57,8 @@ RFC 索引见 [docs/rfcs/README.md](docs/rfcs/README.md)，使用与开发指南
 ## SPEC-AGENT：模型、委派、报告和用量
 
 - agent 从 npm 导入 pi-ai，首次模型请求时才加载，经运行时的 fetch 和 Rust HTTP/TLS 传输；默认 DeepSeek，MiMo 显式选择。密钥取自 profile 的 `apiKeyEnv` 所指的 `process.env` 变量，不使用 pi-ai 的其他环境变量或凭据文件；CLI 只把宿主已设置的 `DEEPSEEK_API_KEY`、`MIMO_API_KEY` 传入插件环境。
+- `ply mcp --host-chat` 显式开放宿主会话扩展：`ply/agent/catalog`、`chat`、`state`、`approve`；这些入口不加入模型工具 Schema。目录读取原生模型元数据，模型与思考选择按目录校验，图片与提示词放在同一用户消息中作为原生 image 内容发送，恢复与上下文提供方保留实际文本，私有 conversation 快照用于继续同一对话。默认使用 ask 审批，普通工具服务不开放这些入口。
+- MCP `notifications/cancelled` 按请求 id 取消当前任务及其 awaited fiber；连接继续服务，返回 `-32800`。`--approval-mode` 由宿主显式选择 risk/ask/bypass。
 - 根 agent 默认最多两个直属子 agent；agent 插件在审批后、发起子调用前同步检查并计数（同 realm 单线程，原子），失败、完成、替换和恢复不退还配额，超额成为工具错误且不产生 Spawn。
 - 父 agent 为每次委派生成一次性凭据，放入子调用输入的 `delegation`（总是覆盖模型提供的值）；子 agent 凭它继承策略上限、报告要求、用量链和父会话快照。未知凭据被拒绝。
 - 子级工具与委派代数只能收窄；默认子级没有 memory 写入能力。max_delegation_depth 为零时不提供 agent 工具，入口也拒绝继续委派。
@@ -110,7 +112,7 @@ Ply 的当前范围是 macOS 和 Linux 上的 Rust/JSC agent harness：CLI、脚
 | 宿主平台 | macOS 系统 JavaScriptCore 与 Linux JavaScriptCoreGTK 4.1；真实平台报告、进程内存预算与终端行为 | [CI 双平台检查](.github/workflows/ci.yml)、[进程内存](crates/ply-jsc/src/process_memory.rs)、[JSC 集成](crates/ply-jsc/tests/node_outlet.rs)、[真实 PTY](crates/ply-cli/tests/tui.rs) |
 | 使用入口 | tools 描述插件；call 返回输出/错误；run 运行脚本；MCP 提供工具服务；commands 列出注册入口；插件可注册顶层命令，tui 启动面板 | [CLI 端到端](crates/ply-cli/tests/entrypoints.rs)、[真实 PTY](crates/ply-cli/tests/tui.rs) |
 | 插件与命令模块 | ply:plugins 显式导入实时目录，移除旧全局 tools；ply:commands 只在 onLoad 注册，原生 realm 归属、重复拒绝/失败撤销、独立 fiber 与取消清理 | [模块与命令](docs/rfcs/0004-commands.md)、[内核验收](crates/ply-kernel/tests/commands.rs) |
-| MCP 请求处理 | 单行 JSON-RPC 并发处理；非法 JSON、版本/方法/id、参数对象返回明确错误；合法通知和入站响应不回包；坏请求后继续服务 | [CLI 端到端](crates/ply-cli/tests/entrypoints.rs)、[入口实现](crates/ply-cli/src/main.rs) |
+| MCP 请求处理 | 单行 JSON-RPC 并发处理；非法 JSON、版本/方法/id、参数对象返回明确错误；合法通知和入站响应不回包；坏请求后继续服务 | [CLI 端到端](crates/ply-cli/tests/entrypoints.rs)、[入口实现](crates/ply-cli/src/mcp.rs) |
 | 插件事件 | onLoad 声明/订阅命名空间事件；运行时异步分发，监听器独立子 fiber；异常/超时/取消阻止 bash 执行；失败加载回收注册 | [事件实现](crates/ply-kernel/src/events.rs)、[hook 集成](crates/ply-kernel/tests/kernel.rs) |
 | 插件与句柄 | TS 签名转工具定义、具名/默认稳定插件句柄、onLoad 接口按插件挂载、具名导入决定 onLoad 顺序、共享闭包、重复/加载失败处理、临时 realm 回收；插件可见面不含 fiber/ctx/lifecycle/.loaded | [内核集成](crates/ply-kernel/tests/kernel.rs)、[加载顺序与回收](crates/ply-kernel/tests/loading.rs)、[签名实现](crates/ply-kernel/src/signature.rs)、[多文件模块回归](crates/ply-kernel/tests/plugin_modules.rs) |
 | 文件和进程 | read 分页、create/edit/remove、只读挂载拒写、内部 Ply sh 执行与超时/取消；磁盘/内存/SQLite 后端行为一致 | [入口测试](crates/ply-cli/tests/entrypoints.rs)、[存储一致性](crates/ply-storage/tests/conformance.rs)、[IO](crates/ply-io/tests/io_layer.rs) |

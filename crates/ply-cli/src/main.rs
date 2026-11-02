@@ -28,6 +28,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use ply_kernel::{Io, JsonlRecorder, Kernel, KernelConfig, KernelError, MountMode, PluginSource, StorageSpec};
 
 mod user_skills;
+mod mcp;
 
 #[derive(Parser)]
 #[command(name = "ply", version, about = "ply agent harness")]
@@ -72,6 +73,12 @@ struct Setup {
     /// JSON options passed to one plugin's onLoad. Repeat for different plugins.
     #[arg(long = "plugin-options", value_name = "NAME=JSON", value_parser = parse_plugin_options)]
     plugin_options: Vec<(String, Value)>,
+    /// Expose trusted host conversation methods over MCP (not model tools).
+    #[arg(long)]
+    host_chat: bool,
+    /// Host approval policy. Model grants and hard denials still apply.
+    #[arg(long, value_parser = ["risk", "ask", "bypass"])]
+    approval_mode: Option<String>,
     /// Enable Jev risk checks and approval coordination (checks use host TYPESAFE_API_KEY).
     #[arg(long)]
     jev: bool,
@@ -282,7 +289,12 @@ async fn kernel(setup: &Setup, ui: UiMode) -> Result<Kernel> {
     }
     // The host selects the approval policy. The TUI only presents requests;
     // agent tool visibility and delegation remain agent-owned defaults.
-    if tui { config.env.insert("PLY_APPROVAL_MODE".into(), if matches!(ui, UiMode::Bypass) { "bypass" } else { "ask" }.into()); }
+    if setup.host_chat { config.env.insert("PLY_HOST_CHAT".into(), "1".into()); }
+    if let Some(mode) = &setup.approval_mode {
+        config.env.insert("PLY_APPROVAL_MODE".into(), mode.clone());
+    } else if tui || setup.host_chat {
+        config.env.insert("PLY_APPROVAL_MODE".into(), if matches!(ui, UiMode::Bypass) { "bypass" } else { "ask" }.into());
+    }
     if let Some(model) = &setup.model {
         config.env.insert("PLY_MODEL".into(), model.clone());
     }
@@ -328,7 +340,7 @@ async fn kernel(setup: &Setup, ui: UiMode) -> Result<Kernel> {
     for dir in &setup.plugins {
         kernel.load(PluginSource::Dir(dir.clone())).await.with_context(|| format!("loading plugin {}", dir.display()))?;
     }
-    if (setup.jev || tui) && !setup.plugins.iter().any(|path| path.file_name().and_then(|name| name.to_str()) == Some("approval")) {
+    if (setup.jev || tui || setup.host_chat || setup.approval_mode.is_some()) && !setup.plugins.iter().any(|path| path.file_name().and_then(|name| name.to_str()) == Some("approval")) {
         kernel.load(PluginSource::builtin("approval").context("missing approval plugin")?).await.context("loading approval coordination")?;
     }
     if setup.jev { kernel.load(PluginSource::builtin("jev").context("missing Jev plugin")?).await.context("loading Jev")?; }
@@ -433,115 +445,6 @@ async fn run(args: RunArgs) -> Result<i32> {
     })
 }
 
-// ------------------------------------------------------------------- mcp
-
-/// One JSON-RPC message per line on stdin/stdout. Requests are handled
-/// concurrently; stdout carries nothing but protocol messages.
-async fn serve_mcp(setup: Setup) -> Result<i32> {
-    let kernel = kernel(&setup, UiMode::Disabled).await?;
-    let out = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
-    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    let mut tasks = tokio::task::JoinSet::new();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let (kernel, out) = (kernel.clone(), out.clone());
-        tasks.spawn(async move {
-            let response = match serde_json::from_str::<Value>(&line) {
-                Ok(message) => handle_mcp(&kernel, message).await,
-                Err(e) => Some(rpc_error(Value::Null, -32700, &format!("parse error: {e}"))),
-            };
-            if let Some(response) = response {
-                let mut out = out.lock().await;
-                let _ = out.write_all(format!("{response}\n").as_bytes()).await;
-                let _ = out.flush().await;
-            }
-        });
-    }
-    while tasks.join_next().await.is_some() {}
-    kernel.close().await;
-    Ok(0)
-}
-
-fn rpc_error(id: Value, code: i64, message: &str) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-}
-
-async fn handle_mcp(kernel: &Kernel, message: Value) -> Option<Value> {
-    let id = message.get("id").cloned();
-    let valid_id = |id: &Value| id.is_null() || id.is_string() || id.is_number();
-    let response_id = id.as_ref().filter(|id| valid_id(id)).cloned().unwrap_or(Value::Null);
-    if !message.is_object() || message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
-        || id.as_ref().is_some_and(|id| !valid_id(id)) {
-        return Some(rpc_error(response_id, -32600, "invalid JSON-RPC request"));
-    }
-    // Ignore response envelopes, but do not silently discard a malformed
-    // request: a client may otherwise wait forever for its response.
-    if message.get("method").is_none() && id.is_some() && (message.get("result").is_some() || message.get("error").is_some()) {
-        return None;
-    }
-    let Some(method) = message.get("method").and_then(Value::as_str) else {
-        return Some(rpc_error(response_id, -32600, "request method must be a string"));
-    };
-    let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
-    if !params.is_object() {
-        return id.map(|id| rpc_error(id, -32602, "MCP params must be an object"));
-    }
-    let result: Result<Value, (i64, String)> = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
-            "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": "ply", "version": env!("CARGO_PKG_VERSION") },
-        })),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({
-            "tools": kernel.catalog().into_iter().map(|t| json!({
-                "name": t.name,
-                "description": t.description,
-                "inputSchema": t.parameters,
-            })).collect::<Vec<_>>(),
-        })),
-        "tools/call" => match params.get("name").and_then(Value::as_str) {
-            None => Err((-32602, "tools/call needs a tool name".into())),
-            Some(name) => match kernel.catalog().into_iter().find(|t| t.name == name) {
-                None => Err((-32602, format!("unknown tool: {name}"))),
-                Some(tool) => {
-                    let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                    if !arguments.is_object() {
-                        Err((-32602, "tools/call arguments must be an object".into()))
-                    } else {
-                        let input = if tool.wraps_input { arguments.get("input").cloned().unwrap_or(Value::Null) } else { arguments };
-                        match kernel.call(name, input).await {
-                            Ok(output) => Ok(tool_result(&output)),
-                            Err(err) => Ok(json!({ "content": [{ "type": "text", "text": err.to_string() }], "isError": true })),
-                        }
-                    }
-                }
-            },
-        },
-        _ if method.starts_with("notifications/") => return None,
-        other => Err((-32601, format!("method not found: {other}"))),
-    };
-    let id = id?;
-    Some(match result {
-        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err((code, message)) => rpc_error(id, code, &message),
-    })
-}
-
-fn tool_result(output: &Value) -> Value {
-    let text = match output {
-        Value::String(text) => text.clone(),
-        other => serde_json::to_string_pretty(other).unwrap_or_default(),
-    };
-    let mut result = json!({ "content": [{ "type": "text", "text": text }], "isError": false });
-    if output.is_object() {
-        result["structuredContent"] = output.clone();
-    }
-    result
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -549,7 +452,7 @@ async fn main() -> Result<()> {
         Cmd::Tools(setup) => describe(setup).await?,
         Cmd::Commands(setup) => describe_commands(setup).await?,
         Cmd::Call(args) => call(args).await?,
-        Cmd::Mcp(setup) => serve_mcp(setup).await?,
+        Cmd::Mcp(setup) => mcp::serve_mcp(setup).await?,
         Cmd::Run(args) => run(args).await?,
         Cmd::Tui(args) => {
             let kernel = kernel(&args.setup, if args.bypass { UiMode::Bypass } else { UiMode::Ask }).await?;

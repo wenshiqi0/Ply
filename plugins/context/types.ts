@@ -60,7 +60,7 @@ export type Provider = { source: string; key: string; type: ContextType; method:
 export type AgentFacts = { max_children: number; max_delegation_depth: number; report_sections: string[]; completion_marker: string };
 
 /** `inherit` names the parent conversation whose context a child task starts from; null or absent means none. */
-export type TaskInput = { prompt: string; model: ModelLimits; allowed_tools: string[]; facts: AgentFacts; inherit?: string };
+export type TaskInput = { images?: { type: "image"; data: string; mimeType: string }[]; prompt: string; model: ModelLimits; allowed_tools: string[]; facts: AgentFacts; inherit?: string };
 
 export type Conversation = {
   system: string;

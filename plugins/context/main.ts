@@ -39,6 +39,13 @@ function setBlock(input: BlockInput) {
 }
 
 /** Model selection, tool registration, conversations, and compaction policy. */
+function taskText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return (content as unknown[]).flatMap(block => block && typeof block === "object" && "type" in block && block.type === "text"
+    && "text" in block && typeof block.text === "string" ? [block.text] : []).join("\n");
+}
+
 export async function onLoad() {
   return {
     registerTool(name: string) { offered.add(name); },
@@ -63,11 +70,15 @@ export async function onLoad() {
       return open(system, info, allowed);
     },
     async openTask(input: TaskInput) {
-      const value = object(input, "task context"); keys(value, ["prompt", "model", "allowed_tools", "facts", "inherit"], "task context");
+      const value = object(input, "task context"); keys(value, ["prompt", "images", "model", "allowed_tools", "facts", "inherit"], "task context");
       if (typeof input.prompt !== "string" || !input.prompt.trim()) throw new Error("task prompt must not be empty");
+      const images = input.images ?? [];
+      if (!Array.isArray(images) || images.length > 5 || images.some(image => image.type !== "image" || typeof image.data !== "string"
+        || image.data.length > 36 * 1024 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data)
+        || !["image/png","image/jpeg","image/webp","image/gif"].includes(image.mimeType))) throw new Error("invalid task images");
       const f = facts(input.facts), allowed = toolNames(input.allowed_tools);
       const id = await open(agentRules(f), input.model, allowed, f, input.prompt, input.inherit);
-      append(conversation(id), [{ role: "user", content: input.prompt, timestamp: Date.now() }]);
+      append(conversation(id), [{ role: "user", content: images.length ? [{ type: "text", text: input.prompt }, ...images] : input.prompt, timestamp: Date.now() }]);
       return id;
     },
     appendMessages(id: string, messages: Message[], observation?: { expected_revision: number; context_tokens?: number; tools_signature?: string }) {
@@ -80,7 +91,7 @@ export async function onLoad() {
       const result = append(c, outcomes.map(r => ({ role: "toolResult", toolCallId: r.id, toolName: r.name, isError: r.isError, timestamp: Date.now(),
         content: [{ type: "text", text: typeof r.output === "string" ? r.output : JSON.stringify(r.output) }],
         ...(r.approval_requests ? { approval_requests: r.approval_requests } : {}) })));
-      if (!c.inherited) await refreshProviders(id, typeof c.messages[0]?.content === "string" ? c.messages[0].content : "");
+      if (!c.inherited) await refreshProviders(id, taskText(c.messages[0]?.content));
       return result;
     },
     repairReport(id: string, errors: string[], revision: number) {
@@ -104,13 +115,13 @@ export async function onLoad() {
     },
     async restoreConversation(snapshot: unknown, info: ModelLimits, allowed: string[], system?: string, inherit?: string) {
       const id = restore(snapshot, info, allowed, system, undefined, inherit);
-      if (inherit == null) await refreshProviders(id,String(conversation(id).messages[0]?.content ?? ""));
+      if (inherit == null) await refreshProviders(id,taskText(conversation(id).messages[0]?.content));
       return id;
     },
-    async restoreTask(snapshot: unknown, input: Omit<TaskInput, "prompt">) {
+    async restoreTask(snapshot: unknown, input: Omit<TaskInput, "prompt" | "images">) {
       const f = facts(input.facts);
       const id = restore(snapshot, input.model, toolNames(input.allowed_tools), agentRules(f), f, input.inherit);
-      if (input.inherit == null) await refreshProviders(id,String(conversation(id).messages[0]?.content ?? ""));
+      if (input.inherit == null) await refreshProviders(id,taskText(conversation(id).messages[0]?.content));
       return id;
     },
     closeConversation(id: string) {
